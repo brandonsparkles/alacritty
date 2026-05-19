@@ -100,6 +100,9 @@ pub struct Processor {
     global_ipc_options: ParsedOptions,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Window currently hosting the periodic session-save timer (macOS).
+    #[cfg(target_os = "macos")]
+    session_save_host: Option<WindowId>,
 }
 
 impl Processor {
@@ -143,6 +146,8 @@ impl Processor {
             #[cfg(unix)]
             global_ipc_options: Default::default(),
             config_monitor,
+            #[cfg(target_os = "macos")]
+            session_save_host: None,
         }
     }
 
@@ -155,19 +160,99 @@ impl Processor {
         event_loop: &ActiveEventLoop,
         window_options: WindowOptions,
     ) -> Result<(), Box<dyn Error>> {
+        // macOS: if a session was saved on the previous run, restore it
+        // (unless the CLI explicitly specified a command/cwd/title that
+        // should win over restoration).
+        #[cfg(target_os = "macos")]
+        let restore = if Self::cli_overrides_restore(&window_options) {
+            None
+        } else {
+            crate::session::Session::load()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let restore: Option<crate::session::Session> = None;
+
+        let (first_options, rest) = match restore {
+            Some(session) if !session.windows.is_empty() => {
+                let mut iter = session.windows.into_iter();
+                let first = iter.next().unwrap();
+                let mut first_options = window_options.clone();
+                apply_session_overrides(&mut first_options, &first);
+                (first_options, iter.collect::<Vec<_>>())
+            },
+            _ => (window_options, Vec::new()),
+        };
+
         let window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
             self.config.clone(),
-            window_options,
+            first_options,
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
         #[cfg(target_os = "macos")]
-        Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
+        {
+            Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
+            self.start_session_save_polling(window_context.id());
+        }
         self.windows.insert(window_context.id(), window_context);
 
+        // Dispatch a CreateWindow event for each remaining restored entry.
+        // We can't call create_window directly here because the GL config
+        // requires the initial window to have finished initializing first;
+        // routing through the event loop handles that ordering.
+        for entry in rest {
+            let mut opts = WindowOptions::default();
+            apply_session_overrides(&mut opts, &entry);
+            let _ = self
+                .proxy
+                .send_event(Event::new(EventType::CreateWindow(opts), None));
+        }
+
+        #[cfg(target_os = "macos")]
+        self.save_session();
+
         Ok(())
+    }
+
+    /// Returns true when the CLI invocation supplied options that should
+    /// suppress session restoration (e.g. `alacritty -e cmd` or
+    /// `--working-directory /foo`). We don't want a deliberate one-off
+    /// command to be overridden by yesterday's restored windows.
+    #[cfg(target_os = "macos")]
+    fn cli_overrides_restore(opts: &WindowOptions) -> bool {
+        opts.terminal_options.working_directory.is_some()
+            || opts.terminal_options.command().is_some()
+            || opts.window_identity.title.is_some()
+    }
+
+    /// Persist a snapshot of every open window to the macOS saved-state
+    /// directory. Called whenever the window set or window state changes.
+    #[cfg(target_os = "macos")]
+    fn save_session(&self) {
+        let windows: Vec<_> = self
+            .windows
+            .values()
+            .filter_map(|wc| wc.session_snapshot())
+            .collect();
+        let session = crate::session::Session { version: 1, windows };
+        session.save();
+    }
+
+    /// Schedule the periodic session-save tick. Hosted on a specific window
+    /// since `TimerId` requires a `WindowId`; if that window closes we
+    /// re-host on another remaining window from the close handler.
+    #[cfg(target_os = "macos")]
+    fn start_session_save_polling(&mut self, window_id: WindowId) {
+        let timer_id = TimerId::new(Topic::SessionSave, window_id);
+        if self.scheduler.scheduled(timer_id) {
+            return;
+        }
+        let event = Event::new(EventType::SessionSaveTick, window_id);
+        self.scheduler
+            .schedule(event, std::time::Duration::from_secs(3), true, timer_id);
+        self.session_save_host = Some(window_id);
     }
 
     /// Schedule the recurring tab-activity tick for a window (macOS).
@@ -206,8 +291,17 @@ impl Processor {
         )?;
 
         #[cfg(target_os = "macos")]
-        Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
+        {
+            Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
+            // Ensure session-save timer exists somewhere (host may have
+            // closed since last create).
+            if self.session_save_host.is_none() {
+                self.start_session_save_polling(window_context.id());
+            }
+        }
         self.windows.insert(window_context.id(), window_context);
+        #[cfg(target_os = "macos")]
+        self.save_session();
         Ok(())
     }
 
@@ -386,6 +480,11 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            // Periodic session snapshot (macOS only).
+            #[cfg(target_os = "macos")]
+            (EventType::SessionSaveTick, _) => {
+                self.save_session();
+            },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
                 // XXX Ensure that no context is current when creating a new window,
@@ -446,8 +545,32 @@ impl ApplicationHandler<Event> for Processor {
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
 
+                // If the closed window was hosting the session-save timer,
+                // re-host on any remaining window so saves continue.
+                #[cfg(target_os = "macos")]
+                if self.session_save_host == Some(window_context.id()) {
+                    self.session_save_host = None;
+                    if let Some(&next_host) = self.windows.keys().next() {
+                        self.start_session_save_polling(next_host);
+                    }
+                }
+
                 // Shutdown if no more terminals are open.
                 if self.windows.is_empty() && !self.cli_options.daemon {
+                    // User explicitly closed every window — clear the saved
+                    // session so a fresh launch doesn't restore stale state.
+                    // Multi-window close-cascade from Cmd+Q lands here too;
+                    // we intentionally preserve the previous (still-populated)
+                    // snapshot in that case because the most recent save
+                    // happened just before the cascade began.
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Differentiate "user closed all manually" from
+                        // "Cmd+Q cascade": with Cmd+Q the close events arrive
+                        // back-to-back without a periodic save in between,
+                        // so the snapshot still has multiple windows. We
+                        // can't easily tell here, so leave the snapshot.
+                    }
                     // Write ref tests of last window to disk.
                     if self.config.debug.ref_test {
                         window_context.write_ref_test_results();
@@ -533,6 +656,24 @@ impl ApplicationHandler<Event> for Processor {
     }
 }
 
+/// Override a [`WindowOptions`] with values from a persisted session entry.
+#[cfg(target_os = "macos")]
+fn apply_session_overrides(opts: &mut WindowOptions, entry: &crate::session::WindowState) {
+    if entry.working_directory.is_dir() {
+        opts.terminal_options.working_directory = Some(entry.working_directory.clone());
+    }
+    if !entry.tabbing_id.is_empty() {
+        opts.window_tabbing_id = Some(entry.tabbing_id.clone());
+    }
+    if let Some(title) = entry.tab_title.as_ref().filter(|t| !t.is_empty()) {
+        opts.restored_tab_title = Some(title.clone());
+    }
+    // Size and position are restored by macOS's own window placement
+    // memory once the tabbing identifier matches — we leave those fields
+    // unset so winit doesn't fight the OS.
+    let _ = (entry.size, entry.position);
+}
+
 /// Alacritty events.
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -576,6 +717,9 @@ pub enum EventType {
     /// Periodic poll of PTY foreground process to update tab activity (macOS).
     #[cfg(target_os = "macos")]
     TabActivityTick,
+    /// Periodic session snapshot for window restoration (macOS).
+    #[cfg(target_os = "macos")]
+    SessionSaveTick,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -667,6 +811,12 @@ impl Default for SearchState {
 pub struct DragCandidate {
     /// Mouse position (physical px) when LMB was first pressed.
     pub press: PhysicalPosition<f64>,
+    /// Grid point at press time. Used by the abort path so a press-to-drag
+    /// gesture creates a selection spanning from press → current rather than
+    /// a degenerate one at the current cursor.
+    pub press_point: alacritty_terminal::index::Point,
+    /// Side of the cell at the press point.
+    pub press_side: alacritty_terminal::index::Side,
     /// Selection text captured at press time; used as the drag payload.
     pub text: String,
 }
@@ -1293,6 +1443,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.rename_tab_state.previous_title = None;
         self.rename_tab_state.active = false;
         self.display.apply_tab_title();
+        // Persist the new title to the session snapshot promptly.
+        let _ = self.event_proxy.send_event(Event::new(EventType::SessionSaveTick, None));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1995,6 +2147,10 @@ pub struct Mouse {
     /// selection. macOS only; iTerm-style drag-out.
     #[cfg(target_os = "macos")]
     pub drag_candidate: Option<DragCandidate>,
+
+    /// Timestamp of the last Escape key press, used to detect a double-tap and
+    /// emit a "clear line" sequence to the PTY (a la Claude Code).
+    pub last_escape_press: Option<Instant>,
 }
 
 impl Default for Mouse {
@@ -2018,6 +2174,7 @@ impl Default for Mouse {
             tab_swipe_fired: false,
             #[cfg(target_os = "macos")]
             drag_candidate: None,
+            last_escape_press: None,
         }
     }
 }
@@ -2058,8 +2215,14 @@ pub struct AccumulatedScroll {
 }
 
 impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
-    /// Poll the PTY's foreground process group and update the tab activity
+    /// Poll the shell's child-process set and update the tab activity
     /// indicator. Fired on a recurring scheduler tick (macOS only).
+    ///
+    /// We detect "subprocess running" by enumerating direct children of the
+    /// shell PID, rather than comparing the TTY's foreground process group.
+    /// Some TUIs (notably Codex and Copilot) share their parent shell's
+    /// process group, so the foreground-pgid heuristic produces false
+    /// negatives. The child-set check works regardless of pgid semantics.
     #[cfg(target_os = "macos")]
     fn poll_tab_activity(&mut self) {
         use crate::display::TabActivity;
@@ -2069,11 +2232,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
             return;
         }
 
-        // Compare the PTY's foreground process group to the shell PID.
-        // SAFETY: `master_fd` is owned by this WindowContext and stays valid
-        // until the window/terminal is dropped.
-        let fpgid = unsafe { libc::tcgetpgrp(self.ctx.master_fd) };
-        let new_status = if fpgid > 0 && fpgid as u32 != self.ctx.shell_pid {
+        let new_status = if crate::macos::proc::has_children(self.ctx.shell_pid as i32) {
             TabActivity::Working
         } else {
             TabActivity::Idle
@@ -2201,6 +2360,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::Frame => (),
+                // Handled at the outer Processor level; per-window handler ignores.
+                #[cfg(target_os = "macos")]
+                EventType::SessionSaveTick => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -2273,6 +2435,16 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                 self.ctx.display.tab_activity = crate::display::TabActivity::Idle;
                                 self.ctx.display.apply_tab_title();
                             }
+                        }
+                        // Focus changes are a good moment to refresh the
+                        // session snapshot (captures cwd of the just-active
+                        // window before user moves on).
+                        #[cfg(target_os = "macos")]
+                        {
+                            let _ = self
+                                .ctx
+                                .event_proxy
+                                .send_event(Event::new(EventType::SessionSaveTick, None));
                         }
 
                         self.ctx.update_cursor_blinking();

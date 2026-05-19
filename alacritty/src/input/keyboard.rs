@@ -87,6 +87,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let build_key_sequence = Self::should_build_sequence(&key, text, mode, mods);
         let is_modifier_key = Self::is_modifier_key(&key);
+        let is_escape_key = matches!(key.logical_key, Key::Named(NamedKey::Escape));
 
         let bytes = if build_key_sequence {
             build_sequence(key, mods, mode)
@@ -107,6 +108,29 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.on_terminal_input_start();
             }
             self.ctx.write_to_pty(bytes);
+
+            // Double-Escape → emit "clear line" (Ctrl-A + Ctrl-K) so TUIs like
+            // Codex/Claude/Copilot and shell readline behave like Claude Code's
+            // double-tap-to-clear. Threshold sized to feel like an intentional
+            // double-tap but not catch deliberate two-step Escapes (e.g.
+            // Vim mode exit + extra Esc to clear partial command).
+            if is_escape_key {
+                use std::time::{Duration, Instant};
+                const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(400);
+                let now = Instant::now();
+                let recent = self
+                    .ctx
+                    .mouse()
+                    .last_escape_press
+                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_WINDOW);
+                self.ctx.mouse_mut().last_escape_press = Some(now);
+                if recent {
+                    // Ctrl-A = move-to-start-of-line; Ctrl-K = kill-to-end.
+                    self.ctx.write_to_pty(b"\x01\x0b".to_vec());
+                    // Reset so a third Esc within the window doesn't re-fire.
+                    self.ctx.mouse_mut().last_escape_press = None;
+                }
+            }
         }
     }
 

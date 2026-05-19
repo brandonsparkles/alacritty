@@ -306,6 +306,11 @@ pub struct WindowOptions {
     pub window_tabbing_id: Option<String>,
 
     #[clap(skip)]
+    #[cfg(target_os = "macos")]
+    /// Tab title to apply after window creation, restored from a previous session.
+    pub restored_tab_title: Option<String>,
+
+    #[clap(skip)]
     #[cfg(not(any(target_os = "macos", windows)))]
     /// `ActivationToken` that we pass to winit.
     pub activation_token: Option<String>,

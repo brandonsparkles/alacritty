@@ -5,6 +5,8 @@
 //! the drag session — it does NOT touch the user's system clipboard.
 
 #![cfg(target_os = "macos")]
+// Disabled while the drag pipeline is rebuilt — see Window::begin_text_drag.
+#![allow(dead_code)]
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

@@ -45,6 +45,8 @@ mod panic;
 mod polling;
 mod renderer;
 mod scheduler;
+#[cfg(target_os = "macos")]
+mod session;
 mod string;
 mod window_context;
 

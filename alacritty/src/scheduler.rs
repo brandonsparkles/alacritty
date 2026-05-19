@@ -31,6 +31,8 @@ pub enum Topic {
     Frame,
     #[cfg(target_os = "macos")]
     TabActivity,
+    #[cfg(target_os = "macos")]
+    SessionSave,
 }
 
 /// Event scheduled to be emitted at a specific time.

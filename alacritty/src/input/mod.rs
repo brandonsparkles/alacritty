@@ -538,18 +538,20 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                         // AppKit owns the gesture now; bail before any selection edits.
                         return;
                     }
-                    // Drag couldn't start (e.g. no current event). Fall back to
-                    // the normal selection-expansion behaviour as if the click
-                    // had been a fresh selection start.
+                    // Drag couldn't start (e.g. no current event, or drag-out
+                    // is disabled). Fall through to "click-and-drag selects
+                    // a new region": clear the old selection, start a fresh
+                    // one at the press point, then extend to the current
+                    // cursor — so the press-to-current segment isn't dropped.
                     self.ctx.clear_selection();
-                    let display_offset = self.ctx.terminal().grid().display_offset();
-                    let start_point =
-                        self.ctx.mouse().point(&size_info, display_offset);
                     self.ctx.start_selection(
                         SelectionType::Simple,
-                        start_point,
-                        self.ctx.mouse().cell_side,
+                        candidate.press_point,
+                        candidate.press_side,
                     );
+                    let display_offset = self.ctx.terminal().grid().display_offset();
+                    let current = self.ctx.mouse().point(&size_info, display_offset);
+                    self.ctx.update_selection(current, self.ctx.mouse().cell_side);
                 }
             }
         }
@@ -788,6 +790,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                             );
                             self.ctx.set_drag_candidate(Some(crate::event::DragCandidate {
                                 press,
+                                press_point: point,
+                                press_side: side,
                                 text,
                             }));
                             return;

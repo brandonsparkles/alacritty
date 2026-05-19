@@ -115,7 +115,12 @@ impl WindowContext {
         let gl_context =
             renderer::platform::create_gl_context(&gl_display, &gl_config, raw_window_handle)?;
 
-        let display = Display::new(window, gl_context, &config, false)?;
+        let mut display = Display::new(window, gl_context, &config, false)?;
+        #[cfg(target_os = "macos")]
+        if let Some(title) = options.restored_tab_title.take() {
+            display.tab_user_title = Some(title);
+            display.apply_tab_title();
+        }
 
         Self::new(display, config, options, proxy)
     }
@@ -155,7 +160,12 @@ impl WindowContext {
         let gl_context =
             renderer::platform::create_gl_context(&gl_display, gl_config, Some(raw_window_handle))?;
 
-        let display = Display::new(window, gl_context, &config, tabbed)?;
+        let mut display = Display::new(window, gl_context, &config, tabbed)?;
+        #[cfg(target_os = "macos")]
+        if let Some(title) = options.restored_tab_title.take() {
+            display.tab_user_title = Some(title);
+            display.apply_tab_title();
+        }
 
         let mut window_context = Self::new(display, config, options, proxy)?;
 
@@ -500,6 +510,30 @@ impl WindowContext {
     /// ID of this terminal context.
     pub fn id(&self) -> WindowId {
         self.display.window.id()
+    }
+
+    /// Build a snapshot of this window for session persistence (macOS).
+    #[cfg(target_os = "macos")]
+    pub fn session_snapshot(&self) -> Option<crate::session::WindowState> {
+        let working_directory =
+            crate::macos::proc::cwd(self.shell_pid as i32).ok()?;
+        let tab_title = self.display.tab_user_title.clone();
+        let tabbing_id = self.display.window.tabbing_id();
+        let inner = self.display.window.inner_size();
+        let size = Some((inner.width, inner.height));
+        let position = self
+            .display
+            .window
+            .outer_position()
+            .ok()
+            .map(|p| (p.x, p.y));
+        Some(crate::session::WindowState {
+            working_directory,
+            tab_title,
+            tabbing_id,
+            size,
+            position,
+        })
     }
 
     /// Write the ref test results to the disk.

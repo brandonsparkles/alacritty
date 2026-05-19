@@ -51,6 +51,43 @@ impl From<IntoStringError> for Error {
     }
 }
 
+/// Return `true` if the given process has at least one direct child.
+///
+/// Uses `proc_listpids(PROC_PPID_ONLY, ppid, …)` which enumerates the
+/// kernel's PIDs whose ppid matches. This is more reliable than checking
+/// the TTY's foreground process group, because TUIs like Codex/Copilot may
+/// share their parent shell's process group while still being children.
+pub fn has_children(parent_pid: c_int) -> bool {
+    use std::os::raw::c_void;
+
+    // First call with a null buffer asks the kernel how many bytes it needs.
+    let needed = unsafe {
+        sys::proc_listpids(sys::PROC_PPID_ONLY, parent_pid as u32, std::ptr::null_mut(), 0)
+    };
+    if needed <= 0 {
+        return false;
+    }
+
+    let count = (needed as usize) / std::mem::size_of::<c_int>();
+    // Add slack — the set of children can grow between the size query and the read.
+    let mut buf: Vec<c_int> = vec![0; count + 8];
+    let buf_bytes = (buf.len() * std::mem::size_of::<c_int>()) as c_int;
+    let actual = unsafe {
+        sys::proc_listpids(
+            sys::PROC_PPID_ONLY,
+            parent_pid as u32,
+            buf.as_mut_ptr() as *mut c_void,
+            buf_bytes,
+        )
+    };
+    if actual <= 0 {
+        return false;
+    }
+    let n = (actual as usize) / std::mem::size_of::<c_int>();
+    // The kernel can write trailing zero entries; treat any non-zero as a real child.
+    buf.iter().take(n).any(|&p| p > 0)
+}
+
 pub fn cwd(pid: c_int) -> Result<PathBuf, Error> {
     let mut info = MaybeUninit::<sys::proc_vnodepathinfo>::uninit();
     let info_ptr = info.as_mut_ptr() as *mut c_void;
@@ -74,6 +111,9 @@ mod sys {
     use std::os::raw::{c_char, c_int, c_longlong, c_void};
 
     pub const PROC_PIDVNODEPATHINFO: c_int = 9;
+
+    /// `proc_listpids` selector: return PIDs whose parent matches `typeinfo`.
+    pub const PROC_PPID_ONLY: u32 = 6;
 
     type gid_t = c_int;
     type off_t = c_longlong;
@@ -140,6 +180,13 @@ mod sys {
             pid: c_int,
             flavor: c_int,
             arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+
+        pub fn proc_listpids(
+            r#type: u32,
+            typeinfo: u32,
             buffer: *mut c_void,
             buffersize: c_int,
         ) -> c_int;
