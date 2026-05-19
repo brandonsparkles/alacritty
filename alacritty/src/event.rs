@@ -668,10 +668,12 @@ fn apply_session_overrides(opts: &mut WindowOptions, entry: &crate::session::Win
     if let Some(title) = entry.tab_title.as_ref().filter(|t| !t.is_empty()) {
         opts.restored_tab_title = Some(title.clone());
     }
-    // Size and position are restored by macOS's own window placement
-    // memory once the tabbing identifier matches — we leave those fields
-    // unset so winit doesn't fight the OS.
-    let _ = (entry.size, entry.position);
+    if let Some(size) = entry.size {
+        opts.restored_size = Some(size);
+    }
+    if let Some(position) = entry.position {
+        opts.restored_position = Some(position);
+    }
 }
 
 /// Alacritty events.

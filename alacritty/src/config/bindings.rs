@@ -227,6 +227,13 @@ pub enum Action {
     /// Create new window in a tab.
     CreateNewTab,
 
+    /// Clear the current input line by emitting Ctrl-A + Ctrl-K to the PTY.
+    ///
+    /// This is the same effect produced by double-tapping Escape; exposing it
+    /// as a bindable action lets users map it to any key (e.g. Cmd+Backspace)
+    /// or replace the default double-tap detection with their own binding.
+    ClearInputLine,
+
     /// Open the inline tab-rename prompt (macOS native tabs only).
     PromptRenameTab,
 

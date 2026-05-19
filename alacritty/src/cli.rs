@@ -311,6 +311,16 @@ pub struct WindowOptions {
     pub restored_tab_title: Option<String>,
 
     #[clap(skip)]
+    #[cfg(target_os = "macos")]
+    /// Window size in physical pixels, restored from a previous session.
+    pub restored_size: Option<(u32, u32)>,
+
+    #[clap(skip)]
+    #[cfg(target_os = "macos")]
+    /// Window outer position in screen coordinates, restored from a previous session.
+    pub restored_position: Option<(i32, i32)>,
+
+    #[clap(skip)]
     #[cfg(not(any(target_os = "macos", windows)))]
     /// `ActivationToken` that we pass to winit.
     pub activation_token: Option<String>,

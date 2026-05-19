@@ -389,6 +389,12 @@ impl<T: EventListener> Execute<T> for Action {
                 ctx.window().hold = false;
                 ctx.terminal_mut().exit();
             },
+            Action::ClearInputLine => {
+                // Ctrl-A (move-to-start) + Ctrl-K (kill-to-end) — emacs-style
+                // readline shortcut that works in shells, REPLs, and most
+                // TUI prompts (Codex, Claude, Copilot, etc.).
+                ctx.write_to_pty(b"\x01\x0b".to_vec());
+            },
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),

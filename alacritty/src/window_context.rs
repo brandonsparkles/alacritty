@@ -117,9 +117,17 @@ impl WindowContext {
 
         let mut display = Display::new(window, gl_context, &config, false)?;
         #[cfg(target_os = "macos")]
-        if let Some(title) = options.restored_tab_title.take() {
-            display.tab_user_title = Some(title);
-            display.apply_tab_title();
+        {
+            if let Some((w, h)) = options.restored_size.take() {
+                display.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+            }
+            if let Some((x, y)) = options.restored_position.take() {
+                display.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            if let Some(title) = options.restored_tab_title.take() {
+                display.tab_user_title = Some(title);
+                display.apply_tab_title();
+            }
         }
 
         Self::new(display, config, options, proxy)
@@ -162,9 +170,17 @@ impl WindowContext {
 
         let mut display = Display::new(window, gl_context, &config, tabbed)?;
         #[cfg(target_os = "macos")]
-        if let Some(title) = options.restored_tab_title.take() {
-            display.tab_user_title = Some(title);
-            display.apply_tab_title();
+        {
+            if let Some((w, h)) = options.restored_size.take() {
+                display.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+            }
+            if let Some((x, y)) = options.restored_position.take() {
+                display.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            if let Some(title) = options.restored_tab_title.take() {
+                display.tab_user_title = Some(title);
+                display.apply_tab_title();
+            }
         }
 
         let mut window_context = Self::new(display, config, options, proxy)?;

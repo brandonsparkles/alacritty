@@ -241,6 +241,12 @@ impl Window {
         self.window.outer_position()
     }
 
+    /// Move the window's top-left to `position` (screen coords, physical px).
+    #[inline]
+    pub fn set_outer_position(&self, position: PhysicalPosition<i32>) {
+        self.window.set_outer_position(position);
+    }
+
     #[inline]
     pub fn set_visible(&self, visibility: bool) {
         self.window.set_visible(visibility);
