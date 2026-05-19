@@ -29,6 +29,8 @@ pub enum Topic {
     BlinkCursor,
     BlinkTimeout,
     Frame,
+    #[cfg(target_os = "macos")]
+    TabActivity,
 }
 
 /// Event scheduled to be emitted at a specific time.

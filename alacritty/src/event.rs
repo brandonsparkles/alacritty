@@ -26,6 +26,8 @@ use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
+#[cfg(target_os = "macos")]
+use winit::dpi::PhysicalPosition;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
@@ -161,9 +163,22 @@ impl Processor {
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
+        #[cfg(target_os = "macos")]
+        Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
         self.windows.insert(window_context.id(), window_context);
 
         Ok(())
+    }
+
+    /// Schedule the recurring tab-activity tick for a window (macOS).
+    #[cfg(target_os = "macos")]
+    fn start_tab_activity_polling(scheduler: &mut Scheduler, window_id: WindowId) {
+        let timer_id = TimerId::new(Topic::TabActivity, window_id);
+        if scheduler.scheduled(timer_id) {
+            return;
+        }
+        let event = Event::new(EventType::TabActivityTick, window_id);
+        scheduler.schedule(event, std::time::Duration::from_millis(500), true, timer_id);
     }
 
     /// Create a new terminal window.
@@ -190,6 +205,8 @@ impl Processor {
             config_overrides,
         )?;
 
+        #[cfg(target_os = "macos")]
+        Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
         self.windows.insert(window_context.id(), window_context);
         Ok(())
     }
@@ -556,6 +573,9 @@ pub enum EventType {
     #[cfg(unix)]
     Shutdown,
     Frame,
+    /// Periodic poll of PTY foreground process to update tab activity (macOS).
+    #[cfg(target_os = "macos")]
+    TabActivityTick,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -639,6 +659,39 @@ impl Default for SearchState {
     }
 }
 
+/// Pending drag-out gesture initiated by LMB-down inside an existing selection.
+/// We hold this until either the mouse moves past a small threshold (drag) or
+/// is released (treated as a normal click that clears the selection).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct DragCandidate {
+    /// Mouse position (physical px) when LMB was first pressed.
+    pub press: PhysicalPosition<f64>,
+    /// Selection text captured at press time; used as the drag payload.
+    pub text: String,
+}
+
+/// Tab rename prompt state.
+///
+/// Used on macOS only — when active, keystrokes update the NSWindowTab title
+/// directly, providing inline visual feedback without a separate rendered overlay.
+#[derive(Debug, Default)]
+pub struct RenameTabState {
+    /// Whether a rename prompt is currently active.
+    pub active: bool,
+    /// Current input buffer being typed.
+    pub input: String,
+    /// Effective tab title prior to entering rename mode, restored on cancel.
+    pub previous_title: Option<String>,
+}
+
+impl RenameTabState {
+    #[allow(dead_code)]
+    pub fn active(&self) -> bool {
+        self.active
+    }
+}
+
 /// Vi inline search state.
 pub struct InlineSearchState {
     /// Whether inline search is currently waiting for search character input.
@@ -678,6 +731,7 @@ pub struct ActionContext<'a, N, T> {
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub inline_search_state: &'a mut InlineSearchState,
+    pub rename_tab_state: &'a mut RenameTabState,
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
@@ -1191,6 +1245,150 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.search_state.history_index.is_some()
     }
 
+    // ---- Tab rename (macOS native tabs) ----
+
+    #[inline]
+    fn rename_tab_active(&self) -> bool {
+        self.rename_tab_state.active
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_rename_tab(&mut self) {
+        if self.rename_tab_state.active {
+            return;
+        }
+        // Remember the user-set title so cancel can restore it. We do NOT touch
+        // the activity prefix; rename only affects the user-set portion.
+        self.rename_tab_state.previous_title = self.display.tab_user_title.clone();
+        self.rename_tab_state.input.clear();
+        self.rename_tab_state.active = true;
+        self.display.tab_user_title = Some("✏ ".to_string());
+        self.display.apply_tab_title();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn start_rename_tab(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn cancel_rename_tab(&mut self) {
+        if !self.rename_tab_state.active {
+            return;
+        }
+        self.display.tab_user_title = self.rename_tab_state.previous_title.take();
+        self.rename_tab_state.input.clear();
+        self.rename_tab_state.active = false;
+        self.display.apply_tab_title();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn cancel_rename_tab(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn confirm_rename_tab(&mut self) {
+        if !self.rename_tab_state.active {
+            return;
+        }
+        let new_title = std::mem::take(&mut self.rename_tab_state.input);
+        self.display.tab_user_title = if new_title.is_empty() { None } else { Some(new_title) };
+        self.rename_tab_state.previous_title = None;
+        self.rename_tab_state.active = false;
+        self.display.apply_tab_title();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn confirm_rename_tab(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn rename_tab_input(&mut self, c: char) {
+        if !self.rename_tab_state.active {
+            return;
+        }
+        // Reject control characters (Enter/Backspace/etc. go through bindings).
+        if c.is_control() {
+            return;
+        }
+        self.rename_tab_state.input.push(c);
+        self.refresh_rename_tab_preview();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn rename_tab_input(&mut self, _c: char) {}
+
+    #[cfg(target_os = "macos")]
+    fn rename_tab_pop_char(&mut self) {
+        if !self.rename_tab_state.active {
+            return;
+        }
+        self.rename_tab_state.input.pop();
+        self.refresh_rename_tab_preview();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn rename_tab_pop_char(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn rename_tab_pop_word(&mut self) {
+        if !self.rename_tab_state.active {
+            return;
+        }
+        let buf = &mut self.rename_tab_state.input;
+        // Trim trailing whitespace, then trailing word chars.
+        while buf.chars().last().is_some_and(|c| c.is_whitespace()) {
+            buf.pop();
+        }
+        while buf.chars().last().is_some_and(|c| !c.is_whitespace()) {
+            buf.pop();
+        }
+        self.refresh_rename_tab_preview();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn rename_tab_pop_word(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn rename_tab_clear(&mut self) {
+        if !self.rename_tab_state.active {
+            return;
+        }
+        self.rename_tab_state.input.clear();
+        self.refresh_rename_tab_preview();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn rename_tab_clear(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn reset_tab_title(&mut self) {
+        // Drop any active rename first.
+        if self.rename_tab_state.active {
+            self.rename_tab_state.previous_title = None;
+            self.rename_tab_state.input.clear();
+            self.rename_tab_state.active = false;
+        }
+        self.display.tab_user_title = None;
+        self.display.apply_tab_title();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reset_tab_title(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn set_drag_candidate(&mut self, candidate: Option<DragCandidate>) {
+        self.mouse.drag_candidate = candidate;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn confirm_close_if_busy(&mut self) -> bool {
+        // Only prompt if a foreground subprocess (other than the shell) is running.
+        let fpgid = unsafe { libc::tcgetpgrp(self.master_fd) };
+        if fpgid <= 0 || fpgid as u32 == self.shell_pid {
+            return true;
+        }
+        let detail = "A process is still running in this terminal. Closing will \
+            terminate it.";
+        self.display.window.confirm_close("Close this terminal?", detail)
+    }
+
     /// Handle keyboard typing start.
     ///
     /// This will temporarily disable some features like terminal cursor blinking or the mouse
@@ -1500,6 +1698,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
+    /// Push the current rename-prompt input into the live tab title.
+    #[cfg(target_os = "macos")]
+    fn refresh_rename_tab_preview(&mut self) {
+        self.display.tab_user_title = Some(format!("✏ {}", self.rename_tab_state.input));
+        self.display.apply_tab_title();
+    }
+
     fn update_search(&mut self) {
         let regex = match self.search_state.regex() {
             Some(regex) => regex,
@@ -1779,6 +1984,17 @@ pub struct Mouse {
     pub inside_text_area: bool,
     pub x: usize,
     pub y: usize,
+    /// Accumulated horizontal pixels for the current two-finger pan gesture (macOS tab swipe).
+    pub tab_swipe_accum_x: f64,
+    /// Accumulated absolute vertical pixels for the current two-finger pan gesture.
+    pub tab_swipe_accum_y_abs: f64,
+    /// Whether a tab-switch has already fired during the current pan gesture.
+    pub tab_swipe_fired: bool,
+
+    /// Pending drag-out candidate set when LMB was pressed inside an existing
+    /// selection. macOS only; iTerm-style drag-out.
+    #[cfg(target_os = "macos")]
+    pub drag_candidate: Option<DragCandidate>,
 }
 
 impl Default for Mouse {
@@ -1797,6 +2013,11 @@ impl Default for Mouse {
             accumulated_scroll: Default::default(),
             x: Default::default(),
             y: Default::default(),
+            tab_swipe_accum_x: 0.0,
+            tab_swipe_accum_y_abs: 0.0,
+            tab_swipe_fired: false,
+            #[cfg(target_os = "macos")]
+            drag_candidate: None,
         }
     }
 }
@@ -1837,6 +2058,33 @@ pub struct AccumulatedScroll {
 }
 
 impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+    /// Poll the PTY's foreground process group and update the tab activity
+    /// indicator. Fired on a recurring scheduler tick (macOS only).
+    #[cfg(target_os = "macos")]
+    fn poll_tab_activity(&mut self) {
+        use crate::display::TabActivity;
+
+        // Never overwrite NeedsAttention except via focus clear (handled elsewhere).
+        if self.ctx.display.tab_activity == TabActivity::NeedsAttention {
+            return;
+        }
+
+        // Compare the PTY's foreground process group to the shell PID.
+        // SAFETY: `master_fd` is owned by this WindowContext and stays valid
+        // until the window/terminal is dropped.
+        let fpgid = unsafe { libc::tcgetpgrp(self.ctx.master_fd) };
+        let new_status = if fpgid > 0 && fpgid as u32 != self.ctx.shell_pid {
+            TabActivity::Working
+        } else {
+            TabActivity::Idle
+        };
+
+        if new_status != self.ctx.display.tab_activity {
+            self.ctx.display.tab_activity = new_status;
+            self.ctx.display.apply_tab_title();
+        }
+    }
+
     /// Handle events from winit.
     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
         match event {
@@ -1851,6 +2099,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         *self.ctx.dirty = true;
                     }
                 },
+                #[cfg(target_os = "macos")]
+                EventType::TabActivityTick => self.poll_tab_activity(),
                 EventType::BlinkCursorTimeout => {
                     // Disable blinking after timeout reached.
                     let timer_id = TimerId::new(Topic::BlinkCursor, self.ctx.display.window.id());
@@ -1868,12 +2118,17 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::Title(title) => {
                         if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
                             self.ctx.window().set_title(title);
+                            // Re-apply tab title since NSWindow title changed.
+                            #[cfg(target_os = "macos")]
+                            self.ctx.display.apply_tab_title();
                         }
                     },
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
                             self.ctx.display.window.set_title(window_config.identity.title.clone());
+                            #[cfg(target_os = "macos")]
+                            self.ctx.display.apply_tab_title();
                         }
                     },
                     TerminalEvent::Bell => {
@@ -1881,6 +2136,18 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         let focused = self.ctx.terminal.is_focused;
                         if !focused && self.ctx.terminal.mode().contains(TermMode::URGENCY_HINTS) {
                             self.ctx.window().set_urgent(true);
+                        }
+
+                        // macOS tab activity: ringing bell on an unfocused tab
+                        // raises the blue "needs attention" indicator.
+                        #[cfg(target_os = "macos")]
+                        if !focused
+                            && self.ctx.display.tab_activity
+                                != crate::display::TabActivity::NeedsAttention
+                        {
+                            self.ctx.display.tab_activity =
+                                crate::display::TabActivity::NeedsAttention;
+                            self.ctx.display.apply_tab_title();
                         }
 
                         // Ring visual bell.
@@ -1938,6 +2205,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
                     WindowEvent::CloseRequested => {
+                        // Prompt before closing if a subprocess is running.
+                        #[cfg(target_os = "macos")]
+                        if !self.ctx.confirm_close_if_busy() {
+                            return;
+                        }
                         // User asked to close the window, so no need to hold it.
                         self.ctx.window().hold = false;
                         self.ctx.terminal.exit();
@@ -1993,6 +2265,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Reset the urgency hint when gaining focus.
                         if is_focused {
                             self.ctx.window().set_urgent(false);
+                            // Clear "needs attention" on tab focus (macOS).
+                            #[cfg(target_os = "macos")]
+                            if self.ctx.display.tab_activity
+                                == crate::display::TabActivity::NeedsAttention
+                            {
+                                self.ctx.display.tab_activity = crate::display::TabActivity::Idle;
+                                self.ctx.display.apply_tab_title();
+                            }
                         }
 
                         self.ctx.update_cursor_blinking();

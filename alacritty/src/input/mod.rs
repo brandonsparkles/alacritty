@@ -39,7 +39,7 @@ use crate::clipboard::Clipboard;
 #[cfg(target_os = "macos")]
 use crate::config::window::Decorations;
 use crate::config::{
-    Action, BindingMode, MouseAction, MouseEvent, SearchAction, UiConfig, ViAction,
+    Action, BindingMode, MouseAction, MouseEvent, SearchAction, TabRenameAction, UiConfig, ViAction,
 };
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
@@ -63,6 +63,24 @@ const MIN_SELECTION_SCROLLING_HEIGHT: f64 = 5.;
 
 /// Number of pixels for increasing the selection scrolling speed factor by one.
 const SELECTION_SCROLLING_STEP: f64 = 20.;
+
+/// Accumulated horizontal pixels in a single two-finger pan gesture before a
+/// tab switch is triggered. Tuned for macOS trackpad "Swipe between pages"
+/// magnitudes (typical gesture totals ~30-100 px before momentum).
+#[cfg(target_os = "macos")]
+const TAB_SWIPE_THRESHOLD_PX: f64 = 50.0;
+
+/// Minimum cosine of the angle between the accumulated pan vector and the
+/// horizontal axis required to interpret the gesture as a tab swipe.
+/// 0.9 ≈ within 25° of horizontal.
+#[cfg(target_os = "macos")]
+const TAB_SWIPE_MIN_COSINE: f64 = 0.9;
+
+/// Pixel distance the mouse must travel after pressing inside a selection
+/// before we hand the gesture to AppKit as a drag-out. iTerm uses ~4 px;
+/// generous so accidental motion during a click doesn't trigger a drag.
+#[cfg(target_os = "macos")]
+const DRAG_OUT_THRESHOLD_PX: f64 = 5.0;
 
 /// Distance before a touch input is considered a drag.
 const MAX_TAP_DISTANCE: f64 = 20.;
@@ -125,6 +143,26 @@ pub trait ActionContext<T: EventListener> {
     fn advance_search_origin(&mut self, _direction: Direction) {}
     fn search_direction(&self) -> Direction;
     fn search_active(&self) -> bool;
+    fn start_rename_tab(&mut self) {}
+    fn cancel_rename_tab(&mut self) {}
+    fn confirm_rename_tab(&mut self) {}
+    fn rename_tab_input(&mut self, _c: char) {}
+    fn rename_tab_pop_char(&mut self) {}
+    fn rename_tab_pop_word(&mut self) {}
+    fn rename_tab_clear(&mut self) {}
+    fn rename_tab_active(&self) -> bool {
+        false
+    }
+    fn reset_tab_title(&mut self) {}
+    /// Show a confirm-close dialog when a foreground subprocess is running.
+    /// Returns `true` to proceed with close, `false` to abort.
+    #[cfg(target_os = "macos")]
+    fn confirm_close_if_busy(&mut self) -> bool {
+        true
+    }
+    /// Stash or clear the drag-out candidate for the current mouse gesture.
+    #[cfg(target_os = "macos")]
+    fn set_drag_candidate(&mut self, _candidate: Option<crate::event::DragCandidate>) {}
     fn on_typing_start(&mut self) {}
     fn toggle_vi_mode(&mut self) {}
     fn inline_search_state(&mut self) -> &mut InlineSearchState;
@@ -344,6 +382,10 @@ impl<T: EventListener> Execute<T> for Action {
             Action::Hide => ctx.window().set_visible(false),
             Action::Minimize => ctx.window().set_minimized(true),
             Action::Quit => {
+                #[cfg(target_os = "macos")]
+                if !ctx.confirm_close_if_busy() {
+                    return;
+                }
                 ctx.window().hold = false;
                 ctx.terminal_mut().exit();
             },
@@ -440,6 +482,24 @@ impl<T: EventListener> Execute<T> for Action {
             Action::SelectTab9 => ctx.window().select_tab_at_index(8),
             #[cfg(target_os = "macos")]
             Action::SelectLastTab => ctx.window().select_last_tab(),
+            #[cfg(target_os = "macos")]
+            Action::PromptRenameTab => {
+                if ctx.config().window.decorations != Decorations::None {
+                    ctx.start_rename_tab();
+                }
+            },
+            #[cfg(target_os = "macos")]
+            Action::ResetTabTitle => ctx.reset_tab_title(),
+            #[cfg(target_os = "macos")]
+            Action::TabRename(TabRenameAction::Confirm) => ctx.confirm_rename_tab(),
+            #[cfg(target_os = "macos")]
+            Action::TabRename(TabRenameAction::Cancel) => ctx.cancel_rename_tab(),
+            #[cfg(target_os = "macos")]
+            Action::TabRename(TabRenameAction::DeleteChar) => ctx.rename_tab_pop_char(),
+            #[cfg(target_os = "macos")]
+            Action::TabRename(TabRenameAction::DeleteWord) => ctx.rename_tab_pop_word(),
+            #[cfg(target_os = "macos")]
+            Action::TabRename(TabRenameAction::Clear) => ctx.rename_tab_clear(),
             _ => (),
         }
     }
@@ -458,6 +518,42 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
+
+        // macOS drag-out: if we have a pending drag candidate and the mouse
+        // has moved past the threshold from the press point, hand off to
+        // AppKit. Once AppKit takes the drag, NSEvent stops dispatching
+        // mouseDragged to our view until the drag concludes.
+        #[cfg(target_os = "macos")]
+        if lmb_pressed {
+            if let Some(candidate) = self.ctx.mouse().drag_candidate.clone() {
+                let dx = position.x - candidate.press.x;
+                let dy = position.y - candidate.press.y;
+                if dx.hypot(dy) >= DRAG_OUT_THRESHOLD_PX {
+                    self.ctx.set_drag_candidate(None);
+                    let started = self
+                        .ctx
+                        .window()
+                        .begin_text_drag(candidate.press, &candidate.text);
+                    if started {
+                        // AppKit owns the gesture now; bail before any selection edits.
+                        return;
+                    }
+                    // Drag couldn't start (e.g. no current event). Fall back to
+                    // the normal selection-expansion behaviour as if the click
+                    // had been a fresh selection start.
+                    self.ctx.clear_selection();
+                    let display_offset = self.ctx.terminal().grid().display_offset();
+                    let start_point =
+                        self.ctx.mouse().point(&size_info, display_offset);
+                    self.ctx.start_selection(
+                        SelectionType::Simple,
+                        start_point,
+                        self.ctx.mouse().cell_side,
+                    );
+                }
+            }
+        }
+
         if !self.ctx.selection_is_empty() && (lmb_pressed || rmb_pressed) {
             self.update_selection_scrolling(y);
         }
@@ -666,6 +762,39 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 // Don't launch URLs if this click cleared the selection.
                 self.ctx.mouse_mut().block_hint_launcher = !self.ctx.selection_is_empty();
 
+                // macOS drag-out: if the press is inside an existing selection,
+                // defer the clear/start and remember the selection as a drag
+                // candidate. Modifier keys (ctrl/shift) bypass — those modify
+                // the selection rather than dragging it.
+                #[cfg(target_os = "macos")]
+                if !control && !self.ctx.modifiers().state().shift_key() {
+                    let in_selection = self
+                        .ctx
+                        .terminal()
+                        .selection
+                        .as_ref()
+                        .and_then(|s| s.to_range(self.ctx.terminal()))
+                        .is_some_and(|range| range.contains(point));
+                    if in_selection {
+                        if let Some(text) = self
+                            .ctx
+                            .terminal()
+                            .selection_to_string()
+                            .filter(|s| !s.is_empty())
+                        {
+                            let press = winit::dpi::PhysicalPosition::new(
+                                self.ctx.mouse().x as f64,
+                                self.ctx.mouse().y as f64,
+                            );
+                            self.ctx.set_drag_candidate(Some(crate::event::DragCandidate {
+                                press,
+                                text,
+                            }));
+                            return;
+                        }
+                    }
+                }
+
                 self.ctx.clear_selection();
 
                 // Start new empty selection.
@@ -694,6 +823,20 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
+        // macOS drag-out: if a drag candidate is still pending at release, the
+        // gesture is effectively a click-inside-selection. Mirror the standard
+        // ClickState::Click behaviour: clear the selection and start a fresh,
+        // empty one at the mouse point.
+        #[cfg(target_os = "macos")]
+        if button == MouseButton::Left && self.ctx.mouse().drag_candidate.is_some() {
+            self.ctx.set_drag_candidate(None);
+            let display_offset = self.ctx.terminal().grid().display_offset();
+            let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+            let side = self.ctx.mouse().cell_side;
+            self.ctx.clear_selection();
+            self.ctx.start_selection(SelectionType::Simple, point, side);
+        }
+
         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
             let code = match button {
                 MouseButton::Left => 0,
@@ -722,6 +865,48 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
+    /// Update tab-swipe accumulators for a pixel-precise pan delta and dispatch a
+    /// tab switch if the gesture qualifies. Returns `true` when the swipe has
+    /// "fired" (either just now, or earlier in the same gesture) so the caller
+    /// can swallow the remainder of the gesture and skip terminal scrolling.
+    #[cfg(target_os = "macos")]
+    fn tab_swipe_step(&mut self, dx: f64, dy: f64) -> bool {
+        // Native tabs require decorations; without them, tab APIs no-op.
+        if self.ctx.config().window.decorations == Decorations::None {
+            return false;
+        }
+
+        let mouse = self.ctx.mouse_mut();
+        if mouse.tab_swipe_fired {
+            return true;
+        }
+
+        mouse.tab_swipe_accum_x += dx;
+        mouse.tab_swipe_accum_y_abs += dy.abs();
+
+        let x_abs = mouse.tab_swipe_accum_x.abs();
+        if x_abs < TAB_SWIPE_THRESHOLD_PX {
+            return false;
+        }
+
+        // Reject vertical-dominant gestures (the user is scrolling, not swiping).
+        let y_abs = mouse.tab_swipe_accum_y_abs;
+        if y_abs > 0.0 && x_abs / x_abs.hypot(y_abs) < TAB_SWIPE_MIN_COSINE {
+            return false;
+        }
+
+        let go_previous = mouse.tab_swipe_accum_x > 0.0;
+        mouse.tab_swipe_fired = true;
+
+        // macOS swipe-between-pages convention: swipe right → previous, swipe left → next.
+        if go_previous {
+            self.ctx.window().select_previous_tab();
+        } else {
+            self.ctx.window().select_next_tab();
+        }
+        true
+    }
+
     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
         let multiplier = self.ctx.config().scrolling.multiplier;
         match delta {
@@ -739,8 +924,21 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                     TouchPhase::Started => {
                         // Reset offset to zero.
                         self.ctx.mouse_mut().accumulated_scroll = Default::default();
+                        #[cfg(target_os = "macos")]
+                        {
+                            let m = self.ctx.mouse_mut();
+                            m.tab_swipe_accum_x = 0.0;
+                            m.tab_swipe_accum_y_abs = 0.0;
+                            m.tab_swipe_fired = false;
+                        }
                     },
                     TouchPhase::Moved => {
+                        // Two-finger horizontal pan → tab switch (macOS only, native tabs).
+                        #[cfg(target_os = "macos")]
+                        if self.tab_swipe_step(lpos.x, lpos.y) {
+                            return;
+                        }
+
                         // When the angle between (x, 0) and (x, y) is lower than ~25 degrees
                         // (cosine is larger that 0.9) we consider this scrolling as horizontal.
                         if lpos.x.abs() / lpos.x.hypot(lpos.y) > 0.9 {
@@ -751,7 +949,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
                         self.scroll_terminal(lpos.x, lpos.y, multiplier as f64);
                     },
-                    _ => (),
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let m = self.ctx.mouse_mut();
+                            m.tab_swipe_accum_x = 0.0;
+                            m.tab_swipe_accum_y_abs = 0.0;
+                            m.tab_swipe_fired = false;
+                        }
+                    },
                 }
             },
         }
@@ -1037,7 +1243,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// The provided mode, mods, and key must match what is allowed by a binding
     /// for its action to be executed.
     fn process_mouse_bindings(&mut self, event: MouseEvent) -> bool {
-        let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+        let mode = BindingMode::new(
+            self.ctx.terminal().mode(),
+            self.ctx.search_active(),
+            self.ctx.rename_tab_active(),
+        );
         let mouse_mode = self.ctx.mouse_mode();
         let mods = self.ctx.modifiers().state();
         let mouse_bindings = self.ctx.config().mouse_bindings().to_owned();

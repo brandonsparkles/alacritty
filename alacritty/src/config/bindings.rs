@@ -111,6 +111,10 @@ pub enum Action {
     #[config(skip)]
     Search(SearchAction),
 
+    /// Perform tab-rename mode action.
+    #[config(skip)]
+    TabRename(TabRenameAction),
+
     /// Perform mouse binding exclusive action.
     #[config(skip)]
     Mouse(MouseAction),
@@ -223,6 +227,12 @@ pub enum Action {
     /// Create new window in a tab.
     CreateNewTab,
 
+    /// Open the inline tab-rename prompt (macOS native tabs only).
+    PromptRenameTab,
+
+    /// Clear any tab-title override, letting the title revert to the window title.
+    ResetTabTitle,
+
     /// Toggle fullscreen.
     ToggleFullscreen,
 
@@ -332,6 +342,27 @@ pub enum ViAction {
     SemanticSearchForward,
     /// Search backward for selection or word under the cursor.
     SemanticSearchBackward,
+}
+
+/// Tab-rename mode specific actions.
+#[derive(ConfigDeserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TabRenameAction {
+    /// Commit the typed name as the tab title.
+    Confirm,
+    /// Cancel the rename, restoring the previous tab title.
+    Cancel,
+    /// Delete the last character.
+    DeleteChar,
+    /// Delete the last word.
+    DeleteWord,
+    /// Clear the entire input.
+    Clear,
+}
+
+impl From<TabRenameAction> for Action {
+    fn from(action: TabRenameAction) -> Self {
+        Action::TabRename(action)
+    }
 }
 
 /// Search mode specific actions.
@@ -596,6 +627,15 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
         "7",    ModifiersState::SUPER;                                         Action::SelectTab7;
         "8",    ModifiersState::SUPER;                                         Action::SelectTab8;
         "9",    ModifiersState::SUPER;                                         Action::SelectLastTab;
+        "r",    ModifiersState::SUPER | ModifiersState::SHIFT;                 Action::PromptRenameTab;
+        "r",    ModifiersState::SUPER | ModifiersState::SHIFT | ModifiersState::ALT; Action::ResetTabTitle;
+        // Tab rename mode key handling.
+        Enter,                              +BindingMode::RENAME_TAB;          TabRenameAction::Confirm;
+        Escape,                             +BindingMode::RENAME_TAB;          TabRenameAction::Cancel;
+        "c",      ModifiersState::CONTROL,  +BindingMode::RENAME_TAB;          TabRenameAction::Cancel;
+        "u",      ModifiersState::CONTROL,  +BindingMode::RENAME_TAB;          TabRenameAction::Clear;
+        "w",      ModifiersState::CONTROL,  +BindingMode::RENAME_TAB;          TabRenameAction::DeleteWord;
+        Backspace,                          +BindingMode::RENAME_TAB;          TabRenameAction::DeleteChar;
         "0",    ModifiersState::SUPER;                                         Action::ResetFontSize;
         "=",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
         "+",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
@@ -758,25 +798,27 @@ pub struct ModeWrapper {
 bitflags! {
     /// Modes available for key bindings.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct BindingMode: u8 {
-        const APP_CURSOR             = 0b0000_0001;
-        const APP_KEYPAD             = 0b0000_0010;
-        const ALT_SCREEN             = 0b0000_0100;
-        const VI                     = 0b0000_1000;
-        const SEARCH                 = 0b0001_0000;
-        const DISAMBIGUATE_ESC_CODES = 0b0010_0000;
-        const REPORT_ALL_KEYS_AS_ESC = 0b0100_0000;
+    pub struct BindingMode: u16 {
+        const APP_CURSOR             = 0b0000_0000_0000_0001;
+        const APP_KEYPAD             = 0b0000_0000_0000_0010;
+        const ALT_SCREEN             = 0b0000_0000_0000_0100;
+        const VI                     = 0b0000_0000_0000_1000;
+        const SEARCH                 = 0b0000_0000_0001_0000;
+        const DISAMBIGUATE_ESC_CODES = 0b0000_0000_0010_0000;
+        const REPORT_ALL_KEYS_AS_ESC = 0b0000_0000_0100_0000;
+        const RENAME_TAB             = 0b0000_0000_1000_0000;
     }
 }
 
 impl BindingMode {
-    pub fn new(mode: &TermMode, search: bool) -> BindingMode {
+    pub fn new(mode: &TermMode, search: bool, rename_tab: bool) -> BindingMode {
         let mut binding_mode = BindingMode::empty();
         binding_mode.set(BindingMode::APP_CURSOR, mode.contains(TermMode::APP_CURSOR));
         binding_mode.set(BindingMode::APP_KEYPAD, mode.contains(TermMode::APP_KEYPAD));
         binding_mode.set(BindingMode::ALT_SCREEN, mode.contains(TermMode::ALT_SCREEN));
         binding_mode.set(BindingMode::VI, mode.contains(TermMode::VI));
         binding_mode.set(BindingMode::SEARCH, search);
+        binding_mode.set(BindingMode::RENAME_TAB, rename_tab);
         binding_mode.set(
             BindingMode::DISAMBIGUATE_ESC_CODES,
             mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
@@ -1076,6 +1118,10 @@ impl<'a> Deserialize<'a> for RawBinding {
                                 SearchAction::deserialize(value.clone())
                             {
                                 Some(search_action.into())
+                            } else if let Ok(tab_rename_action) =
+                                TabRenameAction::deserialize(value.clone())
+                            {
+                                Some(tab_rename_action.into())
                             } else if let Ok(mouse_action) = MouseAction::deserialize(value.clone())
                             {
                                 Some(mouse_action.into())

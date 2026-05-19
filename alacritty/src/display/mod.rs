@@ -60,6 +60,8 @@ use crate::string::{ShortenDirection, StrShortener};
 pub mod color;
 pub mod content;
 pub mod cursor;
+#[cfg(target_os = "macos")]
+pub mod drag_source;
 pub mod hint;
 pub mod window;
 
@@ -338,6 +340,33 @@ impl DisplayUpdate {
     }
 }
 
+/// Current activity status driving the tab label's icon prefix.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub enum TabActivity {
+    /// No subprocess running, no pending alerts.
+    #[default]
+    Idle,
+    /// A foreground subprocess (non-shell) is running.
+    Working,
+    /// Bell rang or output occurred while unfocused — pending user attention.
+    NeedsAttention,
+}
+
+#[cfg(target_os = "macos")]
+impl TabActivity {
+    /// Icon prefix (with trailing space) inserted before the tab label.
+    pub fn prefix(self) -> Option<&'static str> {
+        match self {
+            // Static braille glyph; an animated frame cycle is a follow-up.
+            TabActivity::Working => Some("⠿ "),
+            // U+1F535 LARGE BLUE CIRCLE.
+            TabActivity::NeedsAttention => Some("🔵 "),
+            TabActivity::Idle => None,
+        }
+    }
+}
+
 /// The display wraps a window, font rasterizer, and GPU renderer.
 pub struct Display {
     pub window: Window,
@@ -387,6 +416,16 @@ pub struct Display {
 
     // Mouse point position when highlighting hints.
     hint_mouse_point: Option<Point>,
+
+    /// User-set tab title override (from a confirmed rename), or `None` to fall
+    /// back to the derived window title. macOS native tabs only.
+    #[cfg(target_os = "macos")]
+    pub tab_user_title: Option<String>,
+
+    /// Current tab activity status, drives an icon prefix on the tab label.
+    /// macOS native tabs only.
+    #[cfg(target_os = "macos")]
+    pub tab_activity: TabActivity,
 
     renderer: ManuallyDrop<Renderer>,
     renderer_preference: Option<RendererPreference>,
@@ -539,7 +578,32 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
+            #[cfg(target_os = "macos")]
+            tab_user_title: None,
+            #[cfg(target_os = "macos")]
+            tab_activity: TabActivity::default(),
         })
+    }
+
+    /// Compose `(tab_user_title or window title)` with the activity prefix and
+    /// push it to the native tab label. macOS only.
+    #[cfg(target_os = "macos")]
+    pub fn apply_tab_title(&self) {
+        let prefix = self.tab_activity.prefix();
+        // When there's no user override and no prefix, let the system derive
+        // the tab title from the NSWindow title.
+        match (self.tab_user_title.as_deref(), prefix) {
+            (None, None) => self.window.set_tab_title_raw(None),
+            (Some(user), None) => self.window.set_tab_title_raw(Some(user)),
+            (None, Some(p)) => {
+                let composed = format!("{p}{}", self.window.title());
+                self.window.set_tab_title_raw(Some(&composed));
+            },
+            (Some(user), Some(p)) => {
+                let composed = format!("{p}{user}");
+                self.window.set_tab_title_raw(Some(&composed));
+            },
+        }
     }
 
     #[inline]

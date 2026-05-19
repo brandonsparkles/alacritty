@@ -61,16 +61,32 @@ png = { version = "0.17.5", default-features = false, optional = true }
 objc2 = "0.6.1"
 objc2-foundation = { version = "0.3.1", default-features = false, features = [
     "std",
+    "NSArray",
+    "NSGeometry",
     "NSString",
     "NSLocale",
     "NSUserDefaults",
 ] }
 objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "std",
+    "NSAlert",
+    "NSApplication",
+    "NSButton",
     "NSColorSpace",
+    "NSControl",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSEvent",
+    "NSImage",
+    "NSPanel",
+    "NSPasteboard",
+    "NSPasteboardItem",
     "NSResponder",
+    "NSRunningApplication",
     "NSView",
     "NSWindow",
+    "NSWindowTab",
 ] }
 
 [target.'cfg(windows)'.dependencies]

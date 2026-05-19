@@ -23,7 +23,8 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::MainThreadMarker,
-    objc2_app_kit::{NSColorSpace, NSView},
+    objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSColorSpace, NSView},
+    objc2_foundation::NSString,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -510,6 +511,89 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn tabbing_id(&self) -> String {
         self.window.tabbing_identifier()
+    }
+
+    /// Begin a system drag carrying `text`. `origin` is the local press point
+    /// in physical pixels (caller supplies the same physical coordinate it got
+    /// from winit). Returns `true` if AppKit accepted the drag.
+    #[cfg(target_os = "macos")]
+    pub fn begin_text_drag(&self, origin_physical: PhysicalPosition<f64>, text: &str) -> bool {
+        use crate::display::drag_source;
+        use objc2_foundation::NSPoint;
+
+        let ns_view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                if MainThreadMarker::new().is_none() {
+                    return false;
+                }
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return false,
+        };
+
+        // Convert winit's top-left-origin physical coords to AppKit's
+        // bottom-left-origin logical view coords.
+        let scale = self.window.scale_factor() as f64;
+        let view_height = ns_view.bounds().size.height;
+        let logical_x = origin_physical.x / scale;
+        let logical_y = view_height - (origin_physical.y / scale);
+
+        drag_source::begin_text_drag(ns_view, NSPoint::new(logical_x, logical_y), text)
+    }
+
+    /// Show a modal close-confirmation dialog. Returns `true` if the user
+    /// chose to close, `false` if they cancelled.
+    #[cfg(target_os = "macos")]
+    pub fn confirm_close(&self, prompt: &str, detail: &str) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            // Not on the main thread; fall through to closing.
+            return true;
+        };
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(&NSString::from_str(prompt));
+        if !detail.is_empty() {
+            alert.setInformativeText(&NSString::from_str(detail));
+        }
+        // Order matters — first added is the default; we want "Cancel" to be
+        // the safe default so an inadvertent Return doesn't close anything.
+        let _close = alert.addButtonWithTitle(&NSString::from_str("Close"));
+        let _cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        // Make Cancel the default by giving it the Return key equivalent.
+        // (addButtonWithTitle on macOS assigns ⏎ to the first button by default;
+        // we swap by setting keyEquivalent on Cancel and clearing on Close.)
+        _close.setKeyEquivalent(&NSString::from_str(""));
+        _cancel.setKeyEquivalent(&NSString::from_str("\r"));
+
+        let response = alert.runModal();
+        response == NSAlertFirstButtonReturn
+    }
+
+    /// Low-level NSWindowTab title setter — callers should prefer the
+    /// composed [`crate::display::Display::apply_tab_title`] path so the
+    /// user-set title and activity prefix stay coordinated.
+    ///
+    /// Passing `Some(text)` persists across NSWindow title changes (the shell
+    /// can keep updating the window title without affecting the tab label).
+    /// Passing `None` reverts the tab title to the auto-derived window title.
+    #[cfg(target_os = "macos")]
+    pub fn set_tab_title_raw(&self, title: Option<&str>) {
+        let ns_view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                assert!(MainThreadMarker::new().is_some());
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return,
+        };
+        let Some(ns_window) = ns_view.window() else { return };
+        let tab = ns_window.tab();
+        match title {
+            Some(text) => {
+                let ns_text = NSString::from_str(text);
+                tab.setTitle(Some(&ns_text));
+            },
+            None => tab.setTitle(None),
+        }
     }
 }
 
