@@ -1,10 +1,17 @@
 //! macOS-only window-session persistence.
 //!
 //! Writes a JSON snapshot of all open windows to
-//! `~/Library/Saved Application State/org.alacritty.savedState/session.json`
-//! on every meaningful change. macOS clears that directory when the user
-//! shift-clicks the Dock icon to "Reopen Without Restoring", so we get the
-//! standard opt-out for free.
+//! `~/Library/Application Support/org.alacritty/session.json` on every
+//! meaningful change.
+//!
+//! Note: this used to live inside
+//! `~/Library/Saved Application State/org.alacritty.savedState/` to get
+//! macOS's "Reopen Without Restoring" opt-out for free. That coupling
+//! turned out to be a footgun — macOS wipes that directory after a
+//! crash-loop, so an unrelated SIGABRT could erase a perfectly good session.
+//! We now persist outside of macOS-managed state and implement the opt-out
+//! ourselves: holding Shift at launch (see [`should_clear_on_launch`] in
+//! `main.rs`) clears the saved session before [`Session::load`] runs.
 //!
 //! On launch, if the file exists *and* no command/working-directory was
 //! supplied on the CLI, [`Session::load`] returns the recorded state which
@@ -36,6 +43,14 @@ pub struct WindowState {
     /// Window position in screen coordinates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<(i32, i32)>,
+    /// Optional shell command to auto-execute after the restored shell
+    /// reaches its first prompt. Set when the tab was running an
+    /// allowlisted AI CLI (claude/codex/…) and a session identifier was
+    /// recoverable. The command typically embeds the session id so the
+    /// CLI resumes the prior conversation rather than starting fresh.
+    /// See `cli_resume.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<String>,
 }
 
 /// Persisted snapshot of all open windows at the time of save.
@@ -54,16 +69,18 @@ fn default_version() -> u32 {
 const CURRENT_VERSION: u32 = 1;
 
 impl Session {
-    /// Path to the persisted session file.
+    /// Path to the persisted session directory.
     ///
-    /// Uses the macOS "Saved Application State" directory so the file is
-    /// honoured by the system's "Reopen Without Restoring" gesture.
+    /// Lives under `~/Library/Application Support/org.alacritty/` so the
+    /// session survives macOS's saved-state wipes (e.g. after a crash loop).
+    /// Opt-out for restoration is provided by the Shift-at-launch check in
+    /// `main.rs`, not by macOS managing this directory.
     pub fn path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
         let mut path = PathBuf::from(home);
         path.push("Library");
-        path.push("Saved Application State");
-        path.push("org.alacritty.savedState");
+        path.push("Application Support");
+        path.push("org.alacritty");
         Some(path)
     }
 
@@ -95,7 +112,18 @@ impl Session {
 
     /// Persist this session atomically. Best-effort — logs but does not panic
     /// on filesystem failure.
+    ///
+    /// Empty-window snapshots are NOT written: if the user closes every
+    /// window and the periodic tick fires before they quit (or while
+    /// alacritty idles with no windows), we don't want to overwrite the
+    /// last good state with `windows: []` — that would make the next
+    /// launch restore nothing. The Shift-at-launch opt-out clears
+    /// explicitly when the user really wants a fresh start.
     pub fn save(&self) {
+        if self.windows.is_empty() {
+            return;
+        }
+
         let Some(dir) = Self::path() else { return };
         let Some(file) = Self::file() else { return };
 
@@ -128,9 +156,9 @@ impl Session {
         }
     }
 
-    /// Remove the saved state. Currently unused — kept for future opt-out
-    /// flows ("Clear Saved State" menu item, etc.).
-    #[allow(dead_code)]
+    /// Remove the saved state. Called at launch when the user holds Shift
+    /// (the manual replacement for macOS's "Reopen Without Restoring"
+    /// gesture, now that we no longer live in the macOS-managed dir).
     pub fn clear() {
         if let Some(file) = Self::file() {
             let _ = fs::remove_file(file);

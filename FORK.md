@@ -20,8 +20,7 @@ non-macOS code never reaches.
 | **Needs-attention indicator** | A `🔵 ` prefix is added when the terminal bell rings while the tab is unfocused. Cleared on focus. |
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
 | **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
-| **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Honors macOS shift-Dock "Reopen Without Restoring" gesture. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
-| **Disabled: drag selected text out** | Was crashing AppKit due to a missing `imageComponentsProvider` on the `NSDraggingItem`. Disabled until the dragging pipeline is rebuilt — `Window::begin_text_drag` returns `false`; the fallback in `mouse_moved` starts a fresh selection at the press point. |
+| **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
 
 ## Keybindings reference
 

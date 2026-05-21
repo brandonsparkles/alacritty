@@ -27,7 +27,6 @@ use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 #[cfg(target_os = "macos")]
-use winit::dpi::PhysicalPosition;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
@@ -183,6 +182,9 @@ impl Processor {
             _ => (window_options, Vec::new()),
         };
 
+        #[cfg(target_os = "macos")]
+        let first_resume_command = first_options.restored_resume_command.clone();
+
         let window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
@@ -195,6 +197,13 @@ impl Processor {
         {
             Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
             self.start_session_save_polling(window_context.id());
+            if let Some(cmd) = first_resume_command {
+                Self::schedule_resume_command(
+                    &mut self.scheduler,
+                    window_context.id(),
+                    cmd,
+                );
+            }
         }
         self.windows.insert(window_context.id(), window_context);
 
@@ -266,6 +275,25 @@ impl Processor {
         scheduler.schedule(event, std::time::Duration::from_millis(500), true, timer_id);
     }
 
+    /// Schedule a one-shot delayed dispatch of a resume command into a
+    /// restored window's PTY. The 500 ms delay gives the shell time to print
+    /// its first prompt before we synthesise input — without it, the command
+    /// would land in the shell's pre-prompt input buffer and may be ignored
+    /// or mis-rendered.
+    #[cfg(target_os = "macos")]
+    fn schedule_resume_command(
+        scheduler: &mut Scheduler,
+        window_id: WindowId,
+        command: String,
+    ) {
+        let timer_id = TimerId::new(Topic::ResumeCommand, window_id);
+        if scheduler.scheduled(timer_id) {
+            return;
+        }
+        let event = Event::new(EventType::ResumeCommand(command), window_id);
+        scheduler.schedule(event, std::time::Duration::from_millis(500), false, timer_id);
+    }
+
     /// Create a new terminal window.
     pub fn create_window(
         &mut self,
@@ -280,6 +308,9 @@ impl Processor {
         config_overrides.extend_from_slice(&self.global_ipc_options);
         let mut config = self.config.clone();
         config = config_overrides.override_config_rc(config);
+
+        #[cfg(target_os = "macos")]
+        let resume_command = options.restored_resume_command.clone();
 
         let window_context = WindowContext::additional(
             gl_config,
@@ -297,6 +328,9 @@ impl Processor {
             // closed since last create).
             if self.session_save_host.is_none() {
                 self.start_session_save_polling(window_context.id());
+            }
+            if let Some(cmd) = resume_command {
+                Self::schedule_resume_command(&mut self.scheduler, window_context.id(), cmd);
             }
         }
         self.windows.insert(window_context.id(), window_context);
@@ -484,6 +518,17 @@ impl ApplicationHandler<Event> for Processor {
             #[cfg(target_os = "macos")]
             (EventType::SessionSaveTick, _) => {
                 self.save_session();
+            },
+            // Delayed dispatch of a resume command into a restored window
+            // (macOS only). Synthesises the saved shell command as PTY input
+            // so the shell sees it exactly as if the user had typed it.
+            #[cfg(target_os = "macos")]
+            (EventType::ResumeCommand(cmd), Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    let mut bytes = cmd.clone().into_bytes();
+                    bytes.push(b'\n');
+                    window_context.send_pty_bytes(bytes);
+                }
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
@@ -674,6 +719,9 @@ fn apply_session_overrides(opts: &mut WindowOptions, entry: &crate::session::Win
     if let Some(position) = entry.position {
         opts.restored_position = Some(position);
     }
+    if let Some(cmd) = entry.resume_command.as_ref().filter(|c| !c.is_empty()) {
+        opts.restored_resume_command = Some(cmd.clone());
+    }
 }
 
 /// Alacritty events.
@@ -722,6 +770,11 @@ pub enum EventType {
     /// Periodic session snapshot for window restoration (macOS).
     #[cfg(target_os = "macos")]
     SessionSaveTick,
+    /// Delayed shell command to dispatch into a restored window's PTY once
+    /// its shell is ready. Carries the literal command string (no trailing
+    /// newline — the handler appends one).
+    #[cfg(target_os = "macos")]
+    ResumeCommand(String),
 }
 
 impl From<TerminalEvent> for EventType {
@@ -803,24 +856,6 @@ impl Default for SearchState {
             dfas: Default::default(),
         }
     }
-}
-
-/// Pending drag-out gesture initiated by LMB-down inside an existing selection.
-/// We hold this until either the mouse moves past a small threshold (drag) or
-/// is released (treated as a normal click that clears the selection).
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
-pub struct DragCandidate {
-    /// Mouse position (physical px) when LMB was first pressed.
-    pub press: PhysicalPosition<f64>,
-    /// Grid point at press time. Used by the abort path so a press-to-drag
-    /// gesture creates a selection spanning from press → current rather than
-    /// a degenerate one at the current cursor.
-    pub press_point: alacritty_terminal::index::Point,
-    /// Side of the cell at the press point.
-    pub press_side: alacritty_terminal::index::Side,
-    /// Selection text captured at press time; used as the drag payload.
-    pub text: String,
 }
 
 /// Tab rename prompt state.
@@ -1527,11 +1562,6 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn reset_tab_title(&mut self) {}
 
     #[cfg(target_os = "macos")]
-    fn set_drag_candidate(&mut self, candidate: Option<DragCandidate>) {
-        self.mouse.drag_candidate = candidate;
-    }
-
-    #[cfg(target_os = "macos")]
     fn confirm_close_if_busy(&mut self) -> bool {
         // Only prompt if a foreground subprocess (other than the shell) is running.
         let fpgid = unsafe { libc::tcgetpgrp(self.master_fd) };
@@ -2145,11 +2175,6 @@ pub struct Mouse {
     /// Whether a tab-switch has already fired during the current pan gesture.
     pub tab_swipe_fired: bool,
 
-    /// Pending drag-out candidate set when LMB was pressed inside an existing
-    /// selection. macOS only; iTerm-style drag-out.
-    #[cfg(target_os = "macos")]
-    pub drag_candidate: Option<DragCandidate>,
-
     /// Timestamp of the last Escape key press, used to detect a double-tap and
     /// emit a "clear line" sequence to the PTY (a la Claude Code).
     pub last_escape_press: Option<Instant>,
@@ -2174,8 +2199,6 @@ impl Default for Mouse {
             tab_swipe_accum_x: 0.0,
             tab_swipe_accum_y_abs: 0.0,
             tab_swipe_fired: false,
-            #[cfg(target_os = "macos")]
-            drag_candidate: None,
             last_escape_press: None,
         }
     }
@@ -2220,28 +2243,64 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     /// Poll the shell's child-process set and update the tab activity
     /// indicator. Fired on a recurring scheduler tick (macOS only).
     ///
-    /// We detect "subprocess running" by enumerating direct children of the
-    /// shell PID, rather than comparing the TTY's foreground process group.
-    /// Some TUIs (notably Codex and Copilot) share their parent shell's
-    /// process group, so the foreground-pgid heuristic produces false
-    /// negatives. The child-set check works regardless of pgid semantics.
+    /// Three-state derivation:
+    ///   - no direct children of the shell        → `Idle`
+    ///   - any direct child is in SRUN            → `Working` (⠿)
+    ///   - all direct children blocked for ≥ 2 s  → `NeedsAttention` (🔵)
+    ///     when the tab is also unfocused
+    ///
+    /// Idle-triggered `NeedsAttention` is allowed to revert to `Working`
+    /// once the child resumes work (e.g. user types into claude → next
+    /// tick sees the child runnable). Bell-triggered `NeedsAttention`
+    /// (set by `TerminalEvent::Bell`) is sticky until focus gain;
+    /// `tab_attention_from_bell` tracks which path raised it.
+    ///
+    /// We use direct children of the shell, not the TTY's foreground
+    /// process group — some TUIs (codex/copilot) share their parent
+    /// shell's pgid so the pgid heuristic gives false negatives.
     #[cfg(target_os = "macos")]
     fn poll_tab_activity(&mut self) {
+        use std::time::{Duration, Instant};
+
         use crate::display::TabActivity;
 
-        // Never overwrite NeedsAttention except via focus clear (handled elsewhere).
-        if self.ctx.display.tab_activity == TabActivity::NeedsAttention {
+        /// Wait this long between "all children blocked" and raising the
+        /// 🔵 indicator. Short enough to feel responsive, long enough to
+        /// ride over a streaming tool's brief between-chunk sleeps.
+        const IDLE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+        // Bell-triggered NeedsAttention is sticky — only focus gain clears it.
+        if self.ctx.display.tab_activity == TabActivity::NeedsAttention
+            && self.ctx.display.tab_attention_from_bell
+        {
             return;
         }
 
-        let new_status = if crate::macos::proc::has_children(self.ctx.shell_pid as i32) {
-            TabActivity::Working
-        } else {
+        let children = crate::macos::proc::list_children(self.ctx.shell_pid as i32);
+        let focused = self.ctx.terminal.is_focused;
+
+        let next = if children.is_empty() {
+            self.ctx.display.child_idle_since = None;
             TabActivity::Idle
+        } else if children.iter().all(|&pid| crate::macos::proc::is_idle(pid)) {
+            let now = Instant::now();
+            let started = *self.ctx.display.child_idle_since.get_or_insert(now);
+            if !focused && now.duration_since(started) >= IDLE_DEBOUNCE {
+                TabActivity::NeedsAttention
+            } else {
+                TabActivity::Working
+            }
+        } else {
+            self.ctx.display.child_idle_since = None;
+            TabActivity::Working
         };
 
-        if new_status != self.ctx.display.tab_activity {
-            self.ctx.display.tab_activity = new_status;
+        if next != self.ctx.display.tab_activity {
+            // Polling owns this transition — not bell.
+            if next == TabActivity::NeedsAttention {
+                self.ctx.display.tab_attention_from_bell = false;
+            }
+            self.ctx.display.tab_activity = next;
             self.ctx.display.apply_tab_title();
         }
     }
@@ -2301,14 +2360,17 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 
                         // macOS tab activity: ringing bell on an unfocused tab
                         // raises the blue "needs attention" indicator.
+                        // Sticky until focus gain (see `poll_tab_activity`).
                         #[cfg(target_os = "macos")]
-                        if !focused
-                            && self.ctx.display.tab_activity
+                        if !focused {
+                            if self.ctx.display.tab_activity
                                 != crate::display::TabActivity::NeedsAttention
-                        {
-                            self.ctx.display.tab_activity =
-                                crate::display::TabActivity::NeedsAttention;
-                            self.ctx.display.apply_tab_title();
+                            {
+                                self.ctx.display.tab_activity =
+                                    crate::display::TabActivity::NeedsAttention;
+                                self.ctx.display.apply_tab_title();
+                            }
+                            self.ctx.display.tab_attention_from_bell = true;
                         }
 
                         // Ring visual bell.
@@ -2364,7 +2426,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::Frame => (),
                 // Handled at the outer Processor level; per-window handler ignores.
                 #[cfg(target_os = "macos")]
-                EventType::SessionSaveTick => (),
+                EventType::SessionSaveTick | EventType::ResumeCommand(_) => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -2430,12 +2492,19 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         if is_focused {
                             self.ctx.window().set_urgent(false);
                             // Clear "needs attention" on tab focus (macOS).
+                            // Also drop the bell-sticky flag and idle timer
+                            // so the next tick re-derives state cleanly.
                             #[cfg(target_os = "macos")]
-                            if self.ctx.display.tab_activity
-                                == crate::display::TabActivity::NeedsAttention
                             {
-                                self.ctx.display.tab_activity = crate::display::TabActivity::Idle;
-                                self.ctx.display.apply_tab_title();
+                                if self.ctx.display.tab_activity
+                                    == crate::display::TabActivity::NeedsAttention
+                                {
+                                    self.ctx.display.tab_activity =
+                                        crate::display::TabActivity::Idle;
+                                    self.ctx.display.apply_tab_title();
+                                }
+                                self.ctx.display.tab_attention_from_bell = false;
+                                self.ctx.display.child_idle_since = None;
                             }
                         }
                         // Focus changes are a good moment to refresh the

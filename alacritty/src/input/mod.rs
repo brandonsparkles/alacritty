@@ -76,12 +76,6 @@ const TAB_SWIPE_THRESHOLD_PX: f64 = 50.0;
 #[cfg(target_os = "macos")]
 const TAB_SWIPE_MIN_COSINE: f64 = 0.9;
 
-/// Pixel distance the mouse must travel after pressing inside a selection
-/// before we hand the gesture to AppKit as a drag-out. iTerm uses ~4 px;
-/// generous so accidental motion during a click doesn't trigger a drag.
-#[cfg(target_os = "macos")]
-const DRAG_OUT_THRESHOLD_PX: f64 = 5.0;
-
 /// Distance before a touch input is considered a drag.
 const MAX_TAP_DISTANCE: f64 = 20.;
 
@@ -160,9 +154,6 @@ pub trait ActionContext<T: EventListener> {
     fn confirm_close_if_busy(&mut self) -> bool {
         true
     }
-    /// Stash or clear the drag-out candidate for the current mouse gesture.
-    #[cfg(target_os = "macos")]
-    fn set_drag_candidate(&mut self, _candidate: Option<crate::event::DragCandidate>) {}
     fn on_typing_start(&mut self) {}
     fn toggle_vi_mode(&mut self) {}
     fn inline_search_state(&mut self) -> &mut InlineSearchState;
@@ -525,43 +516,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
 
-        // macOS drag-out: if we have a pending drag candidate and the mouse
-        // has moved past the threshold from the press point, hand off to
-        // AppKit. Once AppKit takes the drag, NSEvent stops dispatching
-        // mouseDragged to our view until the drag concludes.
-        #[cfg(target_os = "macos")]
-        if lmb_pressed {
-            if let Some(candidate) = self.ctx.mouse().drag_candidate.clone() {
-                let dx = position.x - candidate.press.x;
-                let dy = position.y - candidate.press.y;
-                if dx.hypot(dy) >= DRAG_OUT_THRESHOLD_PX {
-                    self.ctx.set_drag_candidate(None);
-                    let started = self
-                        .ctx
-                        .window()
-                        .begin_text_drag(candidate.press, &candidate.text);
-                    if started {
-                        // AppKit owns the gesture now; bail before any selection edits.
-                        return;
-                    }
-                    // Drag couldn't start (e.g. no current event, or drag-out
-                    // is disabled). Fall through to "click-and-drag selects
-                    // a new region": clear the old selection, start a fresh
-                    // one at the press point, then extend to the current
-                    // cursor — so the press-to-current segment isn't dropped.
-                    self.ctx.clear_selection();
-                    self.ctx.start_selection(
-                        SelectionType::Simple,
-                        candidate.press_point,
-                        candidate.press_side,
-                    );
-                    let display_offset = self.ctx.terminal().grid().display_offset();
-                    let current = self.ctx.mouse().point(&size_info, display_offset);
-                    self.ctx.update_selection(current, self.ctx.mouse().cell_side);
-                }
-            }
-        }
-
         if !self.ctx.selection_is_empty() && (lmb_pressed || rmb_pressed) {
             self.update_selection_scrolling(y);
         }
@@ -770,41 +724,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 // Don't launch URLs if this click cleared the selection.
                 self.ctx.mouse_mut().block_hint_launcher = !self.ctx.selection_is_empty();
 
-                // macOS drag-out: if the press is inside an existing selection,
-                // defer the clear/start and remember the selection as a drag
-                // candidate. Modifier keys (ctrl/shift) bypass — those modify
-                // the selection rather than dragging it.
-                #[cfg(target_os = "macos")]
-                if !control && !self.ctx.modifiers().state().shift_key() {
-                    let in_selection = self
-                        .ctx
-                        .terminal()
-                        .selection
-                        .as_ref()
-                        .and_then(|s| s.to_range(self.ctx.terminal()))
-                        .is_some_and(|range| range.contains(point));
-                    if in_selection {
-                        if let Some(text) = self
-                            .ctx
-                            .terminal()
-                            .selection_to_string()
-                            .filter(|s| !s.is_empty())
-                        {
-                            let press = winit::dpi::PhysicalPosition::new(
-                                self.ctx.mouse().x as f64,
-                                self.ctx.mouse().y as f64,
-                            );
-                            self.ctx.set_drag_candidate(Some(crate::event::DragCandidate {
-                                press,
-                                press_point: point,
-                                press_side: side,
-                                text,
-                            }));
-                            return;
-                        }
-                    }
-                }
-
                 self.ctx.clear_selection();
 
                 // Start new empty selection.
@@ -833,20 +752,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
-        // macOS drag-out: if a drag candidate is still pending at release, the
-        // gesture is effectively a click-inside-selection. Mirror the standard
-        // ClickState::Click behaviour: clear the selection and start a fresh,
-        // empty one at the mouse point.
-        #[cfg(target_os = "macos")]
-        if button == MouseButton::Left && self.ctx.mouse().drag_candidate.is_some() {
-            self.ctx.set_drag_candidate(None);
-            let display_offset = self.ctx.terminal().grid().display_offset();
-            let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
-            let side = self.ctx.mouse().cell_side;
-            self.ctx.clear_selection();
-            self.ctx.start_selection(SelectionType::Simple, point, side);
-        }
-
         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
             let code = match button {
                 MouseButton::Left => 0,

@@ -321,6 +321,14 @@ pub struct WindowOptions {
     pub restored_position: Option<(i32, i32)>,
 
     #[clap(skip)]
+    #[cfg(target_os = "macos")]
+    /// Shell command to dispatch into the new PTY once the shell prompts,
+    /// restored from a previous session. Typically `claude --resume <uuid>`
+    /// so the tab's prior AI conversation picks up where it left off.
+    /// See `cli_resume.rs`.
+    pub restored_resume_command: Option<String>,
+
+    #[clap(skip)]
     #[cfg(not(any(target_os = "macos", windows)))]
     /// `ActivationToken` that we pass to winit.
     pub activation_token: Option<String>,

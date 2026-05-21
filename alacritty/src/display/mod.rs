@@ -60,8 +60,6 @@ use crate::string::{ShortenDirection, StrShortener};
 pub mod color;
 pub mod content;
 pub mod cursor;
-#[cfg(target_os = "macos")]
-pub mod drag_source;
 pub mod hint;
 pub mod window;
 
@@ -427,6 +425,21 @@ pub struct Display {
     #[cfg(target_os = "macos")]
     pub tab_activity: TabActivity,
 
+    /// When the foreground child first transitioned to a blocked state.
+    /// Used by the idle-detection path to fire `NeedsAttention` after a
+    /// debounce window of continuous idleness (a tool like claude/copilot
+    /// blocked on stdin for ≥ 2 s while the tab is unfocused).
+    #[cfg(target_os = "macos")]
+    pub child_idle_since: Option<Instant>,
+
+    /// `true` when the current `NeedsAttention` was triggered by a terminal
+    /// BEL. Sticky-on-unfocus: polling must NOT clear a bell-triggered
+    /// attention even if the child resumes work; only focus gain clears it.
+    /// Idle-triggered `NeedsAttention` (this flag false) is allowed to clear
+    /// itself when the child becomes runnable again.
+    #[cfg(target_os = "macos")]
+    pub tab_attention_from_bell: bool,
+
     renderer: ManuallyDrop<Renderer>,
     renderer_preference: Option<RendererPreference>,
 
@@ -582,6 +595,10 @@ impl Display {
             tab_user_title: None,
             #[cfg(target_os = "macos")]
             tab_activity: TabActivity::default(),
+            #[cfg(target_os = "macos")]
+            child_idle_since: None,
+            #[cfg(target_os = "macos")]
+            tab_attention_from_bell: false,
         })
     }
 

@@ -28,6 +28,8 @@ use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use alacritty_terminal::tty;
 
 mod cli;
+#[cfg(target_os = "macos")]
+mod cli_resume;
 mod clipboard;
 mod config;
 mod daemon;
@@ -69,6 +71,14 @@ use crate::macos::locale;
 use crate::polling::{IoListener, ipc};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // macOS: clear saved session if the user is holding Shift at launch.
+    // Replaces the lost-by-design "Reopen Without Restoring" opt-out we
+    // used to get for free by living under Saved Application State.
+    #[cfg(target_os = "macos")]
+    if should_clear_session_on_launch() {
+        session::Session::clear();
+    }
+
     #[cfg(windows)]
     panic::attach_handler();
 
@@ -253,4 +263,19 @@ fn log_config_path(config: &UiConfig) {
     }
 
     info!("{msg}");
+}
+
+/// macOS: returns `true` when Shift is held at process start. Used as the
+/// "Reopen Without Restoring" opt-out for our custom session persistence
+/// (replacing the macOS savedState-dir wipe behavior we used to rely on).
+///
+/// Reads `+[NSEvent modifierFlags]`, which reflects the current global
+/// keyboard state — if the user shift-clicks the Dock icon to launch
+/// Alacritty, Shift is still down by the time `main()` runs and this
+/// returns true.
+#[cfg(target_os = "macos")]
+fn should_clear_session_on_launch() -> bool {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags};
+    let flags = NSEvent::modifierFlags_class();
+    flags.contains(NSEventModifierFlags::Shift)
 }

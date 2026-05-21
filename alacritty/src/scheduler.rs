@@ -33,6 +33,8 @@ pub enum Topic {
     TabActivity,
     #[cfg(target_os = "macos")]
     SessionSave,
+    #[cfg(target_os = "macos")]
+    ResumeCommand,
 }
 
 /// Event scheduled to be emitted at a specific time.

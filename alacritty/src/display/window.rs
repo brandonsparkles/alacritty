@@ -527,18 +527,6 @@ impl Window {
         self.window.tabbing_identifier()
     }
 
-    /// Begin a system drag carrying `text`.
-    ///
-    /// **Temporarily disabled**: the current `NSDraggingItem` setup omits an
-    /// `imageComponentsProvider`, which AppKit raises an `NSException` over —
-    /// and Rust treats that as a foreign exception and SIGABRTs. Returning
-    /// `false` short-circuits the caller back to the normal click handling
-    /// until the drag pipeline is rebuilt with proper image components.
-    #[cfg(target_os = "macos")]
-    pub fn begin_text_drag(&self, _origin_physical: PhysicalPosition<f64>, _text: &str) -> bool {
-        false
-    }
-
     /// Show a modal close-confirmation dialog. Returns `true` if the user
     /// chose to close, `false` if they cancelled.
     #[cfg(target_os = "macos")]

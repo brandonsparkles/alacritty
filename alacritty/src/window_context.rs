@@ -543,13 +543,25 @@ impl WindowContext {
             .outer_position()
             .ok()
             .map(|p| (p.x, p.y));
+        let resume_command =
+            crate::cli_resume::resume_command_for(self.shell_pid as i32, &working_directory);
         Some(crate::session::WindowState {
             working_directory,
             tab_title,
             tabbing_id,
             size,
             position,
+            resume_command,
         })
+    }
+
+    /// Send raw bytes to this window's PTY as if they had been typed by the
+    /// user. Used to deliver the delayed "resume command" after a session
+    /// restore (see `cli_resume.rs`).
+    #[cfg(target_os = "macos")]
+    pub fn send_pty_bytes(&mut self, bytes: Vec<u8>) {
+        use alacritty_terminal::event::Notify;
+        self.notifier.notify(bytes);
     }
 
     /// Write the ref test results to the disk.
