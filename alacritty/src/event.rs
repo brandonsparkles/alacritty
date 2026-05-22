@@ -102,6 +102,68 @@ pub struct Processor {
     /// Window currently hosting the periodic session-save timer (macOS).
     #[cfg(target_os = "macos")]
     session_save_host: Option<WindowId>,
+    /// Daily usage budget — enforces the 3-hour cap and 02:00–06:00 sleep
+    /// window. Ticked once per second while any window is focused; persisted
+    /// to `~/Library/Application Support/org.alacritty/usage.json`.
+    #[cfg(target_os = "macos")]
+    budget: crate::budget::Budget,
+    /// Window currently hosting the 1-second budget ticker (macOS). Mirrors
+    /// the session_save_host pattern so the timer survives window closes.
+    #[cfg(target_os = "macos")]
+    budget_tick_host: Option<WindowId>,
+    /// App-level focus state machine for hide-when-inactive. Computed each
+    /// budget tick from the per-window focus flags.
+    #[cfg(target_os = "macos")]
+    app_focus_state: AppFocusState,
+}
+
+/// Application-level focus state used by the budget ticker's hide-after-grace
+/// logic. macOS only.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+enum AppFocusState {
+    /// At least one window has keyboard focus.
+    Active,
+    /// No window focused, but the app's windows are still visible. The
+    /// `Instant` is when the app fell out of active state — used to compute
+    /// the grace window before hiding.
+    InGrace(std::time::Instant),
+    /// `NSApp.hide()` has been called; alacritty's windows are not on
+    /// screen. We stay in this state until a window regains focus
+    /// (i.e. the user Cmd-Tabs back).
+    Hidden,
+}
+
+/// Pure state-transition helper for the BudgetTick focus state machine.
+///
+/// Returns `(next_state, hit_grace_expiry)`. `hit_grace_expiry` is `true`
+/// when this transition just moved to `Hidden` because the grace window
+/// elapsed — the caller must invoke `hide_app()` when this is set.
+///
+/// This function is `#[cfg(target_os = "macos")]` (same as its callers) but
+/// deliberately free of any I/O or side-effects so it can be unit-tested.
+#[cfg(target_os = "macos")]
+fn next_focus_state(
+    current: AppFocusState,
+    any_focused: bool,
+    now: std::time::Instant,
+    hide_when_inactive: bool,
+    grace_seconds: u64,
+) -> (AppFocusState, bool) {
+    match current {
+        AppFocusState::Active if !any_focused => (AppFocusState::InGrace(now), false),
+        AppFocusState::InGrace(_) if any_focused => (AppFocusState::Active, false),
+        AppFocusState::InGrace(since) => {
+            let elapsed = now.duration_since(since).as_secs();
+            if hide_when_inactive && elapsed >= grace_seconds {
+                (AppFocusState::Hidden, true)
+            } else {
+                (AppFocusState::InGrace(since), false)
+            }
+        },
+        AppFocusState::Hidden if any_focused => (AppFocusState::Active, false),
+        same => (same, false),
+    }
 }
 
 impl Processor {
@@ -132,6 +194,16 @@ impl Processor {
                 ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
         }
 
+        // Materialize the persisted budget state before `config` is moved
+        // into the Rc, so we can pass the policy by reference.
+        #[cfg(target_os = "macos")]
+        let budget = crate::budget::Budget::load_or_default(&config.budget);
+
+        // Register the event-loop proxy with the lockout overlay so its
+        // courtesy button can dispatch GrantCourtesy back into the loop.
+        #[cfg(target_os = "macos")]
+        crate::display::lockout_overlay::register_event_proxy(proxy.clone());
+
         Processor {
             initial_window_options,
             initial_window_error: None,
@@ -147,6 +219,12 @@ impl Processor {
             config_monitor,
             #[cfg(target_os = "macos")]
             session_save_host: None,
+            #[cfg(target_os = "macos")]
+            budget,
+            #[cfg(target_os = "macos")]
+            budget_tick_host: None,
+            #[cfg(target_os = "macos")]
+            app_focus_state: AppFocusState::Active,
         }
     }
 
@@ -197,6 +275,7 @@ impl Processor {
         {
             Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
             self.start_session_save_polling(window_context.id());
+            self.start_budget_tick_polling(window_context.id());
             if let Some(cmd) = first_resume_command {
                 Self::schedule_resume_command(
                     &mut self.scheduler,
@@ -240,6 +319,12 @@ impl Processor {
     /// directory. Called whenever the window set or window state changes.
     #[cfg(target_os = "macos")]
     fn save_session(&self) {
+        // Reset the per-tick codex-UUID claim set so each window's
+        // session_snapshot resolves codex's per-PID rollout against a
+        // fresh slate. This is what stops two codex tabs whose PIDs
+        // started in the same second from both grabbing the same
+        // "earliest" rollout.
+        crate::cli_resume::begin_save_tick();
         let windows: Vec<_> = self
             .windows
             .values()
@@ -275,6 +360,29 @@ impl Processor {
         scheduler.schedule(event, std::time::Duration::from_millis(500), true, timer_id);
     }
 
+    /// Schedule the 1-second budget tick, hosted on the given window.
+    /// Mirrors `start_session_save_polling`: if the host window closes,
+    /// the close handler re-hosts onto another window so the timer
+    /// survives single-window-close.
+    #[cfg(target_os = "macos")]
+    fn start_budget_tick_polling(&mut self, window_id: WindowId) {
+        let timer_id = TimerId::new(Topic::BudgetTick, window_id);
+        if self.scheduler.scheduled(timer_id) {
+            return;
+        }
+        let event = Event::new(EventType::BudgetTick, window_id);
+        self.scheduler
+            .schedule(event, std::time::Duration::from_secs(1), true, timer_id);
+        self.budget_tick_host = Some(window_id);
+    }
+
+    /// True when any current window has keyboard focus. Used by
+    /// `BudgetTick` to decide whether to advance the counter.
+    #[cfg(target_os = "macos")]
+    fn any_window_focused(&self) -> bool {
+        self.windows.values().any(|wc| wc.is_focused())
+    }
+
     /// Schedule a one-shot delayed dispatch of a resume command into a
     /// restored window's PTY. The 500 ms delay gives the shell time to print
     /// its first prompt before we synthesise input — without it, the command
@@ -291,7 +399,10 @@ impl Processor {
             return;
         }
         let event = Event::new(EventType::ResumeCommand(command), window_id);
-        scheduler.schedule(event, std::time::Duration::from_millis(500), false, timer_id);
+        // 2 s gives time for heavy zshrc setups to finish loading before the
+        // synthesized command lands in the PTY. Anything <1 s tends to race
+        // shell startup; the command ends up half-eaten by rc evaluation.
+        scheduler.schedule(event, std::time::Duration::from_millis(2000), false, timer_id);
     }
 
     /// Create a new terminal window.
@@ -328,6 +439,9 @@ impl Processor {
             // closed since last create).
             if self.session_save_host.is_none() {
                 self.start_session_save_polling(window_context.id());
+            }
+            if self.budget_tick_host.is_none() {
+                self.start_budget_tick_polling(window_context.id());
             }
             if let Some(cmd) = resume_command {
                 Self::schedule_resume_command(&mut self.scheduler, window_context.id(), cmd);
@@ -519,6 +633,102 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::SessionSaveTick, _) => {
                 self.save_session();
             },
+            // Grant the once-per-day 5-minute courtesy extension on the
+            // budget. Dispatched from the input layer via the
+            // Cmd+Shift+Ctrl+E keybinding; we route it through the event
+            // loop because the input handler doesn't have access to the
+            // Processor's Budget directly.
+            #[cfg(target_os = "macos")]
+            (EventType::GrantCourtesy, _) => {
+                if self.budget.grant_courtesy(&self.config.budget) {
+                    self.budget.save();
+                    // Immediately push the unlocked state to every window
+                    // so the lock indicator + overlay clear without
+                    // waiting for the next tick.
+                    let reason = self.budget.block_status(&self.config.budget);
+                    let unlock = self.budget.seconds_until_unlock(&self.config.budget);
+                    let still_blocked = reason.is_some();
+                    for wc in self.windows.values_mut() {
+                        wc.display.budget_blocked = still_blocked;
+                        wc.display.budget_unlock_seconds = unlock;
+                        wc.display.apply_tab_title();
+                        if still_blocked {
+                            // Sleep window still active — re-render overlay
+                            // with courtesy_available=false (it's spent).
+                            wc.display.window.show_lockout_overlay(unlock, false);
+                        } else {
+                            wc.display.window.hide_lockout_overlay();
+                        }
+                    }
+                }
+            },
+            // 1-second budget tick (macOS only). Drives the focus state
+            // machine, advances the counter while active or in grace, and
+            // triggers NSApp.hide() when the background grace expires.
+            #[cfg(target_os = "macos")]
+            (EventType::BudgetTick, _) => {
+                let cfg = self.config.budget.clone();
+                if !cfg.enabled {
+                    // Master switch off: leave state untouched.
+                } else {
+                    let any_focused = self.any_window_focused();
+                    let now = std::time::Instant::now();
+                    // State machine — Active ↔ InGrace ↔ Hidden.
+                    let (next_state, hit_grace_expiry) = next_focus_state(
+                        self.app_focus_state,
+                        any_focused,
+                        now,
+                        cfg.hide_when_inactive,
+                        cfg.background_grace_seconds,
+                    );
+                    self.app_focus_state = next_state;
+
+                    if hit_grace_expiry {
+                        hide_app();
+                    }
+
+                    // Tick the counter while we're visible AND useful —
+                    // i.e. Active or InGrace. Hidden state does NOT count
+                    // (alacritty is not in front of the user).
+                    let counts = matches!(
+                        self.app_focus_state,
+                        AppFocusState::Active | AppFocusState::InGrace(_)
+                    );
+                    if counts {
+                        self.budget.tick(&cfg, 1);
+                    } else {
+                        self.budget.refresh_day_boundary(&cfg);
+                    }
+                    self.budget.save();
+
+                    // Push current block state to every window so the
+                    // input handler can filter keystrokes + the tab-title
+                    // composer can show the 🔒 countdown.
+                    let reason = self.budget.block_status(&cfg);
+                    let unlock = self.budget.seconds_until_unlock(&cfg);
+                    let blocked = reason.is_some();
+                    let courtesy_available = !self.budget.courtesy_used
+                        && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    for wc in self.windows.values_mut() {
+                        let was_blocked = wc.display.budget_blocked;
+                        wc.display.budget_blocked = blocked;
+                        wc.display.budget_unlock_seconds = unlock;
+                        // Re-apply tab title each second so the countdown
+                        // updates while locked, AND on the transition out
+                        // of lock (so 🔒 prefix clears immediately).
+                        if blocked || was_blocked {
+                            wc.display.apply_tab_title();
+                        }
+                        // Drive the NSView lockout overlay — install or
+                        // refresh while blocked, remove when block lifts.
+                        if blocked {
+                            wc.display.window.show_lockout_overlay(unlock, courtesy_available);
+                        } else if was_blocked {
+                            wc.display.window.hide_lockout_overlay();
+                        }
+                    }
+                }
+            },
             // Delayed dispatch of a resume command into a restored window
             // (macOS only). Synthesises the saved shell command as PTY input
             // so the shell sees it exactly as if the user had typed it.
@@ -597,6 +807,16 @@ impl ApplicationHandler<Event> for Processor {
                     self.session_save_host = None;
                     if let Some(&next_host) = self.windows.keys().next() {
                         self.start_session_save_polling(next_host);
+                    }
+                }
+
+                // Same dance for the budget ticker — must survive single-
+                // window-close so the cap keeps counting.
+                #[cfg(target_os = "macos")]
+                if self.budget_tick_host == Some(window_context.id()) {
+                    self.budget_tick_host = None;
+                    if let Some(&next_host) = self.windows.keys().next() {
+                        self.start_budget_tick_polling(next_host);
                     }
                 }
 
@@ -775,6 +995,17 @@ pub enum EventType {
     /// newline — the handler appends one).
     #[cfg(target_os = "macos")]
     ResumeCommand(String),
+    /// Recurring 1-second tick for the daily-usage budget. Increments
+    /// active-time when any Alacritty window is focused; checks the block
+    /// status and triggers the lockout overlay when the cap is hit or the
+    /// 02:00–06:00 sleep window opens.
+    #[cfg(target_os = "macos")]
+    BudgetTick,
+    /// User-initiated request to spend the daily 5-minute courtesy
+    /// extension. Dispatched from `Action::GrantCourtesy` (default
+    /// keybinding Cmd+Shift+Ctrl+E).
+    #[cfg(target_os = "macos")]
+    GrantCourtesy,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -1562,6 +1793,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn reset_tab_title(&mut self) {}
 
     #[cfg(target_os = "macos")]
+    fn is_budget_blocked(&self) -> bool {
+        self.display.budget_blocked
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dispatch_grant_courtesy(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::GrantCourtesy, None));
+    }
+
+    #[cfg(target_os = "macos")]
     fn confirm_close_if_busy(&mut self) -> bool {
         // Only prompt if a foreground subprocess (other than the shell) is running.
         let fpgid = unsafe { libc::tcgetpgrp(self.master_fd) };
@@ -2267,7 +2508,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
         /// Wait this long between "all children blocked" and raising the
         /// 🔵 indicator. Short enough to feel responsive, long enough to
         /// ride over a streaming tool's brief between-chunk sleeps.
-        const IDLE_DEBOUNCE: Duration = Duration::from_secs(2);
+        // Long debounce — most AI CLIs spend long periods in SSLEEP while
+        // waiting on a network response, which is NOT user-attention-needed.
+        // 90 s catches "tool truly waiting for the next prompt" while
+        // ignoring everything that looks like in-flight inference.
+        const IDLE_DEBOUNCE: Duration = Duration::from_secs(90);
 
         // Bell-triggered NeedsAttention is sticky — only focus gain clears it.
         if self.ctx.display.tab_activity == TabActivity::NeedsAttention
@@ -2337,18 +2582,30 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Terminal(event) => match event {
                     TerminalEvent::Title(title) => {
                         if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
-                            self.ctx.window().set_title(title);
-                            // Re-apply tab title since NSWindow title changed.
+                            // On macOS, route the title through apply_tab_title
+                            // so the activity / lockout prefix composes onto
+                            // both the NSWindow title bar AND the NSWindowTab
+                            // label. On other platforms, just set the title.
                             #[cfg(target_os = "macos")]
-                            self.ctx.display.apply_tab_title();
+                            {
+                                self.ctx.display.shell_title = title.clone();
+                                self.ctx.display.apply_tab_title();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            self.ctx.window().set_title(title);
                         }
                     },
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
-                            self.ctx.display.window.set_title(window_config.identity.title.clone());
+                            let reset_to = window_config.identity.title.clone();
                             #[cfg(target_os = "macos")]
-                            self.ctx.display.apply_tab_title();
+                            {
+                                self.ctx.display.shell_title = reset_to.clone();
+                                self.ctx.display.apply_tab_title();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            self.ctx.display.window.set_title(reset_to);
                         }
                     },
                     TerminalEvent::Bell => {
@@ -2426,7 +2683,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::Frame => (),
                 // Handled at the outer Processor level; per-window handler ignores.
                 #[cfg(target_os = "macos")]
-                EventType::SessionSaveTick | EventType::ResumeCommand(_) => (),
+                EventType::SessionSaveTick
+                | EventType::ResumeCommand(_)
+                | EventType::BudgetTick
+                | EventType::GrantCourtesy => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -2612,5 +2872,146 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
         let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+    }
+}
+
+
+/// Hide the entire alacritty application (Cmd-H equivalent). All windows
+/// disappear from the screen; in-PTY processes keep running. Cmd-Tab back
+/// or click the Dock icon to unhide.
+#[cfg(target_os = "macos")]
+fn hide_app() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    app.hide(None);
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{next_focus_state, AppFocusState};
+
+    // Helper: an Instant some seconds in the past.
+    fn past(secs: u64) -> Instant {
+        Instant::now() - Duration::from_secs(secs)
+    }
+
+    // ── Active state transitions ──────────────────────────────────────────
+
+    #[test]
+    fn active_stays_active_when_focused() {
+        let (next, expiry) = next_focus_state(AppFocusState::Active, true, Instant::now(), true, 30);
+        assert!(matches!(next, AppFocusState::Active));
+        assert!(!expiry);
+    }
+
+    #[test]
+    fn active_to_ingrace_when_unfocused() {
+        let now = Instant::now();
+        let (next, expiry) = next_focus_state(AppFocusState::Active, false, now, true, 30);
+        assert!(matches!(next, AppFocusState::InGrace(_)));
+        assert!(!expiry);
+    }
+
+    // ── InGrace state transitions ─────────────────────────────────────────
+
+    #[test]
+    fn ingrace_to_active_on_focus_regain() {
+        let since = past(5);
+        let (next, expiry) = next_focus_state(AppFocusState::InGrace(since), true, Instant::now(), true, 30);
+        assert!(matches!(next, AppFocusState::Active));
+        assert!(!expiry);
+    }
+
+    #[test]
+    fn ingrace_stays_ingrace_before_grace_elapsed() {
+        let since = past(10);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), false, Instant::now(), true, 30);
+        // 10 s elapsed < 30 s grace — should stay InGrace.
+        assert!(matches!(next, AppFocusState::InGrace(_)));
+        assert!(!expiry);
+    }
+
+    #[test]
+    fn ingrace_to_hidden_when_grace_elapsed_and_hide_enabled() {
+        let since = past(31);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), false, Instant::now(), true, 30);
+        assert!(matches!(next, AppFocusState::Hidden));
+        assert!(expiry, "expected hit_grace_expiry=true");
+    }
+
+    #[test]
+    fn ingrace_stays_ingrace_when_grace_elapsed_but_hide_disabled() {
+        let since = past(60);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), false, Instant::now(), false, 30);
+        // hide_when_inactive=false — grace must NOT fire even though elapsed > grace_seconds.
+        assert!(matches!(next, AppFocusState::InGrace(_)));
+        assert!(!expiry);
+    }
+
+    #[test]
+    fn ingrace_immediate_hide_when_grace_is_zero() {
+        // grace_seconds = 0: any elapsed time >= 0 fires immediately.
+        let since = past(1);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), false, Instant::now(), true, 0);
+        assert!(matches!(next, AppFocusState::Hidden));
+        assert!(expiry);
+    }
+
+    // ── Hidden state transitions ──────────────────────────────────────────
+
+    #[test]
+    fn hidden_to_active_on_focus_regain() {
+        let (next, expiry) =
+            next_focus_state(AppFocusState::Hidden, true, Instant::now(), true, 30);
+        assert!(matches!(next, AppFocusState::Active));
+        assert!(!expiry);
+    }
+
+    #[test]
+    fn hidden_stays_hidden_when_unfocused() {
+        let (next, expiry) =
+            next_focus_state(AppFocusState::Hidden, false, Instant::now(), true, 30);
+        assert!(matches!(next, AppFocusState::Hidden));
+        assert!(!expiry);
+    }
+
+    #[test]
+    fn hidden_stays_hidden_when_unfocused_hide_disabled() {
+        // hide_when_inactive flag doesn't affect Hidden→Active; only focus matters.
+        let (next, expiry) =
+            next_focus_state(AppFocusState::Hidden, false, Instant::now(), false, 30);
+        assert!(matches!(next, AppFocusState::Hidden));
+        assert!(!expiry);
+    }
+
+    // ── Boundary: exactly at grace_seconds ───────────────────────────────
+
+    #[test]
+    fn ingrace_fires_at_exact_grace_boundary() {
+        // elapsed == grace_seconds is >= so should fire.
+        let grace = 30u64;
+        let since = past(grace);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), false, Instant::now(), true, grace);
+        assert!(matches!(next, AppFocusState::Hidden));
+        assert!(expiry);
+    }
+
+    #[test]
+    fn ingrace_does_not_fire_one_second_before_grace() {
+        let grace = 30u64;
+        let since = past(grace - 1);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), false, Instant::now(), true, grace);
+        assert!(matches!(next, AppFocusState::InGrace(_)));
+        assert!(!expiry);
     }
 }

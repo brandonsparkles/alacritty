@@ -61,6 +61,8 @@ pub mod color;
 pub mod content;
 pub mod cursor;
 pub mod hint;
+#[cfg(target_os = "macos")]
+pub mod lockout_overlay;
 pub mod window;
 
 mod bell;
@@ -338,6 +340,19 @@ impl DisplayUpdate {
     }
 }
 
+/// Render `Xh Ym` or `Ym` depending on magnitude. Used by the lockout
+/// tab-title composer.
+#[cfg(target_os = "macos")]
+fn format_unlock_countdown(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 /// Current activity status driving the tab label's icon prefix.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -439,6 +454,26 @@ pub struct Display {
     /// itself when the child becomes runnable again.
     #[cfg(target_os = "macos")]
     pub tab_attention_from_bell: bool,
+
+    /// `true` while the daily-usage budget block is in effect. Set by the
+    /// budget tick on Processor; read by the input handler (to filter
+    /// keystrokes) and the tab-title composer (to prepend the 🔒 prefix).
+    /// Cleared when block lifts.
+    #[cfg(target_os = "macos")]
+    pub budget_blocked: bool,
+
+    /// Seconds-until-unlock when blocked. Updated on every budget tick.
+    /// 0 when not blocked. Surfaced in the tab title.
+    #[cfg(target_os = "macos")]
+    pub budget_unlock_seconds: u64,
+
+    /// Last shell-provided title (from OSC 0/2). Tracked separately from
+    /// the NSWindow title because we compose `prefix + shell_title` and
+    /// push the result back via `window.set_title()` — reading
+    /// `window.title()` directly would re-prefix our own output on the
+    /// next tick. macOS only.
+    #[cfg(target_os = "macos")]
+    pub shell_title: String,
 
     renderer: ManuallyDrop<Renderer>,
     renderer_preference: Option<RendererPreference>,
@@ -599,26 +634,61 @@ impl Display {
             child_idle_since: None,
             #[cfg(target_os = "macos")]
             tab_attention_from_bell: false,
+            #[cfg(target_os = "macos")]
+            budget_blocked: false,
+            #[cfg(target_os = "macos")]
+            budget_unlock_seconds: 0,
+            #[cfg(target_os = "macos")]
+            shell_title: String::new(),
         })
     }
 
-    /// Compose `(tab_user_title or window title)` with the activity prefix and
-    /// push it to the native tab label. macOS only.
+    /// Compose `(tab_user_title or shell_title)` with the activity (or
+    /// budget-lockout) prefix and push it to BOTH the native NSWindowTab
+    /// label and the NSWindow title bar. macOS only.
+    ///
+    /// Why both:
+    ///   * NSWindowTab title only renders when the user has 2+ tabs grouped
+    ///     in one window (macOS native tab strip). Single-window users
+    ///     never see it.
+    ///   * NSWindow title is always visible in the title bar.
+    ///
+    /// Setting both costs nothing and makes the activity spinner / lockout
+    /// countdown visible regardless of how the user arranges windows.
     #[cfg(target_os = "macos")]
-    pub fn apply_tab_title(&self) {
+    pub fn apply_tab_title(&mut self) {
+        if self.budget_blocked {
+            let countdown = format_unlock_countdown(self.budget_unlock_seconds);
+            let composed = format!("🔒 {countdown}");
+            self.window.set_tab_title_raw(Some(&composed));
+            self.window.set_title(composed);
+            return;
+        }
         let prefix = self.tab_activity.prefix();
-        // When there's no user override and no prefix, let the system derive
-        // the tab title from the NSWindow title.
-        match (self.tab_user_title.as_deref(), prefix) {
-            (None, None) => self.window.set_tab_title_raw(None),
-            (Some(user), None) => self.window.set_tab_title_raw(Some(user)),
-            (None, Some(p)) => {
-                let composed = format!("{p}{}", self.window.title());
-                self.window.set_tab_title_raw(Some(&composed));
+        // Source for the title body: explicit user override, else the last
+        // shell-provided title. Never read window.title() back — that's
+        // already prefix-composed and would cause re-prefixing.
+        let body: &str = self.tab_user_title.as_deref().unwrap_or(self.shell_title.as_str());
+        match (body.is_empty(), prefix) {
+            (true, None) => {
+                self.window.set_tab_title_raw(None);
+                // Leave the NSWindow title alone — nothing meaningful to set.
             },
-            (Some(user), Some(p)) => {
-                let composed = format!("{p}{user}");
+            (false, None) => {
+                self.window.set_tab_title_raw(Some(body));
+                self.window.set_title(body.to_string());
+            },
+            (true, Some(p)) => {
+                // No body, but we have an activity/lockout prefix —
+                // show the prefix alone (trimmed of trailing space).
+                let composed = p.trim_end().to_string();
                 self.window.set_tab_title_raw(Some(&composed));
+                self.window.set_title(composed);
+            },
+            (false, Some(p)) => {
+                let composed = format!("{p}{body}");
+                self.window.set_tab_title_raw(Some(&composed));
+                self.window.set_title(composed);
             },
         }
     }

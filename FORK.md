@@ -21,6 +21,10 @@ non-macOS code never reaches.
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
 | **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
 | **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
+| **Per-tab AI session resume** | After session restoration, claude / copilot / codex tabs reopen at *their specific* prior conversation (not just the most-recent). Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, and codex's `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` (matched by `pbi_start_tvsec` + cwd, with per-save-tick claim set so sibling codex tabs don't collide). |
+| **Cmd+A select all** | Selects the entire terminal contents (scrollback + visible area). Standard macOS shortcut, missing from upstream. |
+| **Budget enforcement** | Daily 3-hour focused-time cap + 02:00–06:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown. One 5-minute courtesy extension per day (clickable button or `Cmd+Shift+Ctrl+E`). See [Budget enforcement](#budget-enforcement) below. |
+| **Window-title activity prefix** | The `⠿` / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
 
 ## Keybindings reference
 
@@ -38,6 +42,8 @@ macOS `platform_key_bindings()` function and can be overridden in your
 | `Ctrl+U` (in rename mode) | `TabRename::Clear` |
 | `Backspace` (in rename mode) | `TabRename::DeleteChar` |
 | `Ctrl+C` (in rename mode) | `TabRename::Cancel` |
+| `Cmd+A` | `SelectAll` (terminal contents — scrollback + visible) |
+| `Cmd+Shift+Ctrl+E` | `GrantCourtesy` (spend the once-per-day 5-min budget extension) |
 
 To rebind, e.g., the inline rename to `Cmd+R` instead:
 
@@ -118,6 +124,120 @@ starting a new selection.
 shell has a foreground subprocess. At an idle shell prompt, Cmd+Q quits
 immediately by design.
 
+## Budget enforcement
+
+A commitment-device subsystem that caps how long alacritty can be used
+each day. Designed for users who want to break passive-attention habits
+around terminal-based AI tools.
+
+### What it does
+
+| Component | Trigger | Effect |
+|---|---|---|
+| 1-second tick | Background timer | Increments `active_seconds` while any alacritty window is focused. |
+| Hide-when-inactive | After `background_grace_seconds` (default 300 s) of no focus | Calls `NSApp.hide()`. Counter stops while hidden. Counter resumes on next focus. |
+| Cap exhaustion | `active_seconds >= cap_seconds` (default 10 800 = 3 h) | Block engages: input filtered, lockout overlay rendered. |
+| Sleep window | Wall-clock time between `sleep_start_hour` (default 02:00) and `sleep_end_hour` (default 06:00) Chicago | Block engages regardless of remaining cap. |
+| Courtesy extension | User clicks the overlay button or presses `Cmd+Shift+Ctrl+E` | One-shot per day: adds 300 s to `cap_seconds`, lifts the block. |
+| Day boundary | Wall-clock crosses `sleep_end_hour` Chicago | `active_seconds = 0`, `courtesy_used = false`. New day. |
+
+The overlay is a fullscreen opaque `NSView` over the GL surface — terminal
+content is invisible behind it. The only interactive element is the
+courtesy button (when still available). Keystrokes are filtered at the
+input layer (the overlay also absorbs them via first-responder, so it's
+belt-and-suspenders). Quitting + relaunching alacritty does not reset the
+block — usage state persists to disk.
+
+### Config (`[budget]` in `alacritty.toml`)
+
+```toml
+[budget]
+enabled = true                  # master switch
+cap_seconds = 10800             # 3 h
+sleep_start_hour = 2            # 02:00 Chicago
+sleep_end_hour = 6              # 06:00 Chicago
+timezone = "America/Chicago"    # any IANA name; falls back to Chicago on parse error
+hide_when_inactive = true
+background_grace_seconds = 300  # 5 min grace before hide
+```
+
+All fields have sensible defaults; the section is optional. Set
+`enabled = false` to disable the entire system (no ticking, no overlay,
+no daemon).
+
+### Persistent state — `~/Library/Application Support/org.alacritty/usage.json`
+
+```json
+{
+  "date_chicago": "2026-05-22",
+  "active_seconds": 4127,
+  "courtesy_used": false,
+  "courtesy_expires_at": null,
+  "updated_at": 1779485231
+}
+```
+
+Written via atomic temp-file-rename every second. Day rollover happens
+automatically when `date_chicago` no longer matches "today" (per the
+configured timezone + sleep_end_hour offset).
+
+### HTTP daemon — `127.0.0.1:38121`
+
+Spawned at startup when `[budget] enabled = true`. Single background
+thread, std::net::TcpListener, hand-rolled HTTP/1.1, no external deps.
+
+**`GET /usage`** → 200 OK, JSON:
+```json
+{
+  "date_chicago": "2026-05-22",
+  "active_seconds": 4127,
+  "cap_seconds": 10800,
+  "courtesy_used": false,
+  "courtesy_expires_at": null,
+  "updated_at": 1779485231,
+  "blocked": false,
+  "reason": null,                       // "sleep_window" | "budget_exhausted" | null
+  "seconds_until_unlock": 0,
+  "timezone": "America/Chicago"
+}
+```
+
+**`POST /courtesy`** →
+- `200 OK` + updated JSON on success
+- `409 Conflict` `{"error":"already_used"}` if already spent today
+- `403 Forbidden` `{"error":"sleep_window"}` during the sleep window (extension is meaningless then — block lifts at `sleep_end_hour` regardless)
+
+**`OPTIONS *`** → 204 (CORS preflight).
+
+CORS headers permit any localhost origin + `https://aisparkles.com` so
+the pomodoro BudgetCard component can read the daemon directly from the
+browser.
+
+### Consumers
+
+- Pomodoro BudgetCard (`brandonai` site, `resources/js/pomodoro/components/BudgetCard.tsx`) — polls `/usage` every 5 s, renders countdown + progress bar + courtesy button.
+- Sparkles Pomodoro Tauri app (`~/Desktop/Projects/sparkles-pomodoro-app/`) — menu-bar tray icon polls `/usage` every 5 s, surfaces "⌛ 2h 14m" or "🔒 Xh Ym".
+
+If alacritty isn't running, both consumers gracefully degrade to a
+"Companion offline" state.
+
+### Code locations
+
+```
+alacritty/src/budget.rs                 — runtime Budget state + day boundaries + courtesy
+alacritty/src/config/budget.rs          — BudgetConfig deserialised from [budget]
+alacritty/src/budget_daemon.rs          — HTTP daemon (single thread, std::net only)
+alacritty/src/display/lockout_overlay.rs — NSView + NSTextField + NSButton overlay
+alacritty/src/event.rs                  — BudgetTick handler, AppFocusState state machine
+                                          (next_focus_state pure helper for testability)
+alacritty/src/config/bindings.rs        — Action::GrantCourtesy binding
+alacritty/src/input/mod.rs              — keystroke filter when block is in effect
+```
+
+Test coverage: `cargo test --release --bin alacritty` runs 125 tests
+including 12 for the daemon (routing, CORS, JSON shape), 11 for the focus
+state machine, and 5 for the budget model itself.
+
 ## Updating
 
 ### Pulling upstream into the fork
@@ -141,19 +261,25 @@ still resolve (`platform_key_bindings()` may grow new entries upstream).
 ## Files added/touched
 
 ```
-alacritty/src/session.rs          (NEW)  — session persistence
-alacritty/src/display/drag_source.rs (NEW) — NSDraggingSource conformer (disabled)
-alacritty/src/display/window.rs   — AppKit FFI (tab title, NSAlert, set_outer_position)
-alacritty/src/display/mod.rs      — TabActivity enum, apply_tab_title composition
-alacritty/src/event.rs            — RenameTabState, DragCandidate, restore on launch
-alacritty/src/input/mod.rs        — tab_swipe_step, drag-out plumbing, ClearInputLine
-alacritty/src/input/keyboard.rs   — double-Esc detection, rename input routing
-alacritty/src/config/bindings.rs  — RENAME_TAB BindingMode, new actions
-alacritty/src/macos/proc.rs       — has_children() via proc_listpids
-alacritty/src/window_context.rs   — session_snapshot, restored_size/position application
-alacritty/src/scheduler.rs        — Topic::TabActivity, Topic::SessionSave
-alacritty/src/cli.rs              — restored_* fields on WindowOptions
-alacritty/Cargo.toml              — objc2-app-kit features (NSAlert, NSDragging, etc.)
+alacritty/src/session.rs                  (NEW)  — session persistence
+alacritty/src/cli_resume.rs               (NEW)  — per-tab AI-CLI session resume resolver
+alacritty/src/budget.rs                   (NEW)  — daily-usage budget state + day boundaries
+alacritty/src/config/budget.rs            (NEW)  — [budget] config struct
+alacritty/src/budget_daemon.rs            (NEW)  — localhost HTTP daemon (127.0.0.1:38121)
+alacritty/src/display/lockout_overlay.rs  (NEW)  — fullscreen NSView lockout
+alacritty/src/display/window.rs           — AppKit FFI (tab title, NSAlert, lockout install/hide)
+alacritty/src/display/mod.rs              — TabActivity, apply_tab_title → both tab + window title
+alacritty/src/event.rs                    — RenameTabState, BudgetTick, AppFocusState, next_focus_state
+alacritty/src/input/mod.rs                — tab_swipe_step, ClearInputLine, budget keystroke filter
+alacritty/src/input/keyboard.rs           — double-Esc detection, rename input routing
+alacritty/src/config/bindings.rs          — RENAME_TAB BindingMode, SelectAll, GrantCourtesy
+alacritty/src/macos/proc.rs               — has_children(), pid_path, start_tvsec, is_idle
+alacritty/src/window_context.rs           — session_snapshot, restored_size/position application
+alacritty/src/scheduler.rs                — Topic::TabActivity, SessionSave, BudgetTick, ResumeCommand
+alacritty/src/cli.rs                      — restored_* fields on WindowOptions
+alacritty/src/main.rs                     — spawns the budget daemon when [budget] enabled
+alacritty/Cargo.toml                      — objc2-app-kit features (NSColor, NSFont, NSTextField,
+                                            NSText), chrono, chrono-tz
 ```
 
 ## Maintainership

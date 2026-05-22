@@ -114,6 +114,12 @@ pub fn pid_path(pid: c_int) -> Option<std::path::PathBuf> {
 
 /// Return the short executable name of `pid` (`pbi_comm`, capped at 15 chars
 /// by the kernel). `None` if the process can't be queried.
+///
+/// Currently unused — `cli_resume.rs` switched to `pid_path` after we
+/// learned `pbi_comm` returns the symlink-resolved basename (e.g.
+/// `"2.1.146"` for claude, not `"claude"`). Kept available for future
+/// callers that want the truncated name regardless.
+#[allow(dead_code)]
 pub fn comm(pid: c_int) -> Option<String> {
     let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
     let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
@@ -136,64 +142,28 @@ pub fn comm(pid: c_int) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// List file-system paths backing the open vnode-type file descriptors of
-/// `pid`. Used by [`crate::cli_resume`] to find the session file an AI CLI
-/// has open (e.g. `~/.claude/projects/<cwd>/<uuid>.jsonl`).
-pub fn list_open_files(pid: c_int) -> Vec<PathBuf> {
-    // First call asks how many bytes of fd-list the kernel wants to return.
-    let needed = unsafe { sys::proc_pidinfo(pid, sys::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if needed <= 0 {
-        return Vec::new();
-    }
-
-    let fd_size = mem::size_of::<sys::proc_fdinfo>();
-    let count = (needed as usize) / fd_size;
-    // Slack against races where new fds are opened between size query and fetch.
-    let mut fds: Vec<sys::proc_fdinfo> =
-        vec![sys::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; count + 16];
-    let buf_bytes = (fds.len() * fd_size) as c_int;
-    let actual = unsafe {
+/// Wall-clock time (Unix seconds) when `pid` started, via the kernel's
+/// `pbi_start_tvsec`. `None` on any error. Used by `cli_resume.rs` to
+/// match a running codex process to its rollout `.jsonl` file (codex
+/// writes no PID-keyed metadata, but its rollout filenames encode the
+/// session-start timestamp, so we can join by proximity).
+pub fn start_tvsec(pid: c_int) -> Option<u64> {
+    let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
+    let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
+    let res = unsafe {
         sys::proc_pidinfo(
             pid,
-            sys::PROC_PIDLISTFDS,
+            sys::PROC_PIDTBSDINFO,
             0,
-            fds.as_mut_ptr() as *mut c_void,
-            buf_bytes,
+            info.as_mut_ptr() as *mut c_void,
+            size,
         )
     };
-    if actual <= 0 {
-        return Vec::new();
+    if res != size {
+        return None;
     }
-    let n = (actual as usize) / fd_size;
-
-    let mut paths = Vec::new();
-    for entry in fds.iter().take(n) {
-        if entry.proc_fdtype != sys::PROX_FDTYPE_VNODE {
-            continue;
-        }
-        let mut info = MaybeUninit::<sys::vnode_fdinfowithpath>::uninit();
-        let info_size = mem::size_of::<sys::vnode_fdinfowithpath>() as c_int;
-        let got = unsafe {
-            sys::proc_pidfdinfo(
-                pid,
-                entry.proc_fd,
-                sys::PROC_PIDFDVNODEPATHINFO,
-                info.as_mut_ptr() as *mut c_void,
-                info_size,
-            )
-        };
-        if got != info_size {
-            continue;
-        }
-        let info = unsafe { info.assume_init() };
-        let cstr = unsafe { CStr::from_ptr(info.pvip.vip_path.as_ptr()) };
-        if let Ok(s) = cstr.to_str() {
-            if !s.is_empty() {
-                paths.push(PathBuf::from(s));
-            }
-        }
-    }
-    paths
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_start_tvsec)
 }
 
 /// `true` if the process is blocked (state SSLEEP/SSTOP) rather than runnable.
@@ -248,8 +218,6 @@ mod sys {
 
     pub const PROC_PIDVNODEPATHINFO: c_int = 9;
     pub const PROC_PIDTBSDINFO: c_int = 3;
-    pub const PROC_PIDLISTFDS: c_int = 1;
-    pub const PROC_PIDFDVNODEPATHINFO: c_int = 2;
 
     /// `proc_listpids` selector: return PIDs whose parent matches `typeinfo`.
     pub const PROC_PPID_ONLY: u32 = 6;
@@ -257,9 +225,6 @@ mod sys {
     // Process states from <sys/proc.h>.
     pub const SSLEEP: u32 = 3;
     pub const SSTOP: u32 = 4;
-
-    // fd-type discriminator from <sys/proc_info.h>.
-    pub const PROX_FDTYPE_VNODE: u32 = 1;
 
     type gid_t = c_int;
     type off_t = c_longlong;
@@ -351,50 +316,11 @@ mod sys {
         pub pbi_start_tvusec: u64,
     }
 
-    /// `struct proc_fdinfo` from `<sys/proc_info.h>` — entries returned by
-    /// `proc_pidinfo(pid, PROC_PIDLISTFDS, …)`.
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    pub struct proc_fdinfo {
-        pub proc_fd: i32,
-        pub proc_fdtype: u32,
-    }
-
-    /// `struct proc_fileinfo` from `<sys/proc_info.h>`. We don't read these
-    /// fields, but their layout has to be accurate for the surrounding
-    /// `vnode_fdinfowithpath` size check to pass.
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    pub struct proc_fileinfo {
-        pub fi_openflags: u32,
-        pub fi_status: u32,
-        pub fi_offset: c_longlong,
-        pub fi_type: i32,
-        pub fi_guardflags: u32,
-    }
-
-    /// `struct vnode_fdinfowithpath` from `<sys/proc_info.h>` — fd + the file
-    /// path the vnode resolves to.
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    pub struct vnode_fdinfowithpath {
-        pub pfi: proc_fileinfo,
-        pub pvip: vnode_info_path,
-    }
-
     unsafe extern "C" {
         pub fn proc_pidinfo(
             pid: c_int,
             flavor: c_int,
             arg: u64,
-            buffer: *mut c_void,
-            buffersize: c_int,
-        ) -> c_int;
-
-        pub fn proc_pidfdinfo(
-            pid: c_int,
-            fd: c_int,
-            flavor: c_int,
             buffer: *mut c_void,
             buffersize: c_int,
         ) -> c_int;

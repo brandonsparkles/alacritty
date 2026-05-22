@@ -35,6 +35,8 @@ pub enum Topic {
     SessionSave,
     #[cfg(target_os = "macos")]
     ResumeCommand,
+    #[cfg(target_os = "macos")]
+    BudgetTick,
 }
 
 /// Event scheduled to be emitted at a specific time.

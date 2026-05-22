@@ -167,6 +167,12 @@ pub enum Action {
     /// Clear the display buffer(s) to remove history.
     ClearHistory,
 
+    /// Select the entire terminal contents (scrollback + visible area).
+    SelectAll,
+
+    /// Spend the once-per-day 5-minute budget courtesy extension. macOS only.
+    GrantCourtesy,
+
     /// Hide the Alacritty window.
     Hide,
 
@@ -653,6 +659,8 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
         "v",    ModifiersState::SUPER, +BindingMode::VI, +BindingMode::SEARCH; Action::Paste;
         "n",    ModifiersState::SUPER;                                         Action::CreateNewWindow;
         "f",    ModifiersState::CONTROL | ModifiersState::SUPER;               Action::ToggleFullscreen;
+        "a",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SelectAll;
+        "e",    ModifiersState::SUPER | ModifiersState::SHIFT | ModifiersState::CONTROL; Action::GrantCourtesy;
         "c",    ModifiersState::SUPER;                                         Action::Copy;
         "c",    ModifiersState::SUPER, +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
         "h",    ModifiersState::SUPER;                                         Action::Hide;

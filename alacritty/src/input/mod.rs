@@ -156,6 +156,16 @@ pub trait ActionContext<T: EventListener> {
     }
     fn on_typing_start(&mut self) {}
     fn toggle_vi_mode(&mut self) {}
+    /// True when the daily-usage budget block is in effect on this
+    /// window. Input is filtered at the action dispatcher when true.
+    /// macOS only; default false for cross-platform builds.
+    #[cfg(target_os = "macos")]
+    fn is_budget_blocked(&self) -> bool {
+        false
+    }
+    /// Send `EventType::GrantCourtesy` to the event loop. macOS only.
+    #[cfg(target_os = "macos")]
+    fn dispatch_grant_courtesy(&mut self) {}
     fn inline_search_state(&mut self) -> &mut InlineSearchState;
     fn start_inline_search(&mut self, _direction: Direction, _stop_short: bool) {}
     fn inline_search_next(&mut self) {}
@@ -197,6 +207,13 @@ trait Execute<T: EventListener> {
 impl<T: EventListener> Execute<T> for Action {
     #[inline]
     fn execute<A: ActionContext<T>>(&self, ctx: &mut A) {
+        // Budget lockout: while blocked, the only action permitted is
+        // GrantCourtesy. Everything else (typing, paste, copy, scroll,
+        // tab navigation, etc.) is silently swallowed.
+        #[cfg(target_os = "macos")]
+        if ctx.is_budget_blocked() && !matches!(self, Action::GrantCourtesy) {
+            return;
+        }
         match self {
             Action::Esc(s) => ctx.paste(s, false),
             Action::Command(program) => ctx.spawn_daemon(program.program(), program.args()),
@@ -353,6 +370,29 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(not(any(target_os = "macos", windows)))]
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
             Action::ClearSelection => ctx.clear_selection(),
+            #[cfg(target_os = "macos")]
+            Action::GrantCourtesy => {
+                ctx.dispatch_grant_courtesy();
+            },
+            Action::SelectAll => {
+                // Span the full grid: from the top of scrollback to the
+                // last column of the bottom visible row.
+                use alacritty_terminal::grid::Dimensions;
+                use alacritty_terminal::index::{Column, Line, Point, Side};
+                let (top, bottom_line, last_col) = {
+                    let term = ctx.terminal();
+                    let topmost = term.grid().topmost_line();
+                    let bottom = Line(term.grid().screen_lines() as i32 - 1);
+                    let last = Column(term.grid().columns().saturating_sub(1));
+                    (topmost, bottom, last)
+                };
+                ctx.start_selection(
+                    SelectionType::Simple,
+                    Point::new(top, Column(0)),
+                    Side::Left,
+                );
+                ctx.update_selection(Point::new(bottom_line, last_col), Side::Right);
+            },
             Action::Paste => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
                 ctx.paste(&text, true);

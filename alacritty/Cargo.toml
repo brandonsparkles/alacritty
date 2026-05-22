@@ -25,6 +25,8 @@ version = "0.2.3"
 [dependencies]
 ahash = { version = "0.8.6", features = ["no-rng"] }
 bitflags = "2.2.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = { version = "0.10", default-features = false }
 clap = { version = "4.2.7", features = ["derive", "env"] }
 copypasta = { version = "0.10.1", default-features = false }
 crossfont = "0.8.1"
@@ -72,18 +74,22 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "NSAlert",
     "NSApplication",
     "NSButton",
+    "NSColor",
     "NSColorSpace",
     "NSControl",
     "NSDragging",
     "NSDraggingItem",
     "NSDraggingSession",
     "NSEvent",
+    "NSFont",
     "NSImage",
     "NSPanel",
     "NSPasteboard",
     "NSPasteboardItem",
     "NSResponder",
     "NSRunningApplication",
+    "NSText",
+    "NSTextField",
     "NSView",
     "NSWindow",
     "NSWindowTab",

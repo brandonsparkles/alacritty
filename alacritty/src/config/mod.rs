@@ -11,6 +11,8 @@ use toml::ser::Error as TomlSeError;
 use toml::{Table, Value};
 
 pub mod bell;
+#[cfg(target_os = "macos")]
+pub mod budget;
 pub mod color;
 pub mod cursor;
 pub mod debug;

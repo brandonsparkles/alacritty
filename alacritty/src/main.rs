@@ -27,6 +27,10 @@ use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 use alacritty_terminal::tty;
 
+#[cfg(target_os = "macos")]
+mod budget;
+#[cfg(target_os = "macos")]
+mod budget_daemon;
 mod cli;
 #[cfg(target_os = "macos")]
 mod cli_resume;
@@ -215,6 +219,15 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
         socket_path,
         log_file: log_cleanup,
     };
+
+    // Spawn the budget daemon (macOS only). Listens on 127.0.0.1:38121
+    // for GET /usage + POST /courtesy. Survives until process exit.
+    // Disabled when [budget].enabled = false in alacritty.toml.
+    #[cfg(target_os = "macos")]
+    if config.budget.enabled {
+        let snapshot = config.budget.clone();
+        budget_daemon::spawn(budget_daemon::DEFAULT_PORT, move || snapshot.clone());
+    }
 
     // Event processor.
     let mut processor = Processor::new(config, options, &window_event_loop);

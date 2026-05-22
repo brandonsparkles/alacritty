@@ -558,6 +558,39 @@ impl Window {
     ///
     /// Passing `Some(text)` persists across NSWindow title changes (the shell
     /// can keep updating the window title without affecting the tab label).
+    /// Install or refresh the lockout overlay on this window's content view.
+    /// Idempotent — calling on every budget tick is the intended pattern.
+    #[cfg(target_os = "macos")]
+    pub fn show_lockout_overlay(&self, unlock_seconds: u64, courtesy_available: bool) {
+        let ns_view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                assert!(MainThreadMarker::new().is_some());
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return,
+        };
+        let Some(ns_window) = ns_view.window() else { return };
+        crate::display::lockout_overlay::install_or_update(
+            &ns_window,
+            unlock_seconds,
+            courtesy_available,
+        );
+    }
+
+    /// Remove the lockout overlay, if installed. No-op otherwise.
+    #[cfg(target_os = "macos")]
+    pub fn hide_lockout_overlay(&self) {
+        let ns_view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                assert!(MainThreadMarker::new().is_some());
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return,
+        };
+        let Some(ns_window) = ns_view.window() else { return };
+        crate::display::lockout_overlay::remove(&ns_window);
+    }
+
     /// Passing `None` reverts the tab title to the auto-derived window title.
     #[cfg(target_os = "macos")]
     pub fn set_tab_title_raw(&self, title: Option<&str>) {

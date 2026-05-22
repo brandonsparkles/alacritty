@@ -564,6 +564,13 @@ impl WindowContext {
         self.notifier.notify(bytes);
     }
 
+    /// True if this window's terminal currently has keyboard focus. Used
+    /// by the budget ticker to decide whether to advance the counter.
+    #[cfg(target_os = "macos")]
+    pub fn is_focused(&self) -> bool {
+        self.terminal.lock().is_focused
+    }
+
     /// Write the ref test results to the disk.
     pub fn write_ref_test_results(&self) {
         // Dump grid state.
