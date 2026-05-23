@@ -72,7 +72,7 @@ pub struct UiConfig {
     /// Bell configuration.
     pub bell: BellConfig,
 
-    /// Daily-usage budget (macOS only). 3-hour cap + 02:00–06:00
+    /// Daily-usage budget (macOS only). 3-hour cap + 02:00–08:00
     /// sleep-window lockout, plus hide-when-inactive behavior.
     #[cfg(target_os = "macos")]
     pub budget: crate::config::budget::BudgetConfig,

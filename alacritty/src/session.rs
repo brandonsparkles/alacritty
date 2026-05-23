@@ -34,8 +34,12 @@ pub struct WindowState {
     /// User-set tab title (set via the inline rename prompt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_title: Option<String>,
-    /// macOS tab grouping id — windows sharing the same value will be tabbed
-    /// together on restore.
+    /// Legacy macOS tab grouping id.
+    ///
+    /// Older custom builds persisted this value, but AppKit's tabbing
+    /// identifiers are not stable across launches. Keep the field only for
+    /// backwards-compatible parsing of existing session files.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tabbing_id: String,
     /// Window size in physical pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]

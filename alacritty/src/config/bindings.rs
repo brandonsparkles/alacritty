@@ -170,7 +170,8 @@ pub enum Action {
     /// Select the entire terminal contents (scrollback + visible area).
     SelectAll,
 
-    /// Spend the once-per-day 5-minute budget courtesy extension. macOS only.
+    /// Spend the optional once-per-day 5-minute budget courtesy extension.
+    /// Inert unless `[budget] allow_courtesy = true`. macOS only.
     GrantCourtesy,
 
     /// Hide the Alacritty window.

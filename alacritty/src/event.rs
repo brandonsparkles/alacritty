@@ -102,7 +102,7 @@ pub struct Processor {
     /// Window currently hosting the periodic session-save timer (macOS).
     #[cfg(target_os = "macos")]
     session_save_host: Option<WindowId>,
-    /// Daily usage budget — enforces the 3-hour cap and 02:00–06:00 sleep
+    /// Daily usage budget — enforces the 3-hour cap and 02:00–08:00 sleep
     /// window. Ticked once per second while any window is focused; persisted
     /// to `~/Library/Application Support/org.alacritty/usage.json`.
     #[cfg(target_os = "macos")]
@@ -707,7 +707,8 @@ impl ApplicationHandler<Event> for Processor {
                     let reason = self.budget.block_status(&cfg);
                     let unlock = self.budget.seconds_until_unlock(&cfg);
                     let blocked = reason.is_some();
-                    let courtesy_available = !self.budget.courtesy_used
+                    let courtesy_available = cfg.allow_courtesy
+                        && !self.budget.courtesy_used
                         && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     for wc in self.windows.values_mut() {
                         let was_blocked = wc.display.budget_blocked;
@@ -927,9 +928,8 @@ fn apply_session_overrides(opts: &mut WindowOptions, entry: &crate::session::Win
     if entry.working_directory.is_dir() {
         opts.terminal_options.working_directory = Some(entry.working_directory.clone());
     }
-    if !entry.tabbing_id.is_empty() {
-        opts.window_tabbing_id = Some(entry.tabbing_id.clone());
-    }
+    // Do not replay persisted AppKit tabbing identifiers. They are runtime
+    // tokens, not durable session state, and can abort during macOS restore.
     if let Some(title) = entry.tab_title.as_ref().filter(|t| !t.is_empty()) {
         opts.restored_tab_title = Some(title.clone());
     }
@@ -998,7 +998,7 @@ pub enum EventType {
     /// Recurring 1-second tick for the daily-usage budget. Increments
     /// active-time when any Alacritty window is focused; checks the block
     /// status and triggers the lockout overlay when the cap is hit or the
-    /// 02:00–06:00 sleep window opens.
+    /// 02:00–08:00 sleep window opens.
     #[cfg(target_os = "macos")]
     BudgetTick,
     /// User-initiated request to spend the daily 5-minute courtesy

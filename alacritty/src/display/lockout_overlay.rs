@@ -7,8 +7,8 @@
 //!
 //!   * The overlay must absorb keystrokes that would otherwise hit the
 //!     terminal — NSView's first-responder semantics handle this for free.
-//!   * The courtesy button must be a real clickable HUD element, not a
-//!     synthesized PTY interaction.
+//!   * The optional courtesy button must be a real clickable HUD element,
+//!     not a synthesized PTY interaction.
 //!   * NSView lives outside the GL surface, so re-rendering doesn't fight
 //!     with the terminal grid renderer's frame loop.
 //!
@@ -25,20 +25,20 @@
 //!
 //! ### Identification
 //!
-//! Subviews are tagged with sentinel `tag` values so we can find them on
-//! repeat ticks without holding Rust references to retained AppKit objects:
-//!
-//!   * `OVERLAY_TAG`   — the root opaque NSView
-//!   * `COUNTDOWN_TAG` — the "Unlocks in Xh Ym" label
-//!   * `BUTTON_TAG`    — the "Use 5-min courtesy" button
+//! AppKit lookup is deliberately avoided for the overlay subviews. Plain
+//! `NSView` does not support UIKit-style `tag` lookup, and an Objective-C
+//! exception here aborts the Rust process. Instead, retained overlay views
+//! live in a main-thread Rust registry keyed by the `NSWindow` pointer.
 
 #![cfg(target_os = "macos")]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject};
-use objc2::{class, define_class, msg_send, sel, MainThreadOnly};
+use objc2::runtime::{AnyObject, NSObject};
+use objc2::{define_class, msg_send, sel, ClassType, MainThreadOnly};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSButton, NSColor, NSFont, NSTextAlignment, NSTextField, NSView,
     NSWindow,
@@ -49,9 +49,15 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::event::{Event, EventType};
 
-const OVERLAY_TAG: isize = 0x10C40A1;
-const COUNTDOWN_TAG: isize = 0x10C40A2;
-const BUTTON_TAG: isize = 0x10C40A3;
+thread_local! {
+    static OVERLAYS: RefCell<HashMap<usize, OverlayViews>> = RefCell::new(HashMap::new());
+}
+
+struct OverlayViews {
+    root: Retained<NSView>,
+    countdown: Retained<NSTextField>,
+    button: Retained<NSButton>,
+}
 
 /// Single shared event proxy for dispatching `GrantCourtesy` from the
 /// button-click target. Set once at process startup by `Processor::new`.
@@ -97,10 +103,9 @@ define_class!(
 
 fn courtesy_target(_mtm: MainThreadMarker) -> &'static Retained<CourtesyTarget> {
     COURTESY_TARGET.get_or_init(|| {
-        // The class name was set via the `#[name = "AlacrittyCourtesyTarget"]`
-        // attribute on the `define_class!` invocation above.
-        let cls: &AnyClass = class!(AlacrittyCourtesyTarget);
-        unsafe { msg_send![cls, new] }
+        // `CourtesyTarget::class()` registers the `define_class!` class before
+        // returning the Obj-C class pointer.
+        unsafe { Retained::from_raw(msg_send![CourtesyTarget::class(), new]) }.unwrap()
     })
 }
 
@@ -114,22 +119,20 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
     let Some(mtm) = MainThreadMarker::new() else { return };
     let Some(content) = window.contentView() else { return };
     let bounds = content.bounds();
+    let window_key = window as *const NSWindow as usize;
 
     // Existing overlay? Just update the countdown.
-    if let Some(overlay) = find_subview(&content, OVERLAY_TAG) {
-        if let Some(countdown) = find_subview(&overlay, COUNTDOWN_TAG) {
-            let cd_obj: &AnyObject = unsafe { &*(&*countdown as *const NSView as *const AnyObject) };
+    if OVERLAYS.with_borrow(|overlays| overlays.contains_key(&window_key)) {
+        OVERLAYS.with_borrow(|overlays| {
+            let Some(overlay) = overlays.get(&window_key) else { return };
+            let cd_obj: &AnyObject =
+                unsafe { &*(&*overlay.countdown as *const NSTextField as *const AnyObject) };
             let s = NSString::from_str(&format_countdown(unlock_seconds));
             unsafe {
                 let _: () = msg_send![cd_obj, setStringValue: &*s];
+                let _: () = msg_send![&*overlay.button, setHidden: !courtesy_available];
             }
-        }
-        // Hide button if courtesy is gone (one-shot per day).
-        if let Some(btn) = find_subview(&overlay, BUTTON_TAG) {
-            unsafe {
-                let _: () = msg_send![&*btn, setHidden: !courtesy_available];
-            }
-        }
+        });
         return;
     }
 
@@ -137,7 +140,6 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
     let overlay: Retained<NSView> =
         unsafe { NSView::initWithFrame(NSView::alloc(mtm), bounds) };
     unsafe {
-        let _: () = msg_send![&*overlay, setTag: OVERLAY_TAG];
         overlay.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -184,7 +186,6 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
         },
     );
     unsafe {
-        let _: () = msg_send![&*countdown, setTag: COUNTDOWN_TAG];
         let cd_view: &NSView = std::mem::transmute(&*countdown);
         cd_view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
@@ -211,7 +212,6 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
     let target = courtesy_target(mtm);
     unsafe {
         button.setTitle(&NSString::from_str("Use 5-min courtesy"));
-        let _: () = msg_send![&*button, setTag: BUTTON_TAG];
         let btn_view: &NSView = std::mem::transmute(&*button);
         btn_view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewMinXMargin
@@ -231,6 +231,10 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
     unsafe {
         content.addSubview(&overlay);
     }
+
+    OVERLAYS.with_borrow_mut(|overlays| {
+        overlays.insert(window_key, OverlayViews { root: overlay, countdown, button });
+    });
 }
 
 /// Remove the overlay if installed. No-op otherwise.
@@ -238,10 +242,10 @@ pub fn remove(window: &NSWindow) {
     if MainThreadMarker::new().is_none() {
         return;
     }
-    let Some(content) = window.contentView() else { return };
-    if let Some(overlay) = find_subview(&content, OVERLAY_TAG) {
-        unsafe { overlay.removeFromSuperview() };
-    }
+    let window_key = window as *const NSWindow as usize;
+    if let Some(overlay) = OVERLAYS.with_borrow_mut(|overlays| overlays.remove(&window_key)) {
+        unsafe { overlay.root.removeFromSuperview() };
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -287,12 +291,4 @@ fn make_label(
         let _: () = msg_send![&*field, setTextColor: &*NSColor::whiteColor()];
     }
     field
-}
-
-/// Look up a subview by `tag` within `parent`. Returns the first match.
-fn find_subview(parent: &NSView, tag: isize) -> Option<Retained<NSView>> {
-    unsafe {
-        let view: Option<Retained<NSView>> = msg_send![parent, viewWithTag: tag];
-        view
-    }
 }

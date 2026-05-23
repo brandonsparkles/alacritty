@@ -23,7 +23,7 @@ non-macOS code never reaches.
 | **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
 | **Per-tab AI session resume** | After session restoration, claude / copilot / codex tabs reopen at *their specific* prior conversation (not just the most-recent). Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, and codex's `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` (matched by `pbi_start_tvsec` + cwd, with per-save-tick claim set so sibling codex tabs don't collide). |
 | **Cmd+A select all** | Selects the entire terminal contents (scrollback + visible area). Standard macOS shortcut, missing from upstream. |
-| **Budget enforcement** | Daily 3-hour focused-time cap + 02:00–06:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown. One 5-minute courtesy extension per day (clickable button or `Cmd+Shift+Ctrl+E`). See [Budget enforcement](#budget-enforcement) below. |
+| **Budget enforcement** | Daily 3-hour focused-time cap + 02:00–08:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown until the next 08:00 Central reset. One 5-minute courtesy extension per day is enabled by default. See [Budget enforcement](#budget-enforcement) below. |
 | **Window-title activity prefix** | The `⠿` / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
 
 ## Keybindings reference
@@ -137,14 +137,16 @@ around terminal-based AI tools.
 | 1-second tick | Background timer | Increments `active_seconds` while any alacritty window is focused. |
 | Hide-when-inactive | After `background_grace_seconds` (default 300 s) of no focus | Calls `NSApp.hide()`. Counter stops while hidden. Counter resumes on next focus. |
 | Cap exhaustion | `active_seconds >= cap_seconds` (default 10 800 = 3 h) | Block engages: input filtered, lockout overlay rendered. |
-| Sleep window | Wall-clock time between `sleep_start_hour` (default 02:00) and `sleep_end_hour` (default 06:00) Chicago | Block engages regardless of remaining cap. |
-| Courtesy extension | User clicks the overlay button or presses `Cmd+Shift+Ctrl+E` | One-shot per day: adds 300 s to `cap_seconds`, lifts the block. |
+| Sleep window | Wall-clock time between `sleep_start_hour` (default 02:00) and `sleep_end_hour` (default 08:00) Chicago | Block engages regardless of remaining cap. |
+| Courtesy extension | User clicks the overlay button or presses `Cmd+Shift+Ctrl+E` | One-shot per day: adds 300 s to `cap_seconds`, lifts the budget-exhausted block. Enabled by default; can be disabled with `allow_courtesy = false`. |
 | Day boundary | Wall-clock crosses `sleep_end_hour` Chicago | `active_seconds = 0`, `courtesy_used = false`. New day. |
 
 The overlay is a fullscreen opaque `NSView` over the GL surface — terminal
-content is invisible behind it. The only interactive element is the
-courtesy button (when still available). Keystrokes are filtered at the
-input layer (the overlay also absorbs them via first-responder, so it's
+content is invisible behind it. A one-shot courtesy button appears while
+the budget-exhausted block is active and the courtesy is still available;
+it does not appear during the 02:00–08:00 sleep window or after it has
+already been used that day. Keystrokes are filtered at the input layer
+(the overlay also absorbs them via first-responder, so it's
 belt-and-suspenders). Quitting + relaunching alacritty does not reset the
 block — usage state persists to disk.
 
@@ -155,10 +157,11 @@ block — usage state persists to disk.
 enabled = true                  # master switch
 cap_seconds = 10800             # 3 h
 sleep_start_hour = 2            # 02:00 Chicago
-sleep_end_hour = 6              # 06:00 Chicago
+sleep_end_hour = 8              # 08:00 Chicago; daily reset
 timezone = "America/Chicago"    # any IANA name; falls back to Chicago on parse error
 hide_when_inactive = true
 background_grace_seconds = 300  # 5 min grace before hide
+allow_courtesy = true            # one 5-min courtesy per day
 ```
 
 All fields have sensible defaults; the section is optional. Set
@@ -202,9 +205,10 @@ thread, std::net::TcpListener, hand-rolled HTTP/1.1, no external deps.
 }
 ```
 
-**`POST /courtesy`** →
+**`POST /courtesy`** → only meaningful when `allow_courtesy = true`
 - `200 OK` + updated JSON on success
 - `409 Conflict` `{"error":"already_used"}` if already spent today
+- `403 Forbidden` `{"error":"courtesy_disabled"}` when not explicitly enabled
 - `403 Forbidden` `{"error":"sleep_window"}` during the sleep window (extension is meaningless then — block lifts at `sleep_end_hour` regardless)
 
 **`OPTIONS *`** → 204 (CORS preflight).

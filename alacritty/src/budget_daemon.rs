@@ -8,7 +8,7 @@
 //!   GET  /usage     → 200 OK, JSON view of the current Budget.
 //!   POST /courtesy  → 200 OK with updated state on success,
 //!                      409 if courtesy has already been spent,
-//!                      403 during the sleep window.
+//!                      403 if courtesy is disabled or during the sleep window.
 //!
 //! Both responses include CORS headers permitting the aisparkles origin
 //! AND any localhost origin (for the Tauri shell + curl).
@@ -142,11 +142,13 @@ fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
                 let body =
                     serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
                 write_response(&mut stream, 200, "OK", "application/json", &body)?;
+            } else if !cfg.allow_courtesy {
+                let body = r#"{"error":"courtesy_disabled"}"#;
+                write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
             } else if was_used {
                 let body = r#"{"error":"already_used"}"#;
                 write_response(&mut stream, 409, "Conflict", "application/json", body)?;
             } else {
-                // Only other failure path is the sleep window.
                 let body = r#"{"error":"sleep_window"}"#;
                 write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
             }

@@ -6,7 +6,7 @@
 //!
 //!   * `active_seconds` — focused-time accumulated today
 //!   * `date_chicago` — day key the state was last written under
-//!   * `courtesy_used` / `courtesy_expires_at` — once-per-day extension
+//!   * `courtesy_used` / `courtesy_expires_at` — optional once-per-day extension
 //!
 //! State lives at `~/Library/Application Support/org.alacritty/usage.json`
 //! and is the single source of truth — read by the lockout overlay, the
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::budget::BudgetConfig;
 
-/// Courtesy extension grants this many additional active seconds.
+/// Courtesy extension grants this many additional active seconds when enabled.
 const COURTESY_DURATION_SECONDS: u64 = 5 * 60;
 
 /// Reason a block is currently active. Stable wire contract — mirrored
@@ -46,13 +46,13 @@ pub enum BlockReason {
 /// app) read this file directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Budget {
-    /// Day key (YYYY-MM-DD using a `sleep_start_hour` cutoff in the
+    /// Day key (YYYY-MM-DD using a `sleep_end_hour` reset cutoff in the
     /// configured timezone) the state was last written under. Used to
     /// detect day rollover at load time.
     pub date_chicago: String,
     /// Seconds of focused time accumulated today.
     pub active_seconds: u64,
-    /// True once the one-time-per-day 5-minute courtesy has been spent.
+    /// True once the optional one-time-per-day 5-minute courtesy has been spent.
     pub courtesy_used: bool,
     /// Unix-seconds timestamp when an active courtesy extension expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,24 +164,30 @@ impl Budget {
         if in_sleep_window(cfg) {
             return Some(BlockReason::SleepWindow);
         }
-        if self.active_seconds >= cfg.cap_seconds && !self.courtesy_active() {
+        if self.active_seconds >= cfg.cap_seconds && !self.courtesy_active(cfg) {
             return Some(BlockReason::BudgetExhausted);
         }
         None
     }
 
-    /// True when an unexpired courtesy extension is currently in effect.
-    pub fn courtesy_active(&self) -> bool {
+    /// True when an enabled, unexpired courtesy extension is currently in effect.
+    pub fn courtesy_active(&self, cfg: &BudgetConfig) -> bool {
+        if !cfg.allow_courtesy {
+            return false;
+        }
         match self.courtesy_expires_at {
             Some(expires_at) => unix_now() < expires_at,
             None => false,
         }
     }
 
-    /// Spend the once-per-day 5-minute courtesy extension. Returns true
-    /// on success, false if already used or if the sleep window is in
-    /// effect (no courtesy during 02:00–06:00).
+    /// Spend the optional once-per-day 5-minute courtesy extension. Returns
+    /// true on success, false if disabled, already used, or if the sleep
+    /// window is in effect (no courtesy during the configured sleep window).
     pub fn grant_courtesy(&mut self, cfg: &BudgetConfig) -> bool {
+        if !cfg.allow_courtesy {
+            return false;
+        }
         if self.courtesy_used {
             return false;
         }
@@ -215,10 +221,10 @@ fn now_in(cfg: &BudgetConfig) -> chrono::DateTime<Tz> {
 }
 
 /// Day key — calendar date of the budget's "day" anchored at
-/// `sleep_start_hour`. Local time before sleep_start still maps to
+/// `sleep_end_hour`. Local time before the reset hour still maps to
 /// *yesterday's* date.
 fn current_day_key(cfg: &BudgetConfig) -> String {
-    let shifted = now_in(cfg) - Duration::hours(cfg.sleep_start_hour as i64);
+    let shifted = now_in(cfg) - Duration::hours(cfg.sleep_end_hour as i64);
     shifted.format("%Y-%m-%d").to_string()
 }
 
@@ -236,30 +242,25 @@ fn in_sleep_window(cfg: &BudgetConfig) -> bool {
 fn seconds_until_sleep_end(cfg: &BudgetConfig) -> u64 {
     let tz = resolve_tz(&cfg.timezone);
     let now = chrono::Utc::now().with_timezone(&tz);
-    let today = now.date_naive();
-    let sleep_end =
-        NaiveTime::from_hms_opt(cfg.sleep_end_hour as u32, 0, 0).expect("valid time");
-    let target = today.and_time(sleep_end);
-    let target_tz = match tz.from_local_datetime(&target).single() {
-        Some(t) => t,
-        None => return 0,
-    };
-    let secs = (target_tz - now).num_seconds();
-    if secs < 0 { 0 } else { secs as u64 }
+    seconds_until_hour(now, tz, cfg.sleep_end_hour)
 }
 
 fn seconds_until_next_day(cfg: &BudgetConfig) -> u64 {
     let tz = resolve_tz(&cfg.timezone);
     let now = chrono::Utc::now().with_timezone(&tz);
-    let sleep_start =
-        NaiveTime::from_hms_opt(cfg.sleep_start_hour as u32, 0, 0).expect("valid time");
+    seconds_until_hour(now, tz, cfg.sleep_end_hour)
+}
+
+fn seconds_until_hour(now: chrono::DateTime<Tz>, tz: Tz, hour: u8) -> u64 {
+    let sleep_end =
+        NaiveTime::from_hms_opt(hour as u32, 0, 0).expect("valid time");
     let today = now.date_naive();
-    let candidate = today.and_time(sleep_start);
+    let candidate = today.and_time(sleep_end);
     let next_start = if (candidate - now.naive_local()).num_seconds() > 0 {
         candidate
     } else {
         let tomorrow = today.succ_opt().unwrap_or(today);
-        tomorrow.and_time(sleep_start)
+        tomorrow.and_time(sleep_end)
     };
     let target_tz = match tz.from_local_datetime(&next_start).single() {
         Some(t) => t,
@@ -282,6 +283,50 @@ mod tests {
     fn default_cap_is_three_hours() {
         let cfg = BudgetConfig::default();
         assert_eq!(cfg.cap_seconds, 10_800);
+    }
+
+    #[test]
+    fn default_sleep_window_is_two_to_eight_chicago_with_courtesy() {
+        let cfg = BudgetConfig::default();
+        assert_eq!(cfg.sleep_start_hour, 2);
+        assert_eq!(cfg.sleep_end_hour, 8);
+        assert_eq!(cfg.timezone, "America/Chicago");
+        assert!(cfg.allow_courtesy);
+    }
+
+    #[test]
+    fn budget_exhaustion_unlocks_at_next_reset_hour() {
+        let cfg = BudgetConfig::default();
+        let tz = resolve_tz(&cfg.timezone);
+        let now = tz.with_ymd_and_hms(2026, 5, 22, 21, 30, 0).single().unwrap();
+        assert_eq!(seconds_until_hour(now, tz, cfg.sleep_end_hour), 10 * 60 * 60 + 30 * 60);
+    }
+
+    #[test]
+    fn courtesy_can_be_disabled_explicitly() {
+        let mut cfg = BudgetConfig::default();
+        cfg.allow_courtesy = false;
+        let mut b = Budget::default();
+        b.date_chicago = current_day_key(&cfg);
+        b.active_seconds = cfg.cap_seconds;
+        b.courtesy_used = false;
+        b.courtesy_expires_at = Some(unix_now() + COURTESY_DURATION_SECONDS);
+
+        assert!(!b.courtesy_active(&cfg));
+        assert_eq!(b.block_status(&cfg), Some(BlockReason::BudgetExhausted));
+        assert!(!b.grant_courtesy(&cfg));
+    }
+
+    #[test]
+    fn courtesy_is_enabled_by_default() {
+        let cfg = BudgetConfig::default();
+        let mut b = Budget::default();
+        b.date_chicago = current_day_key(&cfg);
+        b.active_seconds = cfg.cap_seconds;
+
+        assert!(b.grant_courtesy(&cfg));
+        assert!(b.courtesy_active(&cfg));
+        assert_eq!(b.block_status(&cfg), None);
     }
 
     #[test]

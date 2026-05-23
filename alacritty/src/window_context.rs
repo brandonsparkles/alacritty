@@ -534,7 +534,7 @@ impl WindowContext {
         let working_directory =
             crate::macos::proc::cwd(self.shell_pid as i32).ok()?;
         let tab_title = self.display.tab_user_title.clone();
-        let tabbing_id = self.display.window.tabbing_id();
+        let tabbing_id = String::new();
         let inner = self.display.window.inner_size();
         let size = Some((inner.width, inner.height));
         let position = self
