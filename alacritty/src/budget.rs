@@ -7,6 +7,7 @@
 //!   * `active_seconds` — focused-time accumulated today
 //!   * `date_chicago` — day key the state was last written under
 //!   * `courtesy_used` / `courtesy_expires_at` — optional once-per-day extension
+//!   * `weekly_extension_*` — optional weekly one-hour extensions
 //!
 //! State lives at `~/Library/Application Support/org.alacritty/usage.json`
 //! and is the single source of truth — read by the lockout overlay, the
@@ -18,16 +19,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{Duration, NaiveTime, TimeZone, Timelike};
+use chrono::{Datelike, Duration, NaiveTime, TimeZone, Timelike};
 use chrono_tz::America::Chicago;
 use chrono_tz::Tz;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::config::budget::BudgetConfig;
-
-/// Courtesy extension grants this many additional active seconds when enabled.
-const COURTESY_DURATION_SECONDS: u64 = 5 * 60;
 
 /// Reason a block is currently active. Stable wire contract — mirrored
 /// over the HTTP daemon for the pomodoro/Tauri UI.
@@ -41,6 +39,14 @@ pub enum BlockReason {
     BudgetExhausted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeeklyExtensionError {
+    Disabled,
+    SleepWindow,
+    AlreadyActive,
+    AllowanceSpent,
+}
+
 /// Persisted budget runtime state. On-disk JSON layout is kept stable —
 /// out-of-process consumers (the localhost HTTP daemon, the Tauri menu-bar
 /// app) read this file directly.
@@ -52,11 +58,20 @@ pub struct Budget {
     pub date_chicago: String,
     /// Seconds of focused time accumulated today.
     pub active_seconds: u64,
-    /// True once the optional one-time-per-day 5-minute courtesy has been spent.
+    /// True once the optional one-time-per-day courtesy has been spent.
     pub courtesy_used: bool,
     /// Unix-seconds timestamp when an active courtesy extension expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub courtesy_expires_at: Option<u64>,
+    /// ISO week key the weekly extension allowance was last written under.
+    #[serde(default)]
+    pub weekly_extension_week: String,
+    /// Weekly extension seconds redeemed in the current week.
+    #[serde(default)]
+    pub weekly_extension_used_seconds: u64,
+    /// Unix-seconds timestamp when an active weekly extension expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_extension_expires_at: Option<u64>,
     /// Updated on every save. External tools use this for freshness.
     pub updated_at: u64,
 }
@@ -68,6 +83,9 @@ impl Default for Budget {
             active_seconds: 0,
             courtesy_used: false,
             courtesy_expires_at: None,
+            weekly_extension_week: String::new(),
+            weekly_extension_used_seconds: 0,
+            weekly_extension_expires_at: None,
             updated_at: unix_now(),
         }
     }
@@ -96,6 +114,9 @@ impl Budget {
         // something to compare against on the next tick.
         if budget.date_chicago.is_empty() {
             budget.date_chicago = current_day_key(cfg);
+        }
+        if budget.weekly_extension_week.is_empty() {
+            budget.weekly_extension_week = current_week_key(cfg);
         }
         budget.refresh_day_boundary(cfg);
         budget
@@ -137,14 +158,27 @@ impl Budget {
     pub fn refresh_day_boundary(&mut self, cfg: &BudgetConfig) {
         let today = current_day_key(cfg);
         if self.date_chicago != today {
-            debug!(
-                "Budget: day rollover {} -> {}, resetting counter",
-                self.date_chicago, today
-            );
+            debug!("Budget: day rollover {} -> {}, resetting counter", self.date_chicago, today);
             self.date_chicago = today;
             self.active_seconds = 0;
             self.courtesy_used = false;
             self.courtesy_expires_at = None;
+        }
+        self.refresh_week_boundary(cfg);
+    }
+
+    /// Reset the weekly extension allowance if the configured week key
+    /// has advanced.
+    pub fn refresh_week_boundary(&mut self, cfg: &BudgetConfig) {
+        let week = current_week_key(cfg);
+        if self.weekly_extension_week != week {
+            debug!(
+                "Budget: week rollover {} -> {}, resetting weekly extensions",
+                self.weekly_extension_week, week
+            );
+            self.weekly_extension_week = week;
+            self.weekly_extension_used_seconds = 0;
+            self.weekly_extension_expires_at = None;
         }
     }
 
@@ -164,7 +198,10 @@ impl Budget {
         if in_sleep_window(cfg) {
             return Some(BlockReason::SleepWindow);
         }
-        if self.active_seconds >= cfg.cap_seconds && !self.courtesy_active(cfg) {
+        if self.active_seconds >= cfg.cap_seconds
+            && !self.courtesy_active(cfg)
+            && !self.weekly_extension_active(cfg)
+        {
             return Some(BlockReason::BudgetExhausted);
         }
         None
@@ -172,7 +209,7 @@ impl Budget {
 
     /// True when an enabled, unexpired courtesy extension is currently in effect.
     pub fn courtesy_active(&self, cfg: &BudgetConfig) -> bool {
-        if !cfg.allow_courtesy {
+        if !cfg.allow_courtesy || cfg.courtesy_seconds == 0 {
             return false;
         }
         match self.courtesy_expires_at {
@@ -181,11 +218,36 @@ impl Budget {
         }
     }
 
-    /// Spend the optional once-per-day 5-minute courtesy extension. Returns
+    /// True when an enabled, unexpired weekly extension is currently in effect.
+    pub fn weekly_extension_active(&self, cfg: &BudgetConfig) -> bool {
+        if !cfg.allow_weekly_extensions {
+            return false;
+        }
+        match self.weekly_extension_expires_at {
+            Some(expires_at) => unix_now() < expires_at,
+            None => false,
+        }
+    }
+
+    /// Weekly extension seconds still available for the current week.
+    pub fn weekly_extension_remaining_seconds(&self, cfg: &BudgetConfig) -> u64 {
+        cfg.weekly_extension_allowance_seconds.saturating_sub(self.weekly_extension_used_seconds)
+    }
+
+    /// True when a one-hour weekly extension can be redeemed right now.
+    pub fn weekly_extension_available(&self, cfg: &BudgetConfig) -> bool {
+        cfg.allow_weekly_extensions
+            && cfg.weekly_extension_seconds > 0
+            && !in_sleep_window(cfg)
+            && !self.weekly_extension_active(cfg)
+            && self.weekly_extension_remaining_seconds(cfg) >= cfg.weekly_extension_seconds
+    }
+
+    /// Spend the optional once-per-day courtesy extension. Returns
     /// true on success, false if disabled, already used, or if the sleep
     /// window is in effect (no courtesy during the configured sleep window).
     pub fn grant_courtesy(&mut self, cfg: &BudgetConfig) -> bool {
-        if !cfg.allow_courtesy {
+        if !cfg.allow_courtesy || cfg.courtesy_seconds == 0 {
             return false;
         }
         if self.courtesy_used {
@@ -195,8 +257,33 @@ impl Budget {
             return false;
         }
         self.courtesy_used = true;
-        self.courtesy_expires_at = Some(unix_now() + COURTESY_DURATION_SECONDS);
+        self.courtesy_expires_at = Some(unix_now() + cfg.courtesy_seconds);
         true
+    }
+
+    /// Spend one weekly extension increment.
+    pub fn grant_weekly_extension(
+        &mut self,
+        cfg: &BudgetConfig,
+    ) -> Result<(), WeeklyExtensionError> {
+        self.refresh_week_boundary(cfg);
+        if !cfg.allow_weekly_extensions || cfg.weekly_extension_seconds == 0 {
+            return Err(WeeklyExtensionError::Disabled);
+        }
+        if in_sleep_window(cfg) {
+            return Err(WeeklyExtensionError::SleepWindow);
+        }
+        if self.weekly_extension_active(cfg) {
+            return Err(WeeklyExtensionError::AlreadyActive);
+        }
+        if self.weekly_extension_remaining_seconds(cfg) < cfg.weekly_extension_seconds {
+            return Err(WeeklyExtensionError::AllowanceSpent);
+        }
+
+        self.weekly_extension_used_seconds =
+            self.weekly_extension_used_seconds.saturating_add(cfg.weekly_extension_seconds);
+        self.weekly_extension_expires_at = Some(unix_now() + cfg.weekly_extension_seconds);
+        Ok(())
     }
 
     /// Seconds remaining before the user is unblocked at the soonest.
@@ -228,6 +315,12 @@ fn current_day_key(cfg: &BudgetConfig) -> String {
     shifted.format("%Y-%m-%d").to_string()
 }
 
+fn current_week_key(cfg: &BudgetConfig) -> String {
+    let shifted = now_in(cfg) - Duration::hours(cfg.sleep_end_hour as i64);
+    let week = shifted.iso_week();
+    format!("{}-W{:02}", week.year(), week.week())
+}
+
 fn in_sleep_window(cfg: &BudgetConfig) -> bool {
     let hour = now_in(cfg).hour() as u8;
     // Handle wraparound (start>end means "spans midnight") even though we
@@ -252,8 +345,7 @@ fn seconds_until_next_day(cfg: &BudgetConfig) -> u64 {
 }
 
 fn seconds_until_hour(now: chrono::DateTime<Tz>, tz: Tz, hour: u8) -> u64 {
-    let sleep_end =
-        NaiveTime::from_hms_opt(hour as u32, 0, 0).expect("valid time");
+    let sleep_end = NaiveTime::from_hms_opt(hour as u32, 0, 0).expect("valid time");
     let today = now.date_naive();
     let candidate = today.and_time(sleep_end);
     let next_start = if (candidate - now.naive_local()).num_seconds() > 0 {
@@ -292,6 +384,10 @@ mod tests {
         assert_eq!(cfg.sleep_end_hour, 8);
         assert_eq!(cfg.timezone, "America/Chicago");
         assert!(cfg.allow_courtesy);
+        assert_eq!(cfg.courtesy_seconds, 15 * 60);
+        assert!(cfg.allow_weekly_extensions);
+        assert_eq!(cfg.weekly_extension_seconds, 60 * 60);
+        assert_eq!(cfg.weekly_extension_allowance_seconds, 6 * 60 * 60);
     }
 
     #[test]
@@ -306,11 +402,13 @@ mod tests {
     fn courtesy_can_be_disabled_explicitly() {
         let mut cfg = BudgetConfig::default();
         cfg.allow_courtesy = false;
+        cfg.sleep_start_hour = 0;
+        cfg.sleep_end_hour = 0;
         let mut b = Budget::default();
         b.date_chicago = current_day_key(&cfg);
         b.active_seconds = cfg.cap_seconds;
         b.courtesy_used = false;
-        b.courtesy_expires_at = Some(unix_now() + COURTESY_DURATION_SECONDS);
+        b.courtesy_expires_at = Some(unix_now() + cfg.courtesy_seconds);
 
         assert!(!b.courtesy_active(&cfg));
         assert_eq!(b.block_status(&cfg), Some(BlockReason::BudgetExhausted));
@@ -319,7 +417,9 @@ mod tests {
 
     #[test]
     fn courtesy_is_enabled_by_default() {
-        let cfg = BudgetConfig::default();
+        let mut cfg = BudgetConfig::default();
+        cfg.sleep_start_hour = 0;
+        cfg.sleep_end_hour = 0;
         let mut b = Budget::default();
         b.date_chicago = current_day_key(&cfg);
         b.active_seconds = cfg.cap_seconds;
@@ -327,6 +427,23 @@ mod tests {
         assert!(b.grant_courtesy(&cfg));
         assert!(b.courtesy_active(&cfg));
         assert_eq!(b.block_status(&cfg), None);
+    }
+
+    #[test]
+    fn courtesy_uses_configured_duration() {
+        let mut cfg = BudgetConfig::default();
+        cfg.courtesy_seconds = 42;
+        cfg.sleep_start_hour = 0;
+        cfg.sleep_end_hour = 0;
+        let mut b = Budget::default();
+        b.date_chicago = current_day_key(&cfg);
+        b.active_seconds = cfg.cap_seconds;
+
+        let before = unix_now();
+        assert!(b.grant_courtesy(&cfg));
+        let expires_at = b.courtesy_expires_at.expect("courtesy expiration");
+        assert!(expires_at >= before + cfg.courtesy_seconds);
+        assert!(expires_at <= unix_now() + cfg.courtesy_seconds);
     }
 
     #[test]
@@ -345,9 +462,45 @@ mod tests {
         b.date_chicago = "1970-01-01".into();
         b.active_seconds = 5_000;
         b.courtesy_used = true;
+        b.weekly_extension_week = "1970-W01".into();
+        b.weekly_extension_used_seconds = 6 * 60 * 60;
+        b.weekly_extension_expires_at = Some(unix_now() + 60);
         b.refresh_day_boundary(&cfg);
         assert_eq!(b.active_seconds, 0);
         assert!(!b.courtesy_used);
+        assert_eq!(b.weekly_extension_used_seconds, 0);
+        assert!(b.weekly_extension_expires_at.is_none());
+    }
+
+    #[test]
+    fn weekly_extension_grants_one_hour_and_tracks_allowance() {
+        let mut cfg = BudgetConfig::default();
+        cfg.sleep_start_hour = 0;
+        cfg.sleep_end_hour = 0;
+        let mut b = Budget::default();
+        b.date_chicago = current_day_key(&cfg);
+        b.weekly_extension_week = current_week_key(&cfg);
+        b.active_seconds = cfg.cap_seconds;
+
+        assert_eq!(b.weekly_extension_remaining_seconds(&cfg), 6 * 60 * 60);
+        assert_eq!(b.grant_weekly_extension(&cfg), Ok(()));
+        assert!(b.weekly_extension_active(&cfg));
+        assert_eq!(b.weekly_extension_used_seconds, 60 * 60);
+        assert_eq!(b.weekly_extension_remaining_seconds(&cfg), 5 * 60 * 60);
+        assert_eq!(b.block_status(&cfg), None);
+    }
+
+    #[test]
+    fn weekly_extension_stops_after_six_hours() {
+        let mut cfg = BudgetConfig::default();
+        cfg.sleep_start_hour = 0;
+        cfg.sleep_end_hour = 0;
+        let mut b = Budget::default();
+        b.date_chicago = current_day_key(&cfg);
+        b.weekly_extension_week = current_week_key(&cfg);
+        b.weekly_extension_used_seconds = cfg.weekly_extension_allowance_seconds;
+
+        assert_eq!(b.grant_weekly_extension(&cfg), Err(WeeklyExtensionError::AllowanceSpent));
     }
 
     #[test]

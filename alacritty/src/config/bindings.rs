@@ -170,9 +170,13 @@ pub enum Action {
     /// Select the entire terminal contents (scrollback + visible area).
     SelectAll,
 
-    /// Spend the optional once-per-day 5-minute budget courtesy extension.
+    /// Spend the optional once-per-day budget courtesy extension.
     /// Inert unless `[budget] allow_courtesy = true`. macOS only.
     GrantCourtesy,
+
+    /// Spend one weekly 1-hour budget extension.
+    /// Inert unless `[budget] allow_weekly_extensions = true`. macOS only.
+    GrantWeeklyExtension,
 
     /// Hide the Alacritty window.
     Hide,
@@ -662,6 +666,7 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
         "f",    ModifiersState::CONTROL | ModifiersState::SUPER;               Action::ToggleFullscreen;
         "a",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SelectAll;
         "e",    ModifiersState::SUPER | ModifiersState::SHIFT | ModifiersState::CONTROL; Action::GrantCourtesy;
+        "w",    ModifiersState::SUPER | ModifiersState::SHIFT | ModifiersState::CONTROL; Action::GrantWeeklyExtension;
         "c",    ModifiersState::SUPER;                                         Action::Copy;
         "c",    ModifiersState::SUPER, +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
         "h",    ModifiersState::SUPER;                                         Action::Hide;

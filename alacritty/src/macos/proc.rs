@@ -98,9 +98,7 @@ pub fn list_children(parent_pid: c_int) -> Vec<c_int> {
 pub fn pid_path(pid: c_int) -> Option<std::path::PathBuf> {
     // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN = 4096 on macOS.
     let mut buf = vec![0u8; 4096];
-    let n = unsafe {
-        sys::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32)
-    };
+    let n = unsafe { sys::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
     if n <= 0 {
         return None;
     }
@@ -124,21 +122,14 @@ pub fn comm(pid: c_int) -> Option<String> {
     let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
     let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
     let res = unsafe {
-        sys::proc_pidinfo(
-            pid,
-            sys::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr() as *mut c_void,
-            size,
-        )
+        sys::proc_pidinfo(pid, sys::PROC_PIDTBSDINFO, 0, info.as_mut_ptr() as *mut c_void, size)
     };
     if res != size {
         return None;
     }
     let info = unsafe { info.assume_init() };
     // `pbi_comm` is NUL-padded; build a Rust string from it safely.
-    let bytes: Vec<u8> =
-        info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
     String::from_utf8(bytes).ok()
 }
 
@@ -151,19 +142,72 @@ pub fn start_tvsec(pid: c_int) -> Option<u64> {
     let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
     let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
     let res = unsafe {
-        sys::proc_pidinfo(
-            pid,
-            sys::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr() as *mut c_void,
-            size,
-        )
+        sys::proc_pidinfo(pid, sys::PROC_PIDTBSDINFO, 0, info.as_mut_ptr() as *mut c_void, size)
     };
     if res != size {
         return None;
     }
     let info = unsafe { info.assume_init() };
     Some(info.pbi_start_tvsec)
+}
+
+/// Return the process argv via `KERN_PROCARGS2`.
+///
+/// Used by `cli_resume.rs` to preserve an explicit `codex resume <uuid>`
+/// command after a restored Codex process is running. The rollout file's
+/// timestamp can be much older than the current process when a session was
+/// resumed, so argv is the durable signal in that case.
+pub fn argv(pid: c_int) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut len = buf.len();
+    let res = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res != 0 || len <= std::mem::size_of::<c_int>() {
+        return None;
+    }
+    buf.truncate(len);
+
+    let argc = c_int::from_ne_bytes(buf[..std::mem::size_of::<c_int>()].try_into().ok()?);
+    let argc = usize::try_from(argc).ok()?;
+    if argc == 0 {
+        return None;
+    }
+
+    let mut idx = std::mem::size_of::<c_int>();
+    while idx < buf.len() && buf[idx] != 0 {
+        idx += 1;
+    }
+    while idx < buf.len() && buf[idx] == 0 {
+        idx += 1;
+    }
+
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if idx >= buf.len() {
+            break;
+        }
+        let start = idx;
+        while idx < buf.len() && buf[idx] != 0 {
+            idx += 1;
+        }
+        if idx > start {
+            args.push(String::from_utf8_lossy(&buf[start..idx]).into_owned());
+        }
+        while idx < buf.len() && buf[idx] == 0 {
+            idx += 1;
+        }
+    }
+
+    (!args.is_empty()).then_some(args)
 }
 
 /// `true` if the process is blocked (state SSLEEP/SSTOP) rather than runnable.
@@ -179,13 +223,7 @@ pub fn is_idle(pid: c_int) -> bool {
     let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
     let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
     let res = unsafe {
-        sys::proc_pidinfo(
-            pid,
-            sys::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr() as *mut c_void,
-            size,
-        )
+        sys::proc_pidinfo(pid, sys::PROC_PIDTBSDINFO, 0, info.as_mut_ptr() as *mut c_void, size)
     };
     if res != size {
         return false;

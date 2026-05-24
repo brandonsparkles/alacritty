@@ -166,6 +166,9 @@ pub trait ActionContext<T: EventListener> {
     /// Send `EventType::GrantCourtesy` to the event loop. macOS only.
     #[cfg(target_os = "macos")]
     fn dispatch_grant_courtesy(&mut self) {}
+    /// Send `EventType::GrantWeeklyExtension` to the event loop. macOS only.
+    #[cfg(target_os = "macos")]
+    fn dispatch_grant_weekly_extension(&mut self) {}
     fn inline_search_state(&mut self) -> &mut InlineSearchState;
     fn start_inline_search(&mut self, _direction: Direction, _stop_short: bool) {}
     fn inline_search_next(&mut self) {}
@@ -207,11 +210,13 @@ trait Execute<T: EventListener> {
 impl<T: EventListener> Execute<T> for Action {
     #[inline]
     fn execute<A: ActionContext<T>>(&self, ctx: &mut A) {
-        // Budget lockout: while blocked, the only action permitted is
-        // GrantCourtesy. Everything else (typing, paste, copy, scroll,
-        // tab navigation, etc.) is silently swallowed.
+        // Budget lockout: while blocked, the only actions permitted are
+        // budget-extension requests. Everything else (typing, paste, copy,
+        // scroll, tab navigation, etc.) is silently swallowed.
         #[cfg(target_os = "macos")]
-        if ctx.is_budget_blocked() && !matches!(self, Action::GrantCourtesy) {
+        if ctx.is_budget_blocked()
+            && !matches!(self, Action::GrantCourtesy | Action::GrantWeeklyExtension)
+        {
             return;
         }
         match self {
@@ -374,6 +379,10 @@ impl<T: EventListener> Execute<T> for Action {
             Action::GrantCourtesy => {
                 ctx.dispatch_grant_courtesy();
             },
+            #[cfg(target_os = "macos")]
+            Action::GrantWeeklyExtension => {
+                ctx.dispatch_grant_weekly_extension();
+            },
             Action::SelectAll => {
                 // Span the full grid: from the top of scrollback to the
                 // last column of the bottom visible row.
@@ -386,11 +395,7 @@ impl<T: EventListener> Execute<T> for Action {
                     let last = Column(term.grid().columns().saturating_sub(1));
                     (topmost, bottom, last)
                 };
-                ctx.start_selection(
-                    SelectionType::Simple,
-                    Point::new(top, Column(0)),
-                    Side::Left,
-                );
+                ctx.start_selection(SelectionType::Simple, Point::new(top, Column(0)), Side::Left);
                 ctx.update_selection(Point::new(bottom_line, last_col), Side::Right);
             },
             Action::Paste => {

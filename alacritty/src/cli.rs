@@ -323,10 +323,18 @@ pub struct WindowOptions {
     #[clap(skip)]
     #[cfg(target_os = "macos")]
     /// Shell command to dispatch into the new PTY once the shell prompts,
-    /// restored from a previous session. Typically `claude --resume <uuid>`
-    /// so the tab's prior AI conversation picks up where it left off.
+    /// restored from a previous session. Typically an allowlisted AI CLI
+    /// resume command with permissive flags so the tab's prior conversation
+    /// picks up where it left off.
     /// See `cli_resume.rs`.
     pub restored_resume_command: Option<String>,
+
+    #[clap(skip)]
+    #[cfg(target_os = "macos")]
+    /// True when this window is being replayed from the persisted macOS
+    /// session. Used to avoid overwriting the saved full session during
+    /// partial restore.
+    pub restored_from_session: bool,
 
     #[clap(skip)]
     #[cfg(not(any(target_os = "macos", windows)))]

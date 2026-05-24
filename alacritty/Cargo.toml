@@ -10,6 +10,9 @@ repository = "https://github.com/alacritty/alacritty"
 edition.workspace = true
 rust-version.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["embed-resource", "gl_generator"]
+
 [dependencies.alacritty_terminal]
 path = "../alacritty_terminal"
 version = "0.26.0"

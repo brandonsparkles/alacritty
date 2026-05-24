@@ -2,7 +2,7 @@
     <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
 </p>
 
-<h1 align="center">Alacritty - A fast, cross-platform, OpenGL terminal emulator</h1>
+# Alacritty - A fast, cross-platform, OpenGL terminal emulator
 
 <p align="center">
   <img alt="Alacritty - A fast, cross-platform, OpenGL terminal emulator"
@@ -29,7 +29,7 @@ Join [`#alacritty`] on libera.chat if you have questions or looking for a quick 
 
 ## Features
 
-You can find an overview over the features available in Alacritty [here](./docs/features.md).
+You can find an overview over the [Alacritty feature set](./docs/features.md).
 
 ## Further information
 
@@ -45,8 +45,14 @@ macOS and Windows.
 Prebuilt binaries for macOS and Windows can also be downloaded from the
 [GitHub releases page](https://github.com/alacritty/alacritty/releases).
 
-For everyone else, the detailed instructions to install Alacritty can be found
-[here](INSTALL.md).
+If you only need the binary, you can also install Alacritty with Cargo:
+
+```sh
+cargo install alacritty
+```
+
+For OS-specific build dependencies and source installation instructions, see
+[INSTALL.md](INSTALL.md).
 
 ### Requirements
 
@@ -72,7 +78,7 @@ following locations:
 
 On Windows, the config file will be looked for in:
 
-* `%APPDATA%\alacritty\alacritty.toml`
+- `%APPDATA%\alacritty\alacritty.toml`
 
 ## Contributing
 

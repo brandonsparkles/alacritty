@@ -10,6 +10,8 @@ use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSeError;
 use toml::{Table, Value};
 
+#[cfg(target_os = "macos")]
+pub mod ai_resume;
 pub mod bell;
 #[cfg(target_os = "macos")]
 pub mod budget;
@@ -413,6 +415,22 @@ mod tests {
     #[test]
     fn empty_config() {
         toml::from_str::<UiConfig>("").unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ai_resume_config() {
+        let config = toml::from_str::<UiConfig>(
+            r#"
+[ai_resume.codex]
+flags = ["--sandbox", "workspace-write"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.ai_resume.codex.flags, ["--sandbox", "workspace-write"]);
+        assert!(config.ai_resume.claude.flags.is_empty());
+        assert!(config.ai_resume.copilot.flags.is_empty());
     }
 
     fn yaml_to_toml(contents: &str) -> String {

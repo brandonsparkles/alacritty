@@ -38,7 +38,7 @@ use crate::config::window::WindowConfig;
 /// Regex used for the default URL hint.
 #[rustfmt::skip]
 const URL_REGEX: &str = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
-                         [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+";
+                         [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{}\\^⟨⟩`\\\\]+";
 
 #[derive(ConfigDeserialize, Serialize, Default, Clone, Debug, PartialEq)]
 pub struct UiConfig {
@@ -76,6 +76,10 @@ pub struct UiConfig {
     /// sleep-window lockout, plus hide-when-inactive behavior.
     #[cfg(target_os = "macos")]
     pub budget: crate::config::budget::BudgetConfig,
+
+    /// AI CLI resume-command flag policy (macOS only).
+    #[cfg(target_os = "macos")]
+    pub ai_resume: crate::config::ai_resume::AiResumeConfig,
 
     /// RGB values for colors.
     pub colors: Colors,
@@ -708,6 +712,7 @@ mod tests {
             "git://github.com/user/repo.git",
             "ssh:git@github.com:user/repo.git",
             "ftp://ftp.example.org",
+            "https://github.com/organizations/Sparkles-LLC/settings/models/access-policy",
         ] {
             let term = mock_term(regular_url);
             let mut regex = RegexSearch::new(URL_REGEX).unwrap();
@@ -715,8 +720,13 @@ mod tests {
             assert_eq!(
                 matches.len(),
                 1,
-                "Should have exactly one match url {regular_url}, but instead got: {matches:?}"
-            )
+                "Should have exactly one match url {regular_url}, but instead got: {matches:?}",
+            );
+            assert_eq!(
+                term.bounds_to_string(*matches[0].start(), *matches[0].end()),
+                regular_url,
+                "Should match the complete url {regular_url}, but instead got: {matches:?}",
+            );
         }
     }
 

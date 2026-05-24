@@ -7,8 +7,8 @@
 //!
 //!   * The overlay must absorb keystrokes that would otherwise hit the
 //!     terminal — NSView's first-responder semantics handle this for free.
-//!   * The optional courtesy button must be a real clickable HUD element,
-//!     not a synthesized PTY interaction.
+//!   * The optional extension buttons must be real clickable HUD elements,
+//!     not synthesized PTY interactions.
 //!   * NSView lives outside the GL surface, so re-rendering doesn't fight
 //!     with the terminal grid renderer's frame loop.
 //!
@@ -19,8 +19,8 @@
 //!   update the countdown label in place. Idempotent.
 //! * [`remove`] is called when the block lifts (next tick after
 //!   `block_status() == None`). Drops the overlay from the contentView.
-//! * The courtesy button dispatches `EventType::GrantCourtesy` to the
-//!   alacritty event loop via a global `EventLoopProxy` registered at
+//! * The extension buttons dispatch budget events to the alacritty event
+//!   loop via a global `EventLoopProxy` registered at
 //!   startup (see [`register_event_proxy`]).
 //!
 //! ### Identification
@@ -38,7 +38,7 @@ use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{define_class, msg_send, sel, ClassType, MainThreadOnly};
+use objc2::{ClassType, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSButton, NSColor, NSFont, NSTextAlignment, NSTextField, NSView,
     NSWindow,
@@ -56,11 +56,12 @@ thread_local! {
 struct OverlayViews {
     root: Retained<NSView>,
     countdown: Retained<NSTextField>,
-    button: Retained<NSButton>,
+    courtesy_button: Retained<NSButton>,
+    weekly_button: Retained<NSButton>,
 }
 
-/// Single shared event proxy for dispatching `GrantCourtesy` from the
-/// button-click target. Set once at process startup by `Processor::new`.
+/// Single shared event proxy for dispatching budget-extension events from
+/// button-click targets. Set once at process startup by `Processor::new`.
 static EVENT_PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
 
 /// Singleton target object that owns the button-click action. Created
@@ -75,7 +76,7 @@ pub fn register_event_proxy(proxy: EventLoopProxy<Event>) {
 }
 
 // ---------------------------------------------------------------------------
-// Courtesy button target — an Obj-C class with a method the NSButton can
+// Extension button target — an Obj-C class with methods NSButton can
 // invoke via target/action.
 // ---------------------------------------------------------------------------
 
@@ -94,6 +95,15 @@ define_class!(
         fn grant_courtesy(&self, _sender: *mut NSObject) {
             if let Some(proxy) = EVENT_PROXY.get() {
                 let _ = proxy.send_event(Event::new(EventType::GrantCourtesy, None));
+            }
+        }
+
+        /// Selector: `grantWeeklyExtension:`. Dispatches a one-hour weekly
+        /// extension request to the alacritty main loop.
+        #[unsafe(method(grantWeeklyExtension:))]
+        fn grant_weekly_extension(&self, _sender: *mut NSObject) {
+            if let Some(proxy) = EVENT_PROXY.get() {
+                let _ = proxy.send_event(Event::new(EventType::GrantWeeklyExtension, None));
             }
         }
     }
@@ -115,7 +125,15 @@ fn courtesy_target(_mtm: MainThreadMarker) -> &'static Retained<CourtesyTarget> 
 
 /// Install the overlay if absent, or refresh its countdown text if it's
 /// already there. Safe to call every tick.
-pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_available: bool) {
+pub fn install_or_update(
+    window: &NSWindow,
+    unlock_seconds: u64,
+    courtesy_available: bool,
+    courtesy_seconds: u64,
+    weekly_extension_visible: bool,
+    weekly_extension_available: bool,
+    weekly_extension_remaining_seconds: u64,
+) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let Some(content) = window.contentView() else { return };
     let bounds = content.bounds();
@@ -128,17 +146,28 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
             let cd_obj: &AnyObject =
                 unsafe { &*(&*overlay.countdown as *const NSTextField as *const AnyObject) };
             let s = NSString::from_str(&format_countdown(unlock_seconds));
+            let weekly_title = NSString::from_str(&format_weekly_button_title(
+                weekly_extension_remaining_seconds,
+                weekly_extension_available,
+            ));
+            let courtesy_title =
+                NSString::from_str(&format_courtesy_button_title(courtesy_seconds));
             unsafe {
                 let _: () = msg_send![cd_obj, setStringValue: &*s];
-                let _: () = msg_send![&*overlay.button, setHidden: !courtesy_available];
+                overlay.courtesy_button.setTitle(&courtesy_title);
+                overlay.weekly_button.setTitle(&weekly_title);
+                let _: () = msg_send![&*overlay.courtesy_button, setHidden: !courtesy_available];
+                let _: () =
+                    msg_send![&*overlay.weekly_button, setHidden: !weekly_extension_visible];
+                let _: () =
+                    msg_send![&*overlay.weekly_button, setEnabled: weekly_extension_available];
             }
         });
         return;
     }
 
     // Build a fresh overlay from scratch.
-    let overlay: Retained<NSView> =
-        unsafe { NSView::initWithFrame(NSView::alloc(mtm), bounds) };
+    let overlay: Retained<NSView> = NSView::initWithFrame(NSView::alloc(mtm), bounds);
     unsafe {
         overlay.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
@@ -165,14 +194,12 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
             size: NSSize { width: bounds.size.width, height: 80.0 },
         },
     );
-    unsafe {
-        title.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable
-                | NSAutoresizingMaskOptions::ViewMinYMargin
-                | NSAutoresizingMaskOptions::ViewMaxYMargin,
-        );
-        overlay.addSubview(&title);
-    }
+    title.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    overlay.addSubview(&title);
 
     // ── Countdown
     let countdown = make_label(
@@ -195,24 +222,23 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
         overlay.addSubview(cd_view);
     }
 
-    // ── Courtesy button (centered, ~180×40, below the countdown)
-    let btn_width = 220.0;
+    // ── Courtesy button (centered, below the countdown)
+    let btn_width = if bounds.size.width >= 400.0 { 360.0 } else { 300.0 };
     let btn_height = 40.0;
     let btn_x = (bounds.size.width - btn_width) / 2.0;
-    let btn_y = bounds.size.height * 0.32;
-    let button: Retained<NSButton> = unsafe {
-        NSButton::initWithFrame(
-            NSButton::alloc(mtm),
-            NSRect {
-                origin: NSPoint { x: btn_x, y: btn_y },
-                size: NSSize { width: btn_width, height: btn_height },
-            },
-        )
-    };
+    let courtesy_y = bounds.size.height * 0.33;
+    let courtesy_button: Retained<NSButton> = NSButton::initWithFrame(
+        NSButton::alloc(mtm),
+        NSRect {
+            origin: NSPoint { x: btn_x, y: courtesy_y },
+            size: NSSize { width: btn_width, height: btn_height },
+        },
+    );
     let target = courtesy_target(mtm);
     unsafe {
-        button.setTitle(&NSString::from_str("Use 5-min courtesy"));
-        let btn_view: &NSView = std::mem::transmute(&*button);
+        courtesy_button
+            .setTitle(&NSString::from_str(&format_courtesy_button_title(courtesy_seconds)));
+        let btn_view: &NSView = std::mem::transmute(&*courtesy_button);
         btn_view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewMinXMargin
                 | NSAutoresizingMaskOptions::ViewMaxXMargin
@@ -220,20 +246,52 @@ pub fn install_or_update(window: &NSWindow, unlock_seconds: u64, courtesy_availa
                 | NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
         let target_obj: &NSObject = std::mem::transmute(&**target);
-        let _: () = msg_send![&*button, setTarget: target_obj];
-        let _: () = msg_send![&*button, setAction: sel!(grantCourtesy:)];
+        let _: () = msg_send![&*courtesy_button, setTarget: target_obj];
+        let _: () = msg_send![&*courtesy_button, setAction: sel!(grantCourtesy:)];
         if !courtesy_available {
-            let _: () = msg_send![&*button, setHidden: true];
+            let _: () = msg_send![&*courtesy_button, setHidden: true];
         }
         overlay.addSubview(btn_view);
     }
 
+    // ── Weekly extension button (one-hour increment, six-hour weekly pool)
+    let weekly_y = bounds.size.height * 0.25;
+    let weekly_button: Retained<NSButton> = NSButton::initWithFrame(
+        NSButton::alloc(mtm),
+        NSRect {
+            origin: NSPoint { x: btn_x, y: weekly_y },
+            size: NSSize { width: btn_width, height: btn_height },
+        },
+    );
     unsafe {
-        content.addSubview(&overlay);
+        weekly_button.setTitle(&NSString::from_str(&format_weekly_button_title(
+            weekly_extension_remaining_seconds,
+            weekly_extension_available,
+        )));
+        let btn_view: &NSView = std::mem::transmute(&*weekly_button);
+        btn_view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin
+                | NSAutoresizingMaskOptions::ViewMaxXMargin
+                | NSAutoresizingMaskOptions::ViewMinYMargin
+                | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+        let target_obj: &NSObject = std::mem::transmute(&**target);
+        let _: () = msg_send![&*weekly_button, setTarget: target_obj];
+        let _: () = msg_send![&*weekly_button, setAction: sel!(grantWeeklyExtension:)];
+        let _: () = msg_send![&*weekly_button, setEnabled: weekly_extension_available];
+        if !weekly_extension_visible {
+            let _: () = msg_send![&*weekly_button, setHidden: true];
+        }
+        overlay.addSubview(btn_view);
     }
 
+    content.addSubview(&overlay);
+
     OVERLAYS.with_borrow_mut(|overlays| {
-        overlays.insert(window_key, OverlayViews { root: overlay, countdown, button });
+        overlays.insert(
+            window_key,
+            OverlayViews { root: overlay, countdown, courtesy_button, weekly_button },
+        );
     });
 }
 
@@ -244,7 +302,7 @@ pub fn remove(window: &NSWindow) {
     }
     let window_key = window as *const NSWindow as usize;
     if let Some(overlay) = OVERLAYS.with_borrow_mut(|overlays| overlays.remove(&window_key)) {
-        unsafe { overlay.root.removeFromSuperview() };
+        overlay.root.removeFromSuperview();
     };
 }
 
@@ -265,6 +323,29 @@ fn format_countdown(secs: u64) -> String {
     }
 }
 
+fn format_weekly_button_title(remaining_seconds: u64, available: bool) -> String {
+    let remaining_hours = remaining_seconds / 3600;
+    if available {
+        format!("Use 1-hour extension ({remaining_hours}h left)")
+    } else if remaining_hours > 0 {
+        format!("1-hour extension unavailable ({remaining_hours}h left)")
+    } else {
+        "No 1-hour extensions left this week".to_string()
+    }
+}
+
+fn format_courtesy_button_title(courtesy_seconds: u64) -> String {
+    let minutes = courtesy_seconds / 60;
+    let seconds = courtesy_seconds % 60;
+    if courtesy_seconds < 60 {
+        format!("Use {courtesy_seconds}s grace (free)")
+    } else if seconds == 0 {
+        format!("Use {minutes}-min grace (free)")
+    } else {
+        format!("Use {minutes}m {seconds}s grace (free)")
+    }
+}
+
 fn make_label(
     mtm: MainThreadMarker,
     text: &str,
@@ -272,8 +353,7 @@ fn make_label(
     bold: bool,
     frame: NSRect,
 ) -> Retained<NSTextField> {
-    let field: Retained<NSTextField> =
-        unsafe { NSTextField::initWithFrame(NSTextField::alloc(mtm), frame) };
+    let field: Retained<NSTextField> = NSTextField::initWithFrame(NSTextField::alloc(mtm), frame);
     unsafe {
         field.setStringValue(&NSString::from_str(text));
         field.setEditable(false);
@@ -282,13 +362,38 @@ fn make_label(
         field.setDrawsBackground(false);
         field.setBordered(false);
         field.setAlignment(NSTextAlignment::Center);
-        let font = if bold {
-            NSFont::boldSystemFontOfSize(size)
-        } else {
-            NSFont::systemFontOfSize(size)
-        };
+        let font =
+            if bold { NSFont::boldSystemFontOfSize(size) } else { NSFont::systemFontOfSize(size) };
         field.setFont(Some(&font));
         let _: () = msg_send![&*field, setTextColor: &*NSColor::whiteColor()];
     }
     field
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_courtesy_button_title, format_weekly_button_title};
+
+    #[test]
+    fn courtesy_button_title_uses_configured_minutes() {
+        assert_eq!(format_courtesy_button_title(15 * 60), "Use 15-min grace (free)");
+    }
+
+    #[test]
+    fn weekly_button_title_names_available_extension() {
+        assert_eq!(format_weekly_button_title(6 * 60 * 60, true), "Use 1-hour extension (6h left)");
+    }
+
+    #[test]
+    fn weekly_button_title_explains_unavailable_extension() {
+        assert_eq!(
+            format_weekly_button_title(2 * 60 * 60, false),
+            "1-hour extension unavailable (2h left)"
+        );
+    }
+
+    #[test]
+    fn weekly_button_title_explains_spent_allowance() {
+        assert_eq!(format_weekly_button_title(0, false), "No 1-hour extensions left this week");
+    }
 }

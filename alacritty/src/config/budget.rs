@@ -15,7 +15,11 @@
 //! sleep_end_hour = 8            # 08:00 local — unlock + daily reset
 //! timezone = "America/Chicago"
 //! hide_when_inactive = true     # Cmd-Tab away → all windows hide
-//! allow_courtesy = true         # one 5-minute courtesy per day
+//! allow_courtesy = true         # one courtesy extension per day
+//! courtesy_seconds = 900        # 15 minutes
+//! allow_weekly_extensions = true
+//! weekly_extension_seconds = 3600
+//! weekly_extension_allowance_seconds = 21600
 //! ```
 
 use serde::Serialize;
@@ -63,11 +67,31 @@ pub struct BudgetConfig {
     /// Ignored when `hide_when_inactive` is false.
     pub background_grace_seconds: u64,
 
-    /// When true, allow one 5-minute courtesy extension per day.
+    /// When true, allow one courtesy extension per day.
     ///
     /// Defaults to true, but it is one-shot per day and still unavailable
     /// during the sleep window.
     pub allow_courtesy: bool,
+
+    /// Size of the once-per-day courtesy extension, in seconds.
+    ///
+    /// Default `900` = 15 minutes. Set to `0` to make `allow_courtesy`
+    /// inert without removing the key.
+    pub courtesy_seconds: u64,
+
+    /// When true, allow redeeming weekly extension time after the daily
+    /// budget is exhausted.
+    pub allow_weekly_extensions: bool,
+
+    /// Size of each weekly extension redemption, in seconds.
+    ///
+    /// Default `3600` = one hour.
+    pub weekly_extension_seconds: u64,
+
+    /// Total weekly extension allowance, in seconds.
+    ///
+    /// Default `21600` = six hours.
+    pub weekly_extension_allowance_seconds: u64,
 }
 
 impl Default for BudgetConfig {
@@ -81,6 +105,10 @@ impl Default for BudgetConfig {
             hide_when_inactive: true,
             background_grace_seconds: 300,
             allow_courtesy: true,
+            courtesy_seconds: 15 * 60,
+            allow_weekly_extensions: true,
+            weekly_extension_seconds: 60 * 60,
+            weekly_extension_allowance_seconds: 6 * 60 * 60,
         }
     }
 }

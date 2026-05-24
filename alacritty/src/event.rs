@@ -102,6 +102,11 @@ pub struct Processor {
     /// Window currently hosting the periodic session-save timer (macOS).
     #[cfg(target_os = "macos")]
     session_save_host: Option<WindowId>,
+    /// Number of restored windows still waiting to be replayed. While this
+    /// is non-zero, session writes are suppressed so a partial restore cannot
+    /// overwrite the complete saved session.
+    #[cfg(target_os = "macos")]
+    session_restore_pending: usize,
     /// Daily usage budget — enforces the 3-hour cap and 02:00–08:00 sleep
     /// window. Ticked once per second while any window is focused; persisted
     /// to `~/Library/Application Support/org.alacritty/usage.json`.
@@ -200,7 +205,7 @@ impl Processor {
         let budget = crate::budget::Budget::load_or_default(&config.budget);
 
         // Register the event-loop proxy with the lockout overlay so its
-        // courtesy button can dispatch GrantCourtesy back into the loop.
+        // lockout overlay buttons can dispatch budget events back into the loop.
         #[cfg(target_os = "macos")]
         crate::display::lockout_overlay::register_event_proxy(proxy.clone());
 
@@ -219,6 +224,8 @@ impl Processor {
             config_monitor,
             #[cfg(target_os = "macos")]
             session_save_host: None,
+            #[cfg(target_os = "macos")]
+            session_restore_pending: 0,
             #[cfg(target_os = "macos")]
             budget,
             #[cfg(target_os = "macos")]
@@ -249,16 +256,50 @@ impl Processor {
         #[cfg(not(target_os = "macos"))]
         let restore: Option<crate::session::Session> = None;
 
-        let (first_options, rest) = match restore {
+        #[cfg(target_os = "macos")]
+        let restore_tabbing_id = restore
+            .as_ref()
+            .filter(|session| session.windows.len() > 1)
+            .map(|_| fresh_restore_tabbing_id());
+        #[cfg(not(target_os = "macos"))]
+        let restore_tabbing_id: Option<String> = None;
+
+        let (first_options, rest, restored_initial) = match restore {
             Some(session) if !session.windows.is_empty() => {
                 let mut iter = session.windows.into_iter();
                 let first = iter.next().unwrap();
                 let mut first_options = window_options.clone();
-                apply_session_overrides(&mut first_options, &first);
-                (first_options, iter.collect::<Vec<_>>())
+                apply_session_overrides(
+                    &mut first_options,
+                    &first,
+                    restore_tabbing_id.as_deref(),
+                    &self.config.ai_resume,
+                );
+                (first_options, iter.collect::<Vec<_>>(), true)
             },
-            _ => (window_options, Vec::new()),
+            _ => (window_options, Vec::new(), false),
         };
+
+        #[cfg(target_os = "macos")]
+        {
+            let restored_resume_count = first_options.restored_resume_command.is_some() as usize
+                + rest
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .resume_command
+                            .as_deref()
+                            .and_then(|cmd| {
+                                crate::cli_resume::normalize_saved_resume_command(
+                                    cmd,
+                                    &self.config.ai_resume,
+                                )
+                            })
+                            .is_some()
+                    })
+                    .count();
+            self.session_restore_pending = rest.len() + restored_resume_count;
+        }
 
         #[cfg(target_os = "macos")]
         let first_resume_command = first_options.restored_resume_command.clone();
@@ -277,11 +318,7 @@ impl Processor {
             self.start_session_save_polling(window_context.id());
             self.start_budget_tick_polling(window_context.id());
             if let Some(cmd) = first_resume_command {
-                Self::schedule_resume_command(
-                    &mut self.scheduler,
-                    window_context.id(),
-                    cmd,
-                );
+                Self::schedule_resume_command(&mut self.scheduler, window_context.id(), cmd);
             }
         }
         self.windows.insert(window_context.id(), window_context);
@@ -292,14 +329,19 @@ impl Processor {
         // routing through the event loop handles that ordering.
         for entry in rest {
             let mut opts = WindowOptions::default();
-            apply_session_overrides(&mut opts, &entry);
-            let _ = self
-                .proxy
-                .send_event(Event::new(EventType::CreateWindow(opts), None));
+            apply_session_overrides(
+                &mut opts,
+                &entry,
+                restore_tabbing_id.as_deref(),
+                &self.config.ai_resume,
+            );
+            let _ = self.proxy.send_event(Event::new(EventType::CreateWindow(opts), None));
         }
 
         #[cfg(target_os = "macos")]
-        self.save_session();
+        if !restored_initial {
+            self.save_session();
+        }
 
         Ok(())
     }
@@ -319,19 +361,31 @@ impl Processor {
     /// directory. Called whenever the window set or window state changes.
     #[cfg(target_os = "macos")]
     fn save_session(&self) {
+        if self.session_restore_pending > 0 {
+            return;
+        }
         // Reset the per-tick codex-UUID claim set so each window's
         // session_snapshot resolves codex's per-PID rollout against a
         // fresh slate. This is what stops two codex tabs whose PIDs
         // started in the same second from both grabbing the same
         // "earliest" rollout.
         crate::cli_resume::begin_save_tick();
-        let windows: Vec<_> = self
-            .windows
-            .values()
-            .filter_map(|wc| wc.session_snapshot())
-            .collect();
+        let windows: Vec<_> =
+            self.windows.values().filter_map(|wc| wc.session_snapshot()).collect();
         let session = crate::session::Session { version: 1, windows };
         session.save();
+    }
+
+    /// Mark one restore replay unit complete.
+    ///
+    /// `session_restore_pending` intentionally tracks both deferred window
+    /// creation and deferred resume-command injection. Without this, the
+    /// final restored window could save a shell-only snapshot before
+    /// `codex resume ...` is injected, overwriting the good persisted chat
+    /// commands with blank tabs.
+    #[cfg(target_os = "macos")]
+    fn finish_restore_step(&mut self) {
+        self.session_restore_pending = self.session_restore_pending.saturating_sub(1);
     }
 
     /// Schedule the periodic session-save tick. Hosted on a specific window
@@ -344,8 +398,7 @@ impl Processor {
             return;
         }
         let event = Event::new(EventType::SessionSaveTick, window_id);
-        self.scheduler
-            .schedule(event, std::time::Duration::from_secs(3), true, timer_id);
+        self.scheduler.schedule(event, std::time::Duration::from_secs(3), true, timer_id);
         self.session_save_host = Some(window_id);
     }
 
@@ -371,8 +424,7 @@ impl Processor {
             return;
         }
         let event = Event::new(EventType::BudgetTick, window_id);
-        self.scheduler
-            .schedule(event, std::time::Duration::from_secs(1), true, timer_id);
+        self.scheduler.schedule(event, std::time::Duration::from_secs(1), true, timer_id);
         self.budget_tick_host = Some(window_id);
     }
 
@@ -389,11 +441,7 @@ impl Processor {
     /// would land in the shell's pre-prompt input buffer and may be ignored
     /// or mis-rendered.
     #[cfg(target_os = "macos")]
-    fn schedule_resume_command(
-        scheduler: &mut Scheduler,
-        window_id: WindowId,
-        command: String,
-    ) {
+    fn schedule_resume_command(scheduler: &mut Scheduler, window_id: WindowId, command: String) {
         let timer_id = TimerId::new(Topic::ResumeCommand, window_id);
         if scheduler.scheduled(timer_id) {
             return;
@@ -422,6 +470,8 @@ impl Processor {
 
         #[cfg(target_os = "macos")]
         let resume_command = options.restored_resume_command.clone();
+        #[cfg(target_os = "macos")]
+        let restored_from_session = options.restored_from_session;
 
         let window_context = WindowContext::additional(
             gl_config,
@@ -449,7 +499,13 @@ impl Processor {
         }
         self.windows.insert(window_context.id(), window_context);
         #[cfg(target_os = "macos")]
-        self.save_session();
+        {
+            if restored_from_session {
+                self.finish_restore_step();
+            } else {
+                self.save_session();
+            }
+        }
         Ok(())
     }
 
@@ -633,7 +689,7 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::SessionSaveTick, _) => {
                 self.save_session();
             },
-            // Grant the once-per-day 5-minute courtesy extension on the
+            // Grant the once-per-day courtesy extension on the
             // budget. Dispatched from the input layer via the
             // Cmd+Shift+Ctrl+E keybinding; we route it through the event
             // loop because the input handler doesn't have access to the
@@ -648,6 +704,13 @@ impl ApplicationHandler<Event> for Processor {
                     let reason = self.budget.block_status(&self.config.budget);
                     let unlock = self.budget.seconds_until_unlock(&self.config.budget);
                     let still_blocked = reason.is_some();
+                    let weekly_extension_available =
+                        self.budget.weekly_extension_available(&self.config.budget)
+                            && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_remaining_seconds =
+                        self.budget.weekly_extension_remaining_seconds(&self.config.budget);
+                    let weekly_extension_visible =
+                        matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     for wc in self.windows.values_mut() {
                         wc.display.budget_blocked = still_blocked;
                         wc.display.budget_unlock_seconds = unlock;
@@ -655,7 +718,53 @@ impl ApplicationHandler<Event> for Processor {
                         if still_blocked {
                             // Sleep window still active — re-render overlay
                             // with courtesy_available=false (it's spent).
-                            wc.display.window.show_lockout_overlay(unlock, false);
+                            wc.display.window.show_lockout_overlay(
+                                unlock,
+                                false,
+                                self.config.budget.courtesy_seconds,
+                                weekly_extension_visible,
+                                weekly_extension_available,
+                                weekly_extension_remaining_seconds,
+                            );
+                        } else {
+                            wc.display.window.hide_lockout_overlay();
+                        }
+                    }
+                }
+            },
+            // Grant one weekly one-hour extension. Dispatched from the
+            // lockout overlay button or Cmd+Shift+Ctrl+W.
+            #[cfg(target_os = "macos")]
+            (EventType::GrantWeeklyExtension, _) => {
+                if self.budget.grant_weekly_extension(&self.config.budget).is_ok() {
+                    self.budget.save();
+                    let reason = self.budget.block_status(&self.config.budget);
+                    let unlock = self.budget.seconds_until_unlock(&self.config.budget);
+                    let still_blocked = reason.is_some();
+                    let courtesy_available = self.config.budget.allow_courtesy
+                        && self.config.budget.courtesy_seconds > 0
+                        && !self.budget.courtesy_used
+                        && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_available =
+                        self.budget.weekly_extension_available(&self.config.budget)
+                            && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_remaining_seconds =
+                        self.budget.weekly_extension_remaining_seconds(&self.config.budget);
+                    let weekly_extension_visible =
+                        matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    for wc in self.windows.values_mut() {
+                        wc.display.budget_blocked = still_blocked;
+                        wc.display.budget_unlock_seconds = unlock;
+                        wc.display.apply_tab_title();
+                        if still_blocked {
+                            wc.display.window.show_lockout_overlay(
+                                unlock,
+                                courtesy_available,
+                                self.config.budget.courtesy_seconds,
+                                weekly_extension_visible,
+                                weekly_extension_available,
+                                weekly_extension_remaining_seconds,
+                            );
                         } else {
                             wc.display.window.hide_lockout_overlay();
                         }
@@ -669,8 +778,22 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::BudgetTick, _) => {
                 let cfg = self.config.budget.clone();
                 if !cfg.enabled {
-                    // Master switch off: leave state untouched.
+                    // Master switch off: clear any active lockout state.
+                    for wc in self.windows.values_mut() {
+                        let was_blocked = wc.display.budget_blocked;
+                        wc.display.budget_blocked = false;
+                        wc.display.budget_unlock_seconds = 0;
+                        if was_blocked {
+                            wc.display.apply_tab_title();
+                            wc.display.window.hide_lockout_overlay();
+                        }
+                    }
                 } else {
+                    let persisted = crate::budget::Budget::load_or_default(&cfg);
+                    if persisted.updated_at > self.budget.updated_at {
+                        self.budget = persisted;
+                    }
+
                     let any_focused = self.any_window_focused();
                     let now = std::time::Instant::now();
                     // State machine — Active ↔ InGrace ↔ Hidden.
@@ -708,8 +831,15 @@ impl ApplicationHandler<Event> for Processor {
                     let unlock = self.budget.seconds_until_unlock(&cfg);
                     let blocked = reason.is_some();
                     let courtesy_available = cfg.allow_courtesy
+                        && cfg.courtesy_seconds > 0
                         && !self.budget.courtesy_used
                         && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_available = self.budget.weekly_extension_available(&cfg)
+                        && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_remaining_seconds =
+                        self.budget.weekly_extension_remaining_seconds(&cfg);
+                    let weekly_extension_visible =
+                        matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     for wc in self.windows.values_mut() {
                         let was_blocked = wc.display.budget_blocked;
                         wc.display.budget_blocked = blocked;
@@ -723,7 +853,14 @@ impl ApplicationHandler<Event> for Processor {
                         // Drive the NSView lockout overlay — install or
                         // refresh while blocked, remove when block lifts.
                         if blocked {
-                            wc.display.window.show_lockout_overlay(unlock, courtesy_available);
+                            wc.display.window.show_lockout_overlay(
+                                unlock,
+                                courtesy_available,
+                                cfg.courtesy_seconds,
+                                weekly_extension_visible,
+                                weekly_extension_available,
+                                weekly_extension_remaining_seconds,
+                            );
                         } else if was_blocked {
                             wc.display.window.hide_lockout_overlay();
                         }
@@ -740,6 +877,7 @@ impl ApplicationHandler<Event> for Processor {
                     bytes.push(b'\n');
                     window_context.send_pty_bytes(bytes);
                 }
+                self.finish_restore_step();
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
@@ -924,7 +1062,16 @@ impl ApplicationHandler<Event> for Processor {
 
 /// Override a [`WindowOptions`] with values from a persisted session entry.
 #[cfg(target_os = "macos")]
-fn apply_session_overrides(opts: &mut WindowOptions, entry: &crate::session::WindowState) {
+fn apply_session_overrides(
+    opts: &mut WindowOptions,
+    entry: &crate::session::WindowState,
+    tabbing_id: Option<&str>,
+    ai_resume: &crate::config::ai_resume::AiResumeConfig,
+) {
+    opts.restored_from_session = true;
+    if let Some(tabbing_id) = tabbing_id {
+        opts.window_tabbing_id = Some(tabbing_id.to_string());
+    }
     if entry.working_directory.is_dir() {
         opts.terminal_options.working_directory = Some(entry.working_directory.clone());
     }
@@ -939,9 +1086,23 @@ fn apply_session_overrides(opts: &mut WindowOptions, entry: &crate::session::Win
     if let Some(position) = entry.position {
         opts.restored_position = Some(position);
     }
-    if let Some(cmd) = entry.resume_command.as_ref().filter(|c| !c.is_empty()) {
+    if let Some(cmd) = entry
+        .resume_command
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .and_then(|c| crate::cli_resume::normalize_saved_resume_command(c, ai_resume))
+    {
         opts.restored_resume_command = Some(cmd.clone());
     }
+}
+
+#[cfg(target_os = "macos")]
+fn fresh_restore_tabbing_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("alacritty-restore-{}-{nanos}", std::process::id())
 }
 
 /// Alacritty events.
@@ -1001,11 +1162,16 @@ pub enum EventType {
     /// 02:00–08:00 sleep window opens.
     #[cfg(target_os = "macos")]
     BudgetTick,
-    /// User-initiated request to spend the daily 5-minute courtesy
+    /// User-initiated request to spend the daily courtesy
     /// extension. Dispatched from `Action::GrantCourtesy` (default
     /// keybinding Cmd+Shift+Ctrl+E).
     #[cfg(target_os = "macos")]
     GrantCourtesy,
+    /// User-initiated request to spend one weekly one-hour extension.
+    /// Dispatched from `Action::GrantWeeklyExtension` (default keybinding
+    /// Cmd+Shift+Ctrl+W).
+    #[cfg(target_os = "macos")]
+    GrantWeeklyExtension,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -1800,6 +1966,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[cfg(target_os = "macos")]
     fn dispatch_grant_courtesy(&mut self) {
         let _ = self.event_proxy.send_event(Event::new(EventType::GrantCourtesy, None));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dispatch_grant_weekly_extension(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::GrantWeeklyExtension, None));
     }
 
     #[cfg(target_os = "macos")]
@@ -2686,7 +2857,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::SessionSaveTick
                 | EventType::ResumeCommand(_)
                 | EventType::BudgetTick
-                | EventType::GrantCourtesy => (),
+                | EventType::GrantCourtesy
+                | EventType::GrantWeeklyExtension => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -2875,7 +3047,6 @@ impl EventListener for EventProxy {
     }
 }
 
-
 /// Hide the entire alacritty application (Cmd-H equivalent). All windows
 /// disappear from the screen; in-PTY processes keep running. Cmd-Tab back
 /// or click the Dock icon to unhide.
@@ -2892,7 +3063,7 @@ fn hide_app() {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{next_focus_state, AppFocusState};
+    use super::{AppFocusState, next_focus_state};
 
     // Helper: an Instant some seconds in the past.
     fn past(secs: u64) -> Instant {
@@ -2903,7 +3074,8 @@ mod tests {
 
     #[test]
     fn active_stays_active_when_focused() {
-        let (next, expiry) = next_focus_state(AppFocusState::Active, true, Instant::now(), true, 30);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::Active, true, Instant::now(), true, 30);
         assert!(matches!(next, AppFocusState::Active));
         assert!(!expiry);
     }
@@ -2921,7 +3093,8 @@ mod tests {
     #[test]
     fn ingrace_to_active_on_focus_regain() {
         let since = past(5);
-        let (next, expiry) = next_focus_state(AppFocusState::InGrace(since), true, Instant::now(), true, 30);
+        let (next, expiry) =
+            next_focus_state(AppFocusState::InGrace(since), true, Instant::now(), true, 30);
         assert!(matches!(next, AppFocusState::Active));
         assert!(!expiry);
     }

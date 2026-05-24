@@ -95,7 +95,7 @@ things like code refactorings or documentation/tests) additionally need to be do
 `alacritty_terminal/CHANGELOG.md` as well. The existing entries should be used as a style guideline.
 The change log should be used to document changes from a user-perspective, instead of explaining the
 technical background (like commit messages) More information about Alacritty's change log format can
-be found [here](https://keepachangelog.com).
+be found in the [Keep a Changelog guide](https://keepachangelog.com).
 
 ### Style
 
@@ -105,12 +105,12 @@ rustfmt` and then format all code using `cargo fmt`.
 
 Unless otherwise specified, Alacritty follows the Rust compiler's style guidelines:
 
-https://rust-lang.github.io/api-guidelines
+<https://rust-lang.github.io/api-guidelines>
 
 All comments should be fully punctuated with a trailing period. This applies both to regular and
 documentation comments.
 
-# Release Process
+## Release Process
 
 Alacritty's release process aims to provide stable and well tested releases without having to hold
 back new features during the testing period.
@@ -157,7 +157,7 @@ release is made, releases are tagged as `alacritty_terminal_vX.Y.Z` and pushed t
 a release, only the patch version is bumped on master, since there haven't been any changes since
 the last release yet.
 
-# Contact
+## Contact
 
 If there are any outstanding questions about contributing to Alacritty, they can be asked on the
 [Alacritty issue tracker](https://github.com/alacritty/alacritty/issues).

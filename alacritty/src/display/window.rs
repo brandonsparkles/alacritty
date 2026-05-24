@@ -561,7 +561,15 @@ impl Window {
     /// Install or refresh the lockout overlay on this window's content view.
     /// Idempotent — calling on every budget tick is the intended pattern.
     #[cfg(target_os = "macos")]
-    pub fn show_lockout_overlay(&self, unlock_seconds: u64, courtesy_available: bool) {
+    pub fn show_lockout_overlay(
+        &self,
+        unlock_seconds: u64,
+        courtesy_available: bool,
+        courtesy_seconds: u64,
+        weekly_extension_visible: bool,
+        weekly_extension_available: bool,
+        weekly_extension_remaining_seconds: u64,
+    ) {
         let ns_view = match self.raw_window_handle() {
             RawWindowHandle::AppKit(handle) => {
                 assert!(MainThreadMarker::new().is_some());
@@ -574,6 +582,10 @@ impl Window {
             &ns_window,
             unlock_seconds,
             courtesy_available,
+            courtesy_seconds,
+            weekly_extension_visible,
+            weekly_extension_available,
+            weekly_extension_remaining_seconds,
         );
     }
 

@@ -346,11 +346,7 @@ impl DisplayUpdate {
 fn format_unlock_countdown(secs: u64) -> String {
     let hours = secs / 3600;
     let minutes = (secs % 3600) / 60;
-    if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{minutes}m")
-    }
+    if hours > 0 { format!("{hours}h {minutes}m") } else { format!("{minutes}m") }
 }
 
 /// Current activity status driving the tab label's icon prefix.

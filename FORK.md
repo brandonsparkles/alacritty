@@ -16,14 +16,14 @@ non-macOS code never reaches.
 | **Two-finger swipe between tabs** | Horizontal trackpad pan accumulating ≥ 50 px (within 25° of horizontal) fires `SelectNextTab` / `SelectPreviousTab`. Swipe right → previous, swipe left → next (Apple swipe-between-pages convention). |
 | **Inline tab rename** | `Cmd+Shift+R` opens a live prompt — keystrokes update the NSWindowTab title in place. `Enter` commits, `Esc` cancels, `Ctrl+W` deletes a word, `Ctrl+U` clears, `Backspace` deletes a character. |
 | **Reset tab title** | `Cmd+Shift+Opt+R` clears any user override, reverting to the auto-derived window title. |
-| **Activity indicator** | A `⠿ ` prefix is added to the tab label whenever the shell has any direct child process (vim, codex, claude, copilot, sleep, etc.). Detection: `proc_listpids(PROC_PPID_ONLY, shell_pid)` every 500 ms — works regardless of how the subprocess manages its process group. |
-| **Needs-attention indicator** | A `🔵 ` prefix is added when the terminal bell rings while the tab is unfocused. Cleared on focus. |
+| **Activity indicator** | A `⠿` prefix is added to the tab label whenever the shell has any direct child process (vim, codex, claude, copilot, sleep, etc.). Detection: `proc_listpids(PROC_PPID_ONLY, shell_pid)` every 500 ms — works regardless of how the subprocess manages its process group. |
+| **Needs-attention indicator** | A `🔵` prefix is added when the terminal bell rings while the tab is unfocused. Cleared on focus. |
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
 | **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
-| **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
-| **Per-tab AI session resume** | After session restoration, claude / copilot / codex tabs reopen at *their specific* prior conversation (not just the most-recent). Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, and codex's `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` (matched by `pbi_start_tvsec` + cwd, with per-save-tick claim set so sibling codex tabs don't collide). |
+| **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Restored windows share a fresh launch-local tabbing ID so they reopen as tabs in one window without replaying stale AppKit IDs. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
+| **Per-tab AI session resume** | After session restoration, claude / copilot / codex tabs reopen at *their specific* prior conversation (not just the most-recent) and carry permissive CLI flags from `[ai_resume]` in `alacritty.toml`. Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, codex argv `resume <uuid>`, and codex's `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` (matched by `pbi_start_tvsec` + cwd, with per-save-tick claim set so sibling codex tabs don't collide). Saved commands are normalized on load against current TOML flags, and `codex resume --last` is not persisted or replayed for restored tabs because it collapses multiple tabs into one conversation. |
 | **Cmd+A select all** | Selects the entire terminal contents (scrollback + visible area). Standard macOS shortcut, missing from upstream. |
-| **Budget enforcement** | Daily 3-hour focused-time cap + 02:00–08:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown until the next 08:00 Central reset. One 5-minute courtesy extension per day is enabled by default. See [Budget enforcement](#budget-enforcement) below. |
+| **Budget enforcement** | Daily focused-time cap + 02:00–08:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown until the next 08:00 Central reset. One TOML-configured courtesy extension per day is enabled by default. See [Budget enforcement](#budget-enforcement) below. |
 | **Window-title activity prefix** | The `⠿` / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
 
 ## Keybindings reference
@@ -43,7 +43,7 @@ macOS `platform_key_bindings()` function and can be overridden in your
 | `Backspace` (in rename mode) | `TabRename::DeleteChar` |
 | `Ctrl+C` (in rename mode) | `TabRename::Cancel` |
 | `Cmd+A` | `SelectAll` (terminal contents — scrollback + visible) |
-| `Cmd+Shift+Ctrl+E` | `GrantCourtesy` (spend the once-per-day 5-min budget extension) |
+| `Cmd+Shift+Ctrl+E` | `GrantCourtesy` (spend the once-per-day courtesy budget extension) |
 
 To rebind, e.g., the inline rename to `Cmd+R` instead:
 
@@ -74,6 +74,28 @@ action = "ClearInputLine"
 - `mouse.bindings` for `WheelUp` / `WheelDown` (new in upstream 0.17.0)
   can be used alongside the gesture detection if you want per-tick
   wheel-to-tab in addition to the gesture.
+
+## AI Resume Flags
+
+Resume command flags are configured in `alacritty.toml`, not hardcoded in
+the restore logic:
+
+```toml
+[ai_resume.claude]
+flags = ["--dangerously-skip-permissions"]
+
+[ai_resume.codex]
+flags = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[ai_resume.copilot]
+flags = ["--yolo"]
+```
+
+The Rust code owns session detection and command shape (`claude --resume`,
+`codex resume`, `copilot --resume=`); this section owns local permission
+policy. Saved session commands are normalized through the current config
+before replay, so changing TOML applies to old saved sessions on the next
+launch.
 
 ## Troubleshooting
 
@@ -138,7 +160,7 @@ around terminal-based AI tools.
 | Hide-when-inactive | After `background_grace_seconds` (default 300 s) of no focus | Calls `NSApp.hide()`. Counter stops while hidden. Counter resumes on next focus. |
 | Cap exhaustion | `active_seconds >= cap_seconds` (default 10 800 = 3 h) | Block engages: input filtered, lockout overlay rendered. |
 | Sleep window | Wall-clock time between `sleep_start_hour` (default 02:00) and `sleep_end_hour` (default 08:00) Chicago | Block engages regardless of remaining cap. |
-| Courtesy extension | User clicks the overlay button or presses `Cmd+Shift+Ctrl+E` | One-shot per day: adds 300 s to `cap_seconds`, lifts the budget-exhausted block. Enabled by default; can be disabled with `allow_courtesy = false`. |
+| Courtesy extension | User clicks the overlay button or presses `Cmd+Shift+Ctrl+E` | One-shot per day: adds `courtesy_seconds` to the budget window, lifts the budget-exhausted block. Enabled by default; can be disabled with `allow_courtesy = false`. |
 | Day boundary | Wall-clock crosses `sleep_end_hour` Chicago | `active_seconds = 0`, `courtesy_used = false`. New day. |
 
 The overlay is a fullscreen opaque `NSView` over the GL surface — terminal
@@ -161,7 +183,8 @@ sleep_end_hour = 8              # 08:00 Chicago; daily reset
 timezone = "America/Chicago"    # any IANA name; falls back to Chicago on parse error
 hide_when_inactive = true
 background_grace_seconds = 300  # 5 min grace before hide
-allow_courtesy = true            # one 5-min courtesy per day
+allow_courtesy = true            # one courtesy per day
+courtesy_seconds = 900           # 15 min courtesy duration
 ```
 
 All fields have sensible defaults; the section is optional. Set

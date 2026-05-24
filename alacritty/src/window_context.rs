@@ -531,20 +531,17 @@ impl WindowContext {
     /// Build a snapshot of this window for session persistence (macOS).
     #[cfg(target_os = "macos")]
     pub fn session_snapshot(&self) -> Option<crate::session::WindowState> {
-        let working_directory =
-            crate::macos::proc::cwd(self.shell_pid as i32).ok()?;
+        let working_directory = crate::macos::proc::cwd(self.shell_pid as i32).ok()?;
         let tab_title = self.display.tab_user_title.clone();
         let tabbing_id = String::new();
         let inner = self.display.window.inner_size();
         let size = Some((inner.width, inner.height));
-        let position = self
-            .display
-            .window
-            .outer_position()
-            .ok()
-            .map(|p| (p.x, p.y));
-        let resume_command =
-            crate::cli_resume::resume_command_for(self.shell_pid as i32, &working_directory);
+        let position = self.display.window.outer_position().ok().map(|p| (p.x, p.y));
+        let resume_command = crate::cli_resume::resume_command_for(
+            self.shell_pid as i32,
+            &working_directory,
+            &self.config.ai_resume,
+        );
         Some(crate::session::WindowState {
             working_directory,
             tab_title,

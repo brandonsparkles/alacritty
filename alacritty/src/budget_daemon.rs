@@ -9,6 +9,10 @@
 //!   POST /courtesy  → 200 OK with updated state on success,
 //!                      409 if courtesy has already been spent,
 //!                      403 if courtesy is disabled or during the sleep window.
+//!   POST /weekly-extension
+//!                   → 200 OK with updated state on success,
+//!                      409 if active/already spent for the week,
+//!                      403 if disabled or during the sleep window.
 //!
 //! Both responses include CORS headers permitting the aisparkles origin
 //! AND any localhost origin (for the Tauri shell + curl).
@@ -31,7 +35,7 @@ use std::time::Duration;
 use log::debug;
 use serde::Serialize;
 
-use crate::budget::{BlockReason, Budget};
+use crate::budget::{BlockReason, Budget, WeeklyExtensionError};
 use crate::config::budget::BudgetConfig;
 
 /// Default port — chosen to be high, unlikely to collide, easy to recall.
@@ -54,6 +58,18 @@ struct UsagePayload {
     /// Unix-seconds timestamp when the courtesy extension expires.
     /// `None` when no extension is active.
     courtesy_expires_at: Option<u64>,
+    /// Size of the daily courtesy extension.
+    courtesy_seconds: u64,
+    /// ISO week key for the weekly extension allowance.
+    weekly_extension_week: String,
+    /// Weekly extension seconds already redeemed in the current week.
+    weekly_extension_used_seconds: u64,
+    /// Weekly extension seconds still redeemable in the current week.
+    weekly_extension_remaining_seconds: u64,
+    /// Size of the next weekly extension redemption.
+    weekly_extension_seconds: u64,
+    /// Unix-seconds timestamp when the active weekly extension expires.
+    weekly_extension_expires_at: Option<u64>,
     /// Last persistence timestamp.
     updated_at: u64,
     /// `true` when input is currently blocked. Mirrors the lockout
@@ -139,8 +155,7 @@ fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
             let was_used = budget.courtesy_used;
             if budget.grant_courtesy(cfg) {
                 budget.save();
-                let body =
-                    serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
+                let body = serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
                 write_response(&mut stream, 200, "OK", "application/json", &body)?;
             } else if !cfg.allow_courtesy {
                 let body = r#"{"error":"courtesy_disabled"}"#;
@@ -151,6 +166,33 @@ fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
             } else {
                 let body = r#"{"error":"sleep_window"}"#;
                 write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+            }
+        },
+        ("POST", "/weekly-extension") => {
+            let mut budget = Budget::load_or_default(cfg);
+            match budget.grant_weekly_extension(cfg) {
+                Ok(()) => {
+                    budget.save();
+                    let body =
+                        serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
+                    write_response(&mut stream, 200, "OK", "application/json", &body)?;
+                },
+                Err(WeeklyExtensionError::Disabled) => {
+                    let body = r#"{"error":"weekly_extension_disabled"}"#;
+                    write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+                },
+                Err(WeeklyExtensionError::SleepWindow) => {
+                    let body = r#"{"error":"sleep_window"}"#;
+                    write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+                },
+                Err(WeeklyExtensionError::AlreadyActive) => {
+                    let body = r#"{"error":"weekly_extension_active"}"#;
+                    write_response(&mut stream, 409, "Conflict", "application/json", body)?;
+                },
+                Err(WeeklyExtensionError::AllowanceSpent) => {
+                    let body = r#"{"error":"weekly_extension_spent"}"#;
+                    write_response(&mut stream, 409, "Conflict", "application/json", body)?;
+                },
             }
         },
         _ => {
@@ -171,6 +213,12 @@ fn snapshot(cfg: &BudgetConfig) -> UsagePayload {
         cap_seconds: cfg.cap_seconds,
         courtesy_used: budget.courtesy_used,
         courtesy_expires_at: budget.courtesy_expires_at,
+        courtesy_seconds: cfg.courtesy_seconds,
+        weekly_extension_week: budget.weekly_extension_week.clone(),
+        weekly_extension_used_seconds: budget.weekly_extension_used_seconds,
+        weekly_extension_remaining_seconds: budget.weekly_extension_remaining_seconds(cfg),
+        weekly_extension_seconds: cfg.weekly_extension_seconds,
+        weekly_extension_expires_at: budget.weekly_extension_expires_at,
         updated_at: budget.updated_at,
         blocked,
         reason,
@@ -225,6 +273,7 @@ fn route_static(method: &str, path: &str) -> (u16, &'static str) {
         ("OPTIONS", _) => (204, "No Content"),
         ("GET", "/usage") => (200, "OK"),
         ("POST", "/courtesy") => (200, "OK"),
+        ("POST", "/weekly-extension") => (200, "OK"),
         _ => (404, "Not Found"),
     }
 }
@@ -262,10 +311,7 @@ mod tests {
     fn response_content_type_included_when_nonempty() {
         let raw = build_response_bytes(200, "OK", "application/json", "{}");
         let text = String::from_utf8(raw).unwrap();
-        assert!(
-            text.contains("Content-Type: application/json\r\n"),
-            "Content-Type header missing"
-        );
+        assert!(text.contains("Content-Type: application/json\r\n"), "Content-Type header missing");
     }
 
     #[test]
@@ -309,6 +355,7 @@ mod tests {
         assert_eq!(route_static("OPTIONS", "/").0, 204);
         assert_eq!(route_static("OPTIONS", "/usage").0, 204);
         assert_eq!(route_static("OPTIONS", "/courtesy").0, 204);
+        assert_eq!(route_static("OPTIONS", "/weekly-extension").0, 204);
         assert_eq!(route_static("OPTIONS", "/anything").0, 204);
     }
 
@@ -323,11 +370,17 @@ mod tests {
     }
 
     #[test]
+    fn post_weekly_extension_returns_200_on_route() {
+        assert_eq!(route_static("POST", "/weekly-extension"), (200, "OK"));
+    }
+
+    #[test]
     fn unknown_routes_return_404() {
         assert_eq!(route_static("GET", "/").0, 404);
         assert_eq!(route_static("GET", "/unknown").0, 404);
         assert_eq!(route_static("DELETE", "/usage").0, 404);
         assert_eq!(route_static("PUT", "/courtesy").0, 404);
+        assert_eq!(route_static("PUT", "/weekly-extension").0, 404);
     }
 
     // ── UsagePayload JSON-shape contract ─────────────────────────────────
@@ -342,6 +395,12 @@ mod tests {
             cap_seconds: 10800,
             courtesy_used: false,
             courtesy_expires_at: None,
+            courtesy_seconds: 900,
+            weekly_extension_week: "2026-W21".to_string(),
+            weekly_extension_used_seconds: 0,
+            weekly_extension_remaining_seconds: 21600,
+            weekly_extension_seconds: 3600,
+            weekly_extension_expires_at: None,
             updated_at: 1_000_000,
             blocked: false,
             reason: None,
@@ -355,6 +414,12 @@ mod tests {
             "active_seconds",
             "cap_seconds",
             "courtesy_used",
+            "courtesy_seconds",
+            "weekly_extension_week",
+            "weekly_extension_used_seconds",
+            "weekly_extension_remaining_seconds",
+            "weekly_extension_seconds",
+            "weekly_extension_expires_at",
             "updated_at",
             "blocked",
             "seconds_until_unlock",
@@ -372,16 +437,25 @@ mod tests {
             cap_seconds: 10800,
             courtesy_used: false,
             courtesy_expires_at: None,
+            courtesy_seconds: 900,
+            weekly_extension_week: "2026-W21".to_string(),
+            weekly_extension_used_seconds: 0,
+            weekly_extension_remaining_seconds: 21600,
+            weekly_extension_seconds: 3600,
+            weekly_extension_expires_at: None,
             updated_at: 0,
             blocked: false,
             reason: None,
             seconds_until_unlock: 0,
             timezone: "America/Chicago".to_string(),
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
         // When None, the field must serialize as JSON null (not omitted).
-        assert!(v.as_object().unwrap().contains_key("courtesy_expires_at"),
-            "courtesy_expires_at key missing from JSON");
+        assert!(
+            v.as_object().unwrap().contains_key("courtesy_expires_at"),
+            "courtesy_expires_at key missing from JSON"
+        );
         assert!(v["courtesy_expires_at"].is_null(), "expected null when None");
     }
 
@@ -393,13 +467,21 @@ mod tests {
             cap_seconds: 10800,
             courtesy_used: true,
             courtesy_expires_at: Some(9_999_999),
+            courtesy_seconds: 900,
+            weekly_extension_week: "2026-W21".to_string(),
+            weekly_extension_used_seconds: 3600,
+            weekly_extension_remaining_seconds: 18000,
+            weekly_extension_seconds: 3600,
+            weekly_extension_expires_at: Some(9_888_888),
             updated_at: 0,
             blocked: false,
             reason: None,
             seconds_until_unlock: 0,
             timezone: "America/Chicago".to_string(),
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
         assert_eq!(v["courtesy_expires_at"], 9_999_999u64);
+        assert_eq!(v["weekly_extension_expires_at"], 9_888_888u64);
     }
 }

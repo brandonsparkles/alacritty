@@ -12,10 +12,10 @@
 //!
 //! | Tool    | Identifier source                                     | Resume command                   |
 //! |---------|-------------------------------------------------------|----------------------------------|
-//! | claude  | `~/.claude/sessions/<pid>.json` → `sessionId`         | `claude --resume <sessionId>`    |
-//! | copilot | `~/.copilot/logs/process-<ts>-<pid>.log` last         | `copilot --resume=<sessionId>`   |
+//! | claude  | `~/.claude/sessions/<pid>.json` → `sessionId`         | `claude <flags> --resume <id>`   |
+//! | copilot | `~/.copilot/logs/process-<ts>-<pid>.log` last         | `copilot <flags> --resume=<id>`  |
 //! |         | "Registering foreground session: <uuid>" entry        |                                  |
-//! | codex   | (no per-PID metadata — see fallback)                  | `codex resume --last`            |
+//! | codex   | argv `resume <uuid>` or rollout metadata              | `codex <flags> resume <id>`      |
 //!
 //! Tools are matched by their resolved binary path (via `proc_pidpath`),
 //! not `pbi_comm`, because `pbi_comm` is truncated to 15 chars and reflects
@@ -24,10 +24,11 @@
 //! ## Codex caveat
 //!
 //! codex stores sessions as `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`
-//! with no PID-keyed marker we can use to map a running codex process back to
-//! its specific session. The `codex resume --last` fallback picks the most
-//! recently recorded session — fine for one-tab-per-user usage, but loses
-//! per-tab fidelity when multiple codex tabs are running.
+//! with no PID-keyed marker we can use to map a fresh running codex process
+//! back to its specific session. If codex was started by our restore command,
+//! argv contains `resume <uuid>` and wins; otherwise we join by process start
+//! time and cwd. We deliberately do not persist `resume --last` because it
+//! makes multiple restored tabs open the same most-recent conversation.
 
 #![cfg(target_os = "macos")]
 
@@ -37,6 +38,8 @@ use std::io::{BufRead, BufReader};
 use std::os::raw::c_int;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+use crate::config::ai_resume::AiResumeConfig;
 
 /// Codex session UUIDs claimed by sibling windows during the current
 /// save-tick. Cleared by `begin_save_tick()` from the event loop before
@@ -63,7 +66,11 @@ pub fn begin_save_tick() {
 /// the user-facing CLI is often a node-wrapper script whose actual binary
 /// sits two or three forks deeper (e.g. zsh → `node /opt/homebrew/bin/copilot`
 /// → `@github/copilot-darwin-arm64/copilot`). First match wins.
-pub fn resume_command_for(shell_pid: c_int, _shell_cwd: &Path) -> Option<String> {
+pub fn resume_command_for(
+    shell_pid: c_int,
+    _shell_cwd: &Path,
+    ai_resume: &AiResumeConfig,
+) -> Option<String> {
     /// Bounded BFS depth — avoids runaway traversal into deep subtrees.
     /// Empirically the shell→wrapper→binary chain is depth 2; we allow a
     /// little slack for future layering.
@@ -92,15 +99,17 @@ pub fn resume_command_for(shell_pid: c_int, _shell_cwd: &Path) -> Option<String>
                 };
                 let _ = depth; // diagnostic-only; kept for future logging
                 if is_claude_binary(path_str) {
-                    if let Some(cmd) = claude_resume(child) {
+                    if let Some(cmd) = claude_resume(child, ai_resume) {
                         return Some(cmd);
                     }
                 } else if is_copilot_binary(path_str) {
-                    if let Some(cmd) = copilot_resume(child) {
+                    if let Some(cmd) = copilot_resume(child, ai_resume) {
                         return Some(cmd);
                     }
                 } else if is_codex_binary(path_str) {
-                    return Some(codex_resume(child, _shell_cwd));
+                    if let Some(cmd) = codex_resume(child, _shell_cwd, ai_resume) {
+                        return Some(cmd);
+                    }
                 }
                 // Not an AI binary at this level — keep traversing in case
                 // it's a node/python wrapper that spawned one.
@@ -115,7 +124,6 @@ pub fn resume_command_for(shell_pid: c_int, _shell_cwd: &Path) -> Option<String>
     None
 }
 
-
 // ---------- claude ----------
 
 fn is_claude_binary(p: &str) -> bool {
@@ -124,7 +132,7 @@ fn is_claude_binary(p: &str) -> bool {
 
 /// claude maintains `~/.claude/sessions/<pid>.json` with `sessionId` while
 /// the process is alive. We read it directly — minimal-parse JSON.
-fn claude_resume(pid: c_int) -> Option<String> {
+fn claude_resume(pid: c_int, ai_resume: &AiResumeConfig) -> Option<String> {
     let mut p = home::home_dir()?;
     p.push(".claude");
     p.push("sessions");
@@ -135,7 +143,11 @@ fn claude_resume(pid: c_int) -> Option<String> {
     if session_id.is_empty() {
         return None;
     }
-    Some(format!("claude --resume {}", session_id))
+    Some(claude_resume_command(session_id, ai_resume))
+}
+
+fn claude_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
+    build_command("claude", &ai_resume.claude.flags, ["--resume", session_id])
 }
 
 // ---------- copilot ----------
@@ -149,7 +161,7 @@ fn is_copilot_binary(p: &str) -> bool {
 /// Copilot writes a per-process log at `~/.copilot/logs/process-<ts>-<pid>.log`
 /// and emits `Registering foreground session: <uuid>` whenever it activates
 /// a session. The LAST such entry is the currently-active session.
-fn copilot_resume(pid: c_int) -> Option<String> {
+fn copilot_resume(pid: c_int, ai_resume: &AiResumeConfig) -> Option<String> {
     let mut logs_dir = home::home_dir()?;
     logs_dir.push(".copilot");
     logs_dir.push("logs");
@@ -179,7 +191,11 @@ fn copilot_resume(pid: c_int) -> Option<String> {
         }
     }
     let uuid = last_uuid?;
-    Some(format!("copilot --resume={}", uuid))
+    Some(copilot_resume_command(&uuid, ai_resume))
+}
+
+fn copilot_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
+    build_command("copilot", &ai_resume.copilot.flags, [format!("--resume={session_id}")])
 }
 
 // ---------- codex ----------
@@ -207,13 +223,115 @@ fn is_codex_binary(p: &str) -> bool {
 ///  4. Score each candidate by `|filename_timestamp - process_start|` and
 ///     pick the smallest delta within a reasonable window.
 ///
-/// Falls back to `codex resume --last` (cwd-scoped most-recent) when no
-/// candidate matches — better than no resume at all.
-fn codex_resume(pid: c_int, cwd: &Path) -> String {
-    if let Some(uuid) = codex_session_for_pid(pid, cwd) {
-        return format!("codex resume {}", uuid);
+/// Returns `None` when no exact session can be recovered. Replaying
+/// `codex resume --last` is intentionally avoided because it makes multiple
+/// restored tabs collapse into the same newest conversation.
+fn codex_resume(pid: c_int, cwd: &Path, ai_resume: &AiResumeConfig) -> Option<String> {
+    if let Some(uuid) = codex_resume_arg(pid) {
+        return Some(codex_resume_command(&uuid, ai_resume));
     }
-    "codex resume --last".to_string()
+    if let Some(uuid) = codex_session_for_pid(pid, cwd) {
+        return Some(codex_resume_command(&uuid, ai_resume));
+    }
+    None
+}
+
+fn codex_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
+    build_command("codex", &ai_resume.codex.flags, ["resume", session_id])
+}
+
+fn codex_resume_arg(pid: c_int) -> Option<String> {
+    let args = crate::macos::proc::argv(pid)?;
+    codex_resume_arg_from(&args)
+}
+
+fn codex_resume_arg_from(args: &[String]) -> Option<String> {
+    for pair in args.windows(2) {
+        if pair[0] == "resume" && pair[1] != "--last" && !pair[1].starts_with('-') {
+            return Some(pair[1].clone());
+        }
+    }
+    None
+}
+
+/// Upgrade a persisted resume command to the current flag policy.
+///
+/// Session files outlive the code that wrote them, so replaying the stored
+/// string verbatim can resurrect old flag sets. Normalize on load instead.
+pub fn normalize_saved_resume_command(command: &str, ai_resume: &AiResumeConfig) -> Option<String> {
+    let args: Vec<&str> = command.split_whitespace().collect();
+    let program = args.first()?;
+    if program.ends_with("claude") {
+        return claude_resume_id_from_args(&args).map(|id| claude_resume_command(&id, ai_resume));
+    }
+    if program.ends_with("copilot") {
+        return copilot_resume_id_from_args(&args).map(|id| copilot_resume_command(&id, ai_resume));
+    }
+    if program.ends_with("codex") {
+        return codex_resume_id_from_args(&args).map(|id| codex_resume_command(&id, ai_resume));
+    }
+    None
+}
+
+fn build_command<I, S>(program: &str, flags: &[String], tail: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    std::iter::once(program.to_string())
+        .chain(flags.iter().cloned())
+        .chain(tail.into_iter().map(|part| part.as_ref().to_string()))
+        .map(|part| shell_quote(&part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':' | b'=' | b'+')
+        })
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn claude_resume_id_from_args(args: &[&str]) -> Option<String> {
+    for (idx, arg) in args.iter().enumerate() {
+        if *arg == "--resume" || *arg == "-r" {
+            return args.get(idx + 1).filter(|id| !id.starts_with('-')).map(|id| id.to_string());
+        }
+        if let Some(id) = arg.strip_prefix("--resume=") {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn copilot_resume_id_from_args(args: &[&str]) -> Option<String> {
+    for (idx, arg) in args.iter().enumerate() {
+        if *arg == "--resume" {
+            return args.get(idx + 1).filter(|id| !id.starts_with('-')).map(|id| id.to_string());
+        }
+        if let Some(id) = arg.strip_prefix("--resume=") {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn codex_resume_id_from_args(args: &[&str]) -> Option<String> {
+    for pair in args.windows(2) {
+        if pair[0] == "resume" && pair[1] != "--last" && !pair[1].starts_with('-') {
+            return Some(pair[1].to_string());
+        }
+    }
+    None
 }
 
 fn codex_session_for_pid(pid: c_int, cwd: &Path) -> Option<String> {
@@ -235,13 +353,13 @@ fn codex_session_for_pid_with(
     start_tvsec: u64,
     cwd_str: &str,
 ) -> Option<String> {
-    // Walk today's and yesterday's date dir (process could span midnight).
-    let today = chrono::Utc::now();
-    let yesterday = today - chrono::Duration::days(1);
-    let date_dirs = [
-        date_dir_for(sessions_root, today),
-        date_dir_for(sessions_root, yesterday),
-    ];
+    // Walk the date dirs touched by the accepted rollout window. Candidates
+    // must be within 10 minutes after process start, so wall-clock "today"
+    // is irrelevant and makes long-running sessions/test fixtures stale.
+    let start_dt = chrono::DateTime::from_timestamp(i64::try_from(start_tvsec).ok()?, 0)?;
+    let window_end = start_dt + chrono::Duration::seconds(600);
+    let date_dirs =
+        [date_dir_for(sessions_root, start_dt), date_dir_for(sessions_root, window_end)];
 
     // We want the rollout this codex process CREATED — which must have a
     // timestamp at or after the process start. Picking "closest |Δt|" is
@@ -251,10 +369,7 @@ fn codex_session_for_pid_with(
     // sibling window in the same save-tick are skipped, so two codex
     // tabs that started in the same second still resolve to distinct
     // sessions.
-    let claimed: HashSet<String> = claimed_set()
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let claimed: HashSet<String> = claimed_set().lock().map(|g| g.clone()).unwrap_or_default();
     let mut earliest: Option<(u64, String)> = None;
     for dir in date_dirs.iter().flatten() {
         let entries = match std::fs::read_dir(dir) {
@@ -391,6 +506,98 @@ mod tests {
         assert!(!is_codex_binary("/usr/bin/zsh"));
     }
 
+    #[test]
+    fn resume_commands_use_configured_toml_flags() {
+        let config = test_ai_resume_config();
+        assert_eq!(
+            claude_resume_command("claude-session", &config),
+            "claude --toml-claude-flag --resume claude-session"
+        );
+        assert_eq!(
+            copilot_resume_command("copilot-session", &config),
+            "copilot --toml-copilot-flag --resume=copilot-session"
+        );
+        assert_eq!(
+            codex_resume_command("codex-session", &config),
+            "codex --toml-codex-flag resume codex-session"
+        );
+    }
+
+    #[test]
+    fn resume_commands_use_configured_flags() {
+        let mut config = test_ai_resume_config();
+        config.codex.flags = vec!["--sandbox".into(), "workspace-write".into()];
+        assert_eq!(
+            codex_resume_command("codex-session", &config),
+            "codex --sandbox workspace-write resume codex-session"
+        );
+    }
+
+    #[test]
+    fn resume_command_quotes_configured_flags_for_shell() {
+        let mut config = test_ai_resume_config();
+        config.codex.flags = vec!["--config".into(), "model=\"gpt-5 codex\"".into()];
+        assert_eq!(
+            codex_resume_command("codex-session", &config),
+            "codex --config 'model=\"gpt-5 codex\"' resume codex-session"
+        );
+    }
+
+    #[test]
+    fn codex_resume_arg_extracts_explicit_session() {
+        let args = vec![
+            "codex".to_string(),
+            "--existing-flag".to_string(),
+            "resume".to_string(),
+            "019e53d4-6f52-7ad1-a5c4-171284c2f248".to_string(),
+        ];
+        assert_eq!(
+            codex_resume_arg_from(&args).as_deref(),
+            Some("019e53d4-6f52-7ad1-a5c4-171284c2f248")
+        );
+    }
+
+    #[test]
+    fn codex_resume_arg_rejects_last_fallback() {
+        let args = vec!["codex".to_string(), "resume".to_string(), "--last".to_string()];
+        assert!(codex_resume_arg_from(&args).is_none());
+    }
+
+    #[test]
+    fn normalize_saved_resume_command_upgrades_old_flags() {
+        let config = test_ai_resume_config();
+        assert_eq!(
+            normalize_saved_resume_command("claude --resume claude-session", &config).as_deref(),
+            Some("claude --toml-claude-flag --resume claude-session")
+        );
+        assert_eq!(
+            normalize_saved_resume_command("codex --existing-flag resume codex-session", &config,)
+                .as_deref(),
+            Some("codex --toml-codex-flag resume codex-session")
+        );
+        assert_eq!(
+            normalize_saved_resume_command("copilot --resume=copilot-session", &config).as_deref(),
+            Some("copilot --toml-copilot-flag --resume=copilot-session")
+        );
+    }
+
+    #[test]
+    fn normalize_saved_resume_command_rejects_codex_last() {
+        let config = test_ai_resume_config();
+        assert!(
+            normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
+                .is_none()
+        );
+    }
+
+    fn test_ai_resume_config() -> AiResumeConfig {
+        let mut config = AiResumeConfig::default();
+        config.claude.flags = vec!["--toml-claude-flag".into()];
+        config.codex.flags = vec!["--toml-codex-flag".into()];
+        config.copilot.flags = vec!["--toml-copilot-flag".into()];
+        config
+    }
+
     // ── parse_codex_ts ────────────────────────────────────────────────────
 
     #[test]
@@ -453,11 +660,7 @@ mod tests {
             let dir = root.join(date_sub);
             std::fs::create_dir_all(&dir).unwrap();
             let fname = format!("rollout-{}-{}.jsonl", ts, uuid);
-            let source = if *is_subagent {
-                r#"{"subagent": true}"#
-            } else {
-                r#""user""#
-            };
+            let source = if *is_subagent { r#"{"subagent": true}"# } else { r#""user""# };
             let line = format!(
                 r#"{{"type":"session_meta","payload":{{"cwd":"{}","source":{}}}}}"#,
                 cwd, source
@@ -485,11 +688,14 @@ mod tests {
         // start+1: ts string "2026-05-21T10-00-01" → parse_codex_ts would give start_ts+1,
         // but parse_codex_ts only handles exact local-time strings; use distinct minute offsets.
         let ts_early = "2026-05-21T10-01-00"; // 10:01 CDT = start+60s
-        let ts_late = "2026-05-21T10-05-00";  // 10:05 CDT = start+300s
-        let root = make_sessions_root(&tmp, &[
-            ("2026/05/21", ts_early, "uuid-early", cwd, false),
-            ("2026/05/21", ts_late,  "uuid-late",  cwd, false),
-        ]);
+        let ts_late = "2026-05-21T10-05-00"; // 10:05 CDT = start+300s
+        let root = make_sessions_root(
+            &tmp,
+            &[
+                ("2026/05/21", ts_early, "uuid-early", cwd, false),
+                ("2026/05/21", ts_late, "uuid-late", cwd, false),
+            ],
+        );
         begin_save_tick();
         let result = codex_session_for_pid_with(&root, start_ts, cwd).unwrap();
         assert_eq!(result, "uuid-early", "earlier timestamp should win");
@@ -499,9 +705,10 @@ mod tests {
     fn cwd_mismatch_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        let root = make_sessions_root(&tmp, &[
-            ("2026/05/21", "2026-05-21T10-01-00", "uuid-wrong-cwd", "/other/project", false),
-        ]);
+        let root = make_sessions_root(
+            &tmp,
+            &[("2026/05/21", "2026-05-21T10-01-00", "uuid-wrong-cwd", "/other/project", false)],
+        );
         begin_save_tick();
         let result = codex_session_for_pid_with(&root, start_ts, "/Users/x/project");
         assert!(result.is_none(), "cwd mismatch should be rejected");
@@ -512,9 +719,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
         let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        let root = make_sessions_root(&tmp, &[
-            ("2026/05/21", "2026-05-21T10-01-00", "uuid-subagent", cwd, true),
-        ]);
+        let root = make_sessions_root(
+            &tmp,
+            &[("2026/05/21", "2026-05-21T10-01-00", "uuid-subagent", cwd, true)],
+        );
         begin_save_tick();
         let result = codex_session_for_pid_with(&root, start_ts, cwd);
         assert!(result.is_none(), "subagent rollout should be rejected");
@@ -526,9 +734,10 @@ mod tests {
         let cwd = "/Users/x/project";
         let start_ts = ts_to_unix("2026-05-21T10-00-00");
         // Rollout at 09:58 is 2 minutes BEFORE process start.
-        let root = make_sessions_root(&tmp, &[
-            ("2026/05/21", "2026-05-21T09-58-00", "uuid-before", cwd, false),
-        ]);
+        let root = make_sessions_root(
+            &tmp,
+            &[("2026/05/21", "2026-05-21T09-58-00", "uuid-before", cwd, false)],
+        );
         begin_save_tick();
         let result = codex_session_for_pid_with(&root, start_ts, cwd);
         assert!(result.is_none(), "rollout before process start should be rejected");
@@ -540,9 +749,10 @@ mod tests {
         let cwd = "/Users/x/project";
         let start_ts = ts_to_unix("2026-05-21T10-00-00");
         // Rollout at 10:11 = start + 11 min > 10-min window.
-        let root = make_sessions_root(&tmp, &[
-            ("2026/05/21", "2026-05-21T10-11-00", "uuid-too-late", cwd, false),
-        ]);
+        let root = make_sessions_root(
+            &tmp,
+            &[("2026/05/21", "2026-05-21T10-11-00", "uuid-too-late", cwd, false)],
+        );
         begin_save_tick();
         let result = codex_session_for_pid_with(&root, start_ts, cwd);
         assert!(result.is_none(), "rollout >10 min after start should be rejected");
@@ -555,10 +765,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
         let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        let root = make_sessions_root(&tmp, &[
-            ("2026/05/21", "2026-05-21T10-01-00", "uuid-first",  cwd, false),
-            ("2026/05/21", "2026-05-21T10-02-00", "uuid-second", cwd, false),
-        ]);
+        let root = make_sessions_root(
+            &tmp,
+            &[
+                ("2026/05/21", "2026-05-21T10-01-00", "uuid-first", cwd, false),
+                ("2026/05/21", "2026-05-21T10-02-00", "uuid-second", cwd, false),
+            ],
+        );
         // Reset claimed set as begin_save_tick would do at the start of a save cycle.
         begin_save_tick();
         let first = codex_session_for_pid_with(&root, start_ts, cwd);

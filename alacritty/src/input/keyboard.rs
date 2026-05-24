@@ -20,12 +20,11 @@ use crate::scheduler::{TimerId, Topic};
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Process key input.
     pub fn key_input(&mut self, key: KeyEvent) {
-        // Budget lockout. While blocked, the ONLY input we honour is the
-        // courtesy-extension binding (Cmd+Shift+Ctrl+E). We need to let
-        // the binding path run so the keystroke maps to an Action and
-        // hits the budget-block check in `Execute::execute`. Bare PTY
-        // input and IME pre-edits are dropped here so the shell sees no
-        // keystrokes while locked.
+        // Budget lockout. While blocked, the ONLY input we honour is a
+        // budget-extension binding. We need to let the binding path run so
+        // the keystroke maps to an Action and hits the budget-block check
+        // in `Execute::execute`. Bare PTY input and IME pre-edits are
+        // dropped here so the shell sees no keystrokes while locked.
         #[cfg(target_os = "macos")]
         if self.ctx.is_budget_blocked() {
             if key.state == ElementState::Released {

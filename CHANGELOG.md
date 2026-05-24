@@ -378,7 +378,7 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - `window.gtk_theme_variant` config field; use `window.decorations_theme_variant` instead
 - `alt_send_esc` is now always set to `true`
 
-## 0.11.0
+## 0.11.1
 
 ### Packaging
 
@@ -556,8 +556,6 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 - Minimum Rust version has been bumped to 1.45.0
 
-### Packaging
-
 - Updated shell completions
 - Added ARM executable to prebuilt macOS binaries
 
@@ -660,11 +658,11 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 ### Removed
 
 - The following CLI arguments have been removed in favor of the `--option` flag:
-    * `--persistent-logging`
-    * `--live-config-reload`
-    * `--no-live-config-reload`
-    * `--dimensions`
-    * `--position`
+  - `--persistent-logging`
+  - `--live-config-reload`
+  - `--no-live-config-reload`
+  - `--dimensions`
+  - `--position`
 - `live-shader-reload` feature
 - Config option `dynamic_title`, you should use `window.dynamic_title` instead
 - Config option `scrolling.faux_multiplier`, which was replaced by escape `CSI ? 1007 h/l`
@@ -1380,9 +1378,9 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Add support for macOS systemwide dark mode
 - Set the environment variable `COLORTERM="truecolor"` to advertise 24-bit color support
 - On macOS, there are two new values for the config option `window.decorations`:
-    - `transparent` - This makes the title bar transparent and allows the
+  - `transparent` - This makes the title bar transparent and allows the
         viewport to extend to the top of the window.
-    - `buttonless` - Similar to transparent but also removed the buttons.
+  - `buttonless` - Similar to transparent but also removed the buttons.
 - Add support for changing the colors from 16 to 256 in the `indexed_colors` config section
 - Add `save_to_clipboard` configuration option for copying selected text to the system clipboard
 - New terminfo entry, `alacritty-direct`, that advertises 24-bit color support

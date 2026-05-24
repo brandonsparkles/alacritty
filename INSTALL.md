@@ -12,7 +12,7 @@ cargo install alacritty
 Note that you will still need to install the dependencies for your OS of choice.
 Please refer to the [Dependencies](#dependencies) section.
 
-# Manual Installation
+## Manual Installation
 
 1. [Prerequisites](#prerequisites)
     1. [Source Code](#clone-the-source-code)
@@ -22,19 +22,20 @@ Please refer to the [Dependencies](#dependencies) section.
         2. [Arch Linux](#arch-linux)
         3. [Fedora](#fedora)
         4. [CentOS/RHEL 7](#centosrhel-7)
-        5. [openSUSE](#opensuse)
-        6. [Slackware](#slackware)
-        7. [Void Linux](#void-linux)
-        8. [FreeBSD](#freebsd)
-        9. [OpenBSD](#openbsd)
-        10. [Solus](#solus)
-        11. [NixOS/Nixpkgs](#nixosnixpkgs)
-        12. [Gentoo](#gentoo)
-        13. [Clear Linux](#clear-linux)
-        14. [GNU Guix](#gnu-guix)
-        15. [Alpine Linux](#alpine-linux)
-        16. [Windows](#windows)
-        17. [Other](#other)
+        5. [RHEL 8](#rhel-8)
+        6. [openSUSE](#opensuse)
+        7. [Slackware](#slackware)
+        8. [Void Linux](#void-linux)
+        9. [FreeBSD](#freebsd)
+        10. [OpenBSD](#openbsd)
+        11. [Solus](#solus)
+        12. [NixOS/Nixpkgs](#nixosnixpkgs)
+        13. [Gentoo](#gentoo)
+        14. [Clear Linux](#clear-linux)
+        15. [GNU Guix](#gnu-guix)
+        16. [Alpine Linux](#alpine-linux)
+        17. [Windows](#windows)
+        18. [Other](#other)
 2. [Building](#building)
     1. [Linux/Windows/BSD](#linux--windows--bsd)
     2. [macOS](#macos)
@@ -62,7 +63,7 @@ cd alacritty
 
 1. Install [`rustup.rs`](https://rustup.rs/).
 
-3. To make sure you have the right Rust compiler installed, run
+2. To make sure you have the right Rust compiler installed, run
 
    ```sh
    rustup override set stable
