@@ -21,8 +21,9 @@ non-macOS code never reaches.
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
 | **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
 | **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Restored windows share a fresh launch-local tabbing ID so they reopen as tabs in one window without replaying stale AppKit IDs. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
-| **Per-tab AI session resume** | After session restoration, claude / copilot / codex tabs reopen at *their specific* prior conversation (not just the most-recent) and carry permissive CLI flags from `[ai_resume]` in `alacritty.toml`. Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, codex argv `resume <uuid>`, and codex's `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` (matched by `pbi_start_tvsec` + cwd, with per-save-tick claim set so sibling codex tabs don't collide). Saved commands are normalized on load against current TOML flags, and `codex resume --last` is not persisted or replayed for restored tabs because it collapses multiple tabs into one conversation. |
+| **Per-tab AI session resume** | After session restoration, claude / copilot / codex tabs reopen at *their specific* prior conversation (not just the most-recent) and carry permissive CLI flags from `[ai_resume]` in `alacritty.toml`. Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, codex argv `resume <uuid>`, and codex's `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` (matched by `pbi_start_tvsec` + cwd, with per-save-tick claim set so sibling codex tabs don't collide). Saved commands are normalized on load against current TOML flags, `copilot` restore defaults to `--mouse=on` unless you already configured a mouse flag, and `codex resume --last` is not persisted or replayed for restored tabs because it collapses multiple tabs into one conversation. |
 | **Cmd+A select all** | Selects the entire terminal contents (scrollback + visible area). Standard macOS shortcut, missing from upstream. |
+| **Cmd-drag local selection** | In terminal mouse-reporting apps (Claude/Codex/Copilot chats, TUIs, etc.), holding `Cmd` while dragging now forces local text selection on macOS, matching the existing `Shift` bypass but with a native-feeling modifier. Use `Cmd+C` to copy; selection alone does not copy unless `selection.save_to_clipboard = true` in your config. |
 | **Budget enforcement** | Daily focused-time cap + 02:00–08:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown until the next 08:00 Central reset. One TOML-configured courtesy extension per day is enabled by default. See [Budget enforcement](#budget-enforcement) below. |
 | **Window-title activity prefix** | The `⠿` / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
 
@@ -43,6 +44,7 @@ macOS `platform_key_bindings()` function and can be overridden in your
 | `Backspace` (in rename mode) | `TabRename::DeleteChar` |
 | `Ctrl+C` (in rename mode) | `TabRename::Cancel` |
 | `Cmd+A` | `SelectAll` (terminal contents — scrollback + visible) |
+| `Cmd+drag` | Local text selection even when the app has enabled terminal mouse mode |
 | `Cmd+Shift+Ctrl+E` | `GrantCourtesy` (spend the once-per-day courtesy budget extension) |
 
 To rebind, e.g., the inline rename to `Cmd+R` instead:
@@ -95,7 +97,8 @@ The Rust code owns session detection and command shape (`claude --resume`,
 `codex resume`, `copilot --resume=`); this section owns local permission
 policy. Saved session commands are normalized through the current config
 before replay, so changing TOML applies to old saved sessions on the next
-launch.
+launch. Copilot restores automatically add `--mouse=on` unless your
+configured flags already include `--mouse`, `--mouse=...`, or `--no-mouse`.
 
 ## Troubleshooting
 

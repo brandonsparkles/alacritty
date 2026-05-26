@@ -547,6 +547,20 @@ impl<T: EventListener> Execute<T> for Action {
     }
 }
 
+#[inline]
+fn uses_local_selection(mouse_mode: bool, mods: ModifiersState) -> bool {
+    if !mouse_mode || mods.shift_key() {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    if mods.super_key() {
+        return true;
+    }
+
+    false
+}
+
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn new(ctx: A) -> Self {
         Self { ctx, _phantom: Default::default() }
@@ -601,7 +615,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         self.ctx.mouse_mut().block_hint_launcher = true;
 
         if (lmb_pressed || rmb_pressed)
-            && (self.ctx.modifiers().state().shift_key() || !self.ctx.mouse_mode())
+            && uses_local_selection(self.ctx.mouse_mode(), self.ctx.modifiers().state())
         {
             self.ctx.update_selection(point, cell_side);
         } else if cell_changed
@@ -719,7 +733,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     fn on_mouse_press(&mut self, button: MouseButton) {
         // Handle mouse mode.
-        if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+        if !uses_local_selection(self.ctx.mouse_mode(), self.ctx.modifiers().state()) {
             self.ctx.mouse_mut().click_state = ClickState::None;
 
             let code = match button {
@@ -797,7 +811,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
-        if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+        if !uses_local_selection(self.ctx.mouse_mode(), self.ctx.modifiers().state()) {
             let code = match button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
@@ -1701,6 +1715,27 @@ mod tests {
         triggers: true,
         mode: BindingMode::APP_CURSOR,
         mods: ModifiersState::empty(),
+    }
+
+    #[test]
+    fn local_selection_without_mouse_mode() {
+        assert!(uses_local_selection(false, ModifiersState::empty()));
+    }
+
+    #[test]
+    fn local_selection_with_shift_in_mouse_mode() {
+        assert!(uses_local_selection(true, ModifiersState::SHIFT));
+    }
+
+    #[test]
+    fn local_selection_without_modifiers_in_mouse_mode() {
+        assert!(!uses_local_selection(true, ModifiersState::empty()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_selection_with_command_in_mouse_mode() {
+        assert!(uses_local_selection(true, ModifiersState::SUPER));
     }
 
     test_process_binding! {

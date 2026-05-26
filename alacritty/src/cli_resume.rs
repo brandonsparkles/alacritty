@@ -195,7 +195,26 @@ fn copilot_resume(pid: c_int, ai_resume: &AiResumeConfig) -> Option<String> {
 }
 
 fn copilot_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
-    build_command("copilot", &ai_resume.copilot.flags, [format!("--resume={session_id}")])
+    build_command(
+        "copilot",
+        &copilot_resume_flags(&ai_resume.copilot.flags),
+        [format!("--resume={session_id}")],
+    )
+}
+
+fn copilot_resume_flags(flags: &[String]) -> Vec<String> {
+    if flags
+        .iter()
+        .any(|flag| flag == "--mouse" || flag.starts_with("--mouse=") || flag == "--no-mouse")
+    {
+        return flags.to_vec();
+    }
+
+    // Copilot uses alt-screen; without mouse mode wheel events degrade to
+    // arrow-key history navigation under Alacritty's standard alternate-scroll behavior.
+    let mut flags = flags.to_vec();
+    flags.push("--mouse=on".into());
+    flags
 }
 
 // ---------- codex ----------
@@ -515,7 +534,7 @@ mod tests {
         );
         assert_eq!(
             copilot_resume_command("copilot-session", &config),
-            "copilot --toml-copilot-flag --resume=copilot-session"
+            "copilot --toml-copilot-flag --mouse=on --resume=copilot-session"
         );
         assert_eq!(
             codex_resume_command("codex-session", &config),
@@ -577,7 +596,7 @@ mod tests {
         );
         assert_eq!(
             normalize_saved_resume_command("copilot --resume=copilot-session", &config).as_deref(),
-            Some("copilot --toml-copilot-flag --resume=copilot-session")
+            Some("copilot --toml-copilot-flag --mouse=on --resume=copilot-session")
         );
     }
 
@@ -587,6 +606,37 @@ mod tests {
         assert!(
             normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn copilot_resume_defaults_mouse_on_when_unspecified() {
+        let config = AiResumeConfig::default();
+        assert_eq!(
+            copilot_resume_command("copilot-session", &config),
+            "copilot --mouse=on --resume=copilot-session"
+        );
+    }
+
+    #[test]
+    fn copilot_resume_respects_explicit_mouse_flags() {
+        let mut config = AiResumeConfig::default();
+        config.copilot.flags = vec!["--mouse=off".into(), "--toml-copilot-flag".into()];
+        assert_eq!(
+            copilot_resume_command("copilot-session", &config),
+            "copilot --mouse=off --toml-copilot-flag --resume=copilot-session"
+        );
+
+        config.copilot.flags = vec!["--no-mouse".into()];
+        assert_eq!(
+            copilot_resume_command("copilot-session", &config),
+            "copilot --no-mouse --resume=copilot-session"
+        );
+
+        config.copilot.flags = vec!["--mouse".into(), "off".into()];
+        assert_eq!(
+            copilot_resume_command("copilot-session", &config),
+            "copilot --mouse off --resume=copilot-session"
         );
     }
 
