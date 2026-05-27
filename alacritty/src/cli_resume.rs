@@ -10,12 +10,12 @@
 //!
 //! ## Supported tools
 //!
-//! | Tool    | Identifier source                                     | Resume command                   |
-//! |---------|-------------------------------------------------------|----------------------------------|
-//! | claude  | `~/.claude/sessions/<pid>.json` → `sessionId`         | `claude <flags> --resume <id>`   |
-//! | copilot | `~/.copilot/logs/process-<ts>-<pid>.log` last         | `copilot <flags> --resume=<id>`  |
-//! |         | "Registering foreground session: <uuid>" entry        |                                  |
-//! | codex   | argv `resume <uuid>` or rollout metadata              | `codex <flags> resume <id>`      |
+//! | Tool                 | Identifier source                              | Resume command                        |
+//! |----------------------|------------------------------------------------|---------------------------------------|
+//! | claude               | `~/.claude/sessions/<pid>.json` → `sessionId`  | `claude <flags> --resume <id>`        |
+//! | copilot              | `~/.copilot/logs/process-<ts>-<pid>.log` last  | `copilot <flags> --resume=<id>`       |
+//! |                      | "Registering foreground session: <uuid>" entry |                                       |
+//! | codex / codexpilot   | argv `resume <uuid>` or rollout metadata       | `<program> <flags> resume <id>`       |
 //!
 //! Tools are matched by their resolved binary path (via `proc_pidpath`),
 //! not `pbi_comm`, because `pbi_comm` is truncated to 15 chars and reflects
@@ -106,8 +106,8 @@ pub fn resume_command_for(
                     if let Some(cmd) = copilot_resume(child, ai_resume) {
                         return Some(cmd);
                     }
-                } else if is_codex_binary(path_str) {
-                    if let Some(cmd) = codex_resume(child, _shell_cwd, ai_resume) {
+                } else if let Some(program) = codex_program_for_binary(path_str) {
+                    if let Some(cmd) = codex_resume(child, _shell_cwd, ai_resume, program) {
                         return Some(cmd);
                     }
                 }
@@ -219,8 +219,14 @@ fn copilot_resume_flags(flags: &[String]) -> Vec<String> {
 
 // ---------- codex ----------
 
-fn is_codex_binary(p: &str) -> bool {
-    p.contains("@openai/codex") || p.contains("/codex-darwin-")
+fn codex_program_for_binary(p: &str) -> Option<&'static str> {
+    if p.contains("/codexpilot/") || p.contains("/codexpilot-") {
+        return Some("codexpilot");
+    }
+    if p.contains("@openai/codex") || p.contains("/codex-darwin-") {
+        return Some("codex");
+    }
+    None
 }
 
 /// codex doesn't write PID-keyed session metadata anywhere, but each
@@ -245,18 +251,23 @@ fn is_codex_binary(p: &str) -> bool {
 /// Returns `None` when no exact session can be recovered. Replaying
 /// `codex resume --last` is intentionally avoided because it makes multiple
 /// restored tabs collapse into the same newest conversation.
-fn codex_resume(pid: c_int, cwd: &Path, ai_resume: &AiResumeConfig) -> Option<String> {
+fn codex_resume(
+    pid: c_int,
+    cwd: &Path,
+    ai_resume: &AiResumeConfig,
+    program: &str,
+) -> Option<String> {
     if let Some(uuid) = codex_resume_arg(pid) {
-        return Some(codex_resume_command(&uuid, ai_resume));
+        return Some(codex_resume_command(program, &uuid, ai_resume));
     }
     if let Some(uuid) = codex_session_for_pid(pid, cwd) {
-        return Some(codex_resume_command(&uuid, ai_resume));
+        return Some(codex_resume_command(program, &uuid, ai_resume));
     }
     None
 }
 
-fn codex_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
-    build_command("codex", &ai_resume.codex.flags, ["resume", session_id])
+fn codex_resume_command(program: &str, session_id: &str, ai_resume: &AiResumeConfig) -> String {
+    build_command(program, &ai_resume.codex.flags, ["resume", session_id])
 }
 
 fn codex_resume_arg(pid: c_int) -> Option<String> {
@@ -286,8 +297,13 @@ pub fn normalize_saved_resume_command(command: &str, ai_resume: &AiResumeConfig)
     if program.ends_with("copilot") {
         return copilot_resume_id_from_args(&args).map(|id| copilot_resume_command(&id, ai_resume));
     }
+    if program.ends_with("codexpilot") {
+        return codex_resume_id_from_args(&args)
+            .map(|id| codex_resume_command("codexpilot", &id, ai_resume));
+    }
     if program.ends_with("codex") {
-        return codex_resume_id_from_args(&args).map(|id| codex_resume_command(&id, ai_resume));
+        return codex_resume_id_from_args(&args)
+            .map(|id| codex_resume_command("codex", &id, ai_resume));
     }
     None
 }
@@ -518,11 +534,15 @@ mod tests {
 
     #[test]
     fn matches_codex_binary() {
-        assert!(is_codex_binary(
-            "/Users/x/.config/yarn/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex"
-        ));
-        assert!(is_codex_binary("/x/@openai/codex/foo"));
-        assert!(!is_codex_binary("/usr/bin/zsh"));
+        let codex_path = "/Users/x/.config/yarn/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex";
+        let codexpilot_path = "/opt/homebrew/lib/node_modules/codexpilot/node_modules/codexpilot-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex";
+
+        assert_eq!(codex_program_for_binary(codex_path), Some("codex"));
+        assert_eq!(codex_program_for_binary(codexpilot_path), Some("codexpilot"));
+        assert!(codex_program_for_binary(codex_path).is_some());
+        assert!(codex_program_for_binary(codexpilot_path).is_some());
+        assert!(codex_program_for_binary("/x/@openai/codex/foo").is_some());
+        assert!(codex_program_for_binary("/usr/bin/zsh").is_none());
     }
 
     #[test]
@@ -537,8 +557,12 @@ mod tests {
             "copilot --toml-copilot-flag --mouse=on --resume=copilot-session"
         );
         assert_eq!(
-            codex_resume_command("codex-session", &config),
+            codex_resume_command("codex", "codex-session", &config),
             "codex --toml-codex-flag resume codex-session"
+        );
+        assert_eq!(
+            codex_resume_command("codexpilot", "codex-session", &config),
+            "codexpilot --toml-codex-flag resume codex-session"
         );
     }
 
@@ -547,7 +571,7 @@ mod tests {
         let mut config = test_ai_resume_config();
         config.codex.flags = vec!["--sandbox".into(), "workspace-write".into()];
         assert_eq!(
-            codex_resume_command("codex-session", &config),
+            codex_resume_command("codex", "codex-session", &config),
             "codex --sandbox workspace-write resume codex-session"
         );
     }
@@ -557,7 +581,7 @@ mod tests {
         let mut config = test_ai_resume_config();
         config.codex.flags = vec!["--config".into(), "model=\"gpt-5 codex\"".into()];
         assert_eq!(
-            codex_resume_command("codex-session", &config),
+            codex_resume_command("codex", "codex-session", &config),
             "codex --config 'model=\"gpt-5 codex\"' resume codex-session"
         );
     }
@@ -595,6 +619,14 @@ mod tests {
             Some("codex --toml-codex-flag resume codex-session")
         );
         assert_eq!(
+            normalize_saved_resume_command(
+                "codexpilot --existing-flag resume codex-session",
+                &config,
+            )
+            .as_deref(),
+            Some("codexpilot --toml-codex-flag resume codex-session")
+        );
+        assert_eq!(
             normalize_saved_resume_command("copilot --resume=copilot-session", &config).as_deref(),
             Some("copilot --toml-copilot-flag --mouse=on --resume=copilot-session")
         );
@@ -605,6 +637,10 @@ mod tests {
         let config = test_ai_resume_config();
         assert!(
             normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
+                .is_none()
+        );
+        assert!(
+            normalize_saved_resume_command("codexpilot --existing-flag resume --last", &config,)
                 .is_none()
         );
     }
