@@ -1,1 +1,4 @@
 target
+
+# Personal Alacritty config (moved here from ~/.config, symlinked back)
+/alacritty.toml
