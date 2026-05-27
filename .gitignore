@@ -1,4 +1,8 @@
 target
 
+# macOS
+.DS_Store
+**/.DS_Store
+
 # Personal Alacritty config (moved here from ~/.config, symlinked back)
 /alacritty.toml
