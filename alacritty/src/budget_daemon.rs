@@ -228,7 +228,8 @@ fn snapshot(cfg: &BudgetConfig) -> UsagePayload {
 }
 
 /// Minimal HTTP/1.1 writer. CORS headers allow the aisparkles app + any
-/// localhost origin to fetch directly from the browser.
+/// localhost origin to fetch directly from the browser. The private-network
+/// header is required by Chromium when a public HTTPS origin calls loopback.
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
@@ -250,6 +251,7 @@ fn build_response_bytes(status: u16, reason: &str, content_type: &str, body: &st
     headers.push_str("Access-Control-Allow-Origin: *\r\n");
     headers.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
     headers.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
+    headers.push_str("Access-Control-Allow-Private-Network: true\r\n");
     headers.push_str("Cache-Control: no-store\r\n");
     if !content_type.is_empty() {
         headers.push_str(&format!("Content-Type: {}\r\n", content_type));
@@ -303,6 +305,10 @@ mod tests {
         assert!(
             text.contains("Access-Control-Allow-Headers: Content-Type\r\n"),
             "ACAH header missing"
+        );
+        assert!(
+            text.contains("Access-Control-Allow-Private-Network: true\r\n"),
+            "ACAPN header missing"
         );
         assert!(text.contains("Cache-Control: no-store\r\n"), "Cache-Control header missing");
     }
