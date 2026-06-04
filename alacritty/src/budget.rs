@@ -5,6 +5,7 @@
 //! This module only owns runtime counters that persist across restarts:
 //!
 //!   * `active_seconds` — focused-time accumulated today
+//!   * `weekly_active_seconds` — focused-time accumulated this week
 //!   * `date_chicago` — day key the state was last written under
 //!   * `courtesy_used` / `courtesy_expires_at` — optional once-per-day extension
 //!   * `weekly_extension_*` — optional weekly one-hour extensions
@@ -58,6 +59,9 @@ pub struct Budget {
     pub date_chicago: String,
     /// Seconds of focused time accumulated today.
     pub active_seconds: u64,
+    /// Seconds of focused time accumulated this week.
+    #[serde(default)]
+    pub weekly_active_seconds: u64,
     /// True once the optional one-time-per-day courtesy has been spent.
     pub courtesy_used: bool,
     /// Unix-seconds timestamp when an active courtesy extension expires.
@@ -81,6 +85,7 @@ impl Default for Budget {
         Self {
             date_chicago: String::new(),
             active_seconds: 0,
+            weekly_active_seconds: 0,
             courtesy_used: false,
             courtesy_expires_at: None,
             weekly_extension_week: String::new(),
@@ -177,6 +182,7 @@ impl Budget {
                 self.weekly_extension_week, week
             );
             self.weekly_extension_week = week;
+            self.weekly_active_seconds = 0;
             self.weekly_extension_used_seconds = 0;
             self.weekly_extension_expires_at = None;
         }
@@ -187,6 +193,7 @@ impl Budget {
     pub fn tick(&mut self, cfg: &BudgetConfig, delta_seconds: u64) {
         self.refresh_day_boundary(cfg);
         self.active_seconds = self.active_seconds.saturating_add(delta_seconds);
+        self.weekly_active_seconds = self.weekly_active_seconds.saturating_add(delta_seconds);
     }
 
     /// Returns `Some(reason)` if the user should be locked out right

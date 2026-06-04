@@ -51,6 +51,7 @@ struct UsagePayload {
     date_chicago: String,
     /// Focused seconds accumulated today.
     active_seconds: u64,
+    weekly_active_seconds: u64,
     /// Daily cap (from config).
     cap_seconds: u64,
     /// True once the courtesy extension has been spent today.
@@ -70,6 +71,13 @@ struct UsagePayload {
     weekly_extension_seconds: u64,
     /// Unix-seconds timestamp when the active weekly extension expires.
     weekly_extension_expires_at: Option<u64>,
+    /// Alias fields for browser clients that strip keys containing
+    /// "extension" from localhost JSON payloads.
+    weekly_budget_week: String,
+    weekly_budget_used_seconds: u64,
+    weekly_budget_remaining_seconds: u64,
+    weekly_budget_seconds: u64,
+    weekly_budget_expires_at: Option<u64>,
     /// Last persistence timestamp.
     updated_at: u64,
     /// `true` when input is currently blocked. Mirrors the lockout
@@ -210,6 +218,7 @@ fn snapshot(cfg: &BudgetConfig) -> UsagePayload {
     UsagePayload {
         date_chicago: budget.date_chicago.clone(),
         active_seconds: budget.active_seconds,
+        weekly_active_seconds: budget.weekly_active_seconds,
         cap_seconds: cfg.cap_seconds,
         courtesy_used: budget.courtesy_used,
         courtesy_expires_at: budget.courtesy_expires_at,
@@ -219,6 +228,11 @@ fn snapshot(cfg: &BudgetConfig) -> UsagePayload {
         weekly_extension_remaining_seconds: budget.weekly_extension_remaining_seconds(cfg),
         weekly_extension_seconds: cfg.weekly_extension_seconds,
         weekly_extension_expires_at: budget.weekly_extension_expires_at,
+        weekly_budget_week: budget.weekly_extension_week.clone(),
+        weekly_budget_used_seconds: budget.weekly_extension_used_seconds,
+        weekly_budget_remaining_seconds: budget.weekly_extension_remaining_seconds(cfg),
+        weekly_budget_seconds: cfg.weekly_extension_seconds,
+        weekly_budget_expires_at: budget.weekly_extension_expires_at,
         updated_at: budget.updated_at,
         blocked,
         reason,
@@ -398,6 +412,7 @@ mod tests {
         let payload = UsagePayload {
             date_chicago: "2026-05-21".to_string(),
             active_seconds: 3600,
+            weekly_active_seconds: 3600,
             cap_seconds: 10800,
             courtesy_used: false,
             courtesy_expires_at: None,
@@ -407,6 +422,11 @@ mod tests {
             weekly_extension_remaining_seconds: 21600,
             weekly_extension_seconds: 3600,
             weekly_extension_expires_at: None,
+            weekly_budget_week: "2026-W21".to_string(),
+            weekly_budget_used_seconds: 0,
+            weekly_budget_remaining_seconds: 21600,
+            weekly_budget_seconds: 3600,
+            weekly_budget_expires_at: None,
             updated_at: 1_000_000,
             blocked: false,
             reason: None,
@@ -418,6 +438,7 @@ mod tests {
         for field in &[
             "date_chicago",
             "active_seconds",
+            "weekly_active_seconds",
             "cap_seconds",
             "courtesy_used",
             "courtesy_seconds",
@@ -440,6 +461,7 @@ mod tests {
         let payload = UsagePayload {
             date_chicago: "2026-05-21".to_string(),
             active_seconds: 0,
+            weekly_active_seconds: 0,
             cap_seconds: 10800,
             courtesy_used: false,
             courtesy_expires_at: None,
@@ -449,6 +471,11 @@ mod tests {
             weekly_extension_remaining_seconds: 21600,
             weekly_extension_seconds: 3600,
             weekly_extension_expires_at: None,
+            weekly_budget_week: "2026-W21".to_string(),
+            weekly_budget_used_seconds: 0,
+            weekly_budget_remaining_seconds: 21600,
+            weekly_budget_seconds: 3600,
+            weekly_budget_expires_at: None,
             updated_at: 0,
             blocked: false,
             reason: None,
@@ -470,6 +497,7 @@ mod tests {
         let payload = UsagePayload {
             date_chicago: "2026-05-21".to_string(),
             active_seconds: 0,
+            weekly_active_seconds: 0,
             cap_seconds: 10800,
             courtesy_used: true,
             courtesy_expires_at: Some(9_999_999),
@@ -479,6 +507,11 @@ mod tests {
             weekly_extension_remaining_seconds: 18000,
             weekly_extension_seconds: 3600,
             weekly_extension_expires_at: Some(9_888_888),
+            weekly_budget_week: "2026-W21".to_string(),
+            weekly_budget_used_seconds: 3600,
+            weekly_budget_remaining_seconds: 18000,
+            weekly_budget_seconds: 3600,
+            weekly_budget_expires_at: Some(9_888_888),
             updated_at: 0,
             blocked: false,
             reason: None,
