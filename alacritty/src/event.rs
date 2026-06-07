@@ -2652,70 +2652,34 @@ pub struct AccumulatedScroll {
 }
 
 impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
-    /// Poll the shell's child-process set and update the tab activity
-    /// indicator. Fired on a recurring scheduler tick (macOS only).
+    /// Poll shell descendants and reflect activity in the native macOS tab title.
     ///
-    /// Three-state derivation:
-    ///   - no direct children of the shell        → `Idle`
-    ///   - any direct child is in SRUN            → `Working` (⠿)
-    ///   - all direct children blocked for ≥ 2 s  → `NeedsAttention` (🔵)
-    ///     when the tab is also unfocused
+    /// State transitions:
+    ///   - no shell descendants                      -> `Idle`
+    ///   - any shell descendant is alive             -> `Working` (⠿)
     ///
-    /// Idle-triggered `NeedsAttention` is allowed to revert to `Working`
-    /// once the child resumes work (e.g. user types into claude → next
-    /// tick sees the child runnable). Bell-triggered `NeedsAttention`
-    /// (set by `TerminalEvent::Bell`) is sticky until focus gain;
-    /// `tab_attention_from_bell` tracks which path raised it.
+    /// Bell-triggered `NeedsAttention` (set by `TerminalEvent::Bell`) is sticky
+    /// until focus gain; `tab_attention_from_bell` tracks that path.
     ///
-    /// We use direct children of the shell, not the TTY's foreground
-    /// process group — some TUIs (codex/copilot) share their parent
-    /// shell's pgid so the pgid heuristic gives false negatives.
+    /// We use descendants of the shell, not the TTY's foreground process group.
+    /// Some TUIs (codex/claude/copilot) run through wrappers or share their
+    /// parent shell's pgid, so the pgid/direct-child heuristics can give false
+    /// negatives.
     #[cfg(target_os = "macos")]
     fn poll_tab_activity(&mut self) {
-        use std::time::{Duration, Instant};
-
         use crate::display::TabActivity;
 
-        /// Wait this long between "all children blocked" and raising the
-        /// 🔵 indicator. Short enough to feel responsive, long enough to
-        /// ride over a streaming tool's brief between-chunk sleeps.
-        // Long debounce — most AI CLIs spend long periods in SSLEEP while
-        // waiting on a network response, which is NOT user-attention-needed.
-        // 90 s catches "tool truly waiting for the next prompt" while
-        // ignoring everything that looks like in-flight inference.
-        const IDLE_DEBOUNCE: Duration = Duration::from_secs(90);
-
-        // Bell-triggered NeedsAttention is sticky — only focus gain clears it.
+        // Bell-triggered NeedsAttention is sticky; only focus gain clears it.
         if self.ctx.display.tab_activity == TabActivity::NeedsAttention
             && self.ctx.display.tab_attention_from_bell
         {
             return;
         }
 
-        let children = crate::macos::proc::list_children(self.ctx.shell_pid as i32);
-        let focused = self.ctx.terminal.is_focused;
-
-        let next = if children.is_empty() {
-            self.ctx.display.child_idle_since = None;
-            TabActivity::Idle
-        } else if children.iter().all(|&pid| crate::macos::proc::is_idle(pid)) {
-            let now = Instant::now();
-            let started = *self.ctx.display.child_idle_since.get_or_insert(now);
-            if !focused && now.duration_since(started) >= IDLE_DEBOUNCE {
-                TabActivity::NeedsAttention
-            } else {
-                TabActivity::Working
-            }
-        } else {
-            self.ctx.display.child_idle_since = None;
-            TabActivity::Working
-        };
+        let children = crate::macos::proc::list_descendants(self.ctx.shell_pid as i32, 4);
+        let next = if children.is_empty() { TabActivity::Idle } else { TabActivity::Working };
 
         if next != self.ctx.display.tab_activity {
-            // Polling owns this transition — not bell.
-            if next == TabActivity::NeedsAttention {
-                self.ctx.display.tab_attention_from_bell = false;
-            }
             self.ctx.display.tab_activity = next;
             self.ctx.display.apply_tab_title();
         }
@@ -2936,7 +2900,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                     self.ctx.display.apply_tab_title();
                                 }
                                 self.ctx.display.tab_attention_from_bell = false;
-                                self.ctx.display.child_idle_since = None;
                             }
                         }
                         // Focus changes are a good moment to refresh the

@@ -16,7 +16,7 @@ non-macOS code never reaches.
 | **Two-finger swipe between tabs** | Horizontal trackpad pan accumulating ≥ 50 px (within 25° of horizontal) fires `SelectNextTab` / `SelectPreviousTab`. Swipe right → previous, swipe left → next (Apple swipe-between-pages convention). |
 | **Inline tab rename** | `Cmd+Shift+R` opens a live prompt — keystrokes update the NSWindowTab title in place. `Enter` commits, `Esc` cancels, `Ctrl+W` deletes a word, `Ctrl+U` clears, `Backspace` deletes a character. |
 | **Reset tab title** | `Cmd+Shift+Opt+R` clears any user override, reverting to the auto-derived window title. |
-| **Activity indicator** | A `⠿` prefix is added to the tab label whenever the shell has any direct child process (vim, codex, claude, copilot, sleep, etc.). Detection: `proc_listpids(PROC_PPID_ONLY, shell_pid)` every 500 ms — works regardless of how the subprocess manages its process group. |
+| **Activity indicator** | A `⠿` prefix is added to the tab label whenever the shell has any active descendant process (vim, codex, claude, copilot, sleep, etc.). Detection: a bounded `proc_listpids(PROC_PPID_ONLY, pid)` tree walk every 500 ms — works regardless of wrappers or how the subprocess manages its process group. |
 | **Needs-attention indicator** | A `🔵` prefix is added when the terminal bell rings while the tab is unfocused. Cleared on focus. |
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
 | **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
@@ -303,7 +303,7 @@ alacritty/src/event.rs                    — RenameTabState, BudgetTick, AppFoc
 alacritty/src/input/mod.rs                — tab_swipe_step, ClearInputLine, budget keystroke filter
 alacritty/src/input/keyboard.rs           — double-Esc detection, rename input routing
 alacritty/src/config/bindings.rs          — RENAME_TAB BindingMode, SelectAll, GrantCourtesy
-alacritty/src/macos/proc.rs               — has_children(), pid_path, start_tvsec, is_idle
+alacritty/src/macos/proc.rs               — list_children(), list_descendants(), pid_path, start_tvsec
 alacritty/src/window_context.rs           — session_snapshot, restored_size/position application
 alacritty/src/scheduler.rs                — Topic::TabActivity, SessionSave, BudgetTick, ResumeCommand
 alacritty/src/cli.rs                      — restored_* fields on WindowOptions

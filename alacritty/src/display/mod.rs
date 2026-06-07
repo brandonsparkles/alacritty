@@ -436,13 +436,6 @@ pub struct Display {
     #[cfg(target_os = "macos")]
     pub tab_activity: TabActivity,
 
-    /// When the foreground child first transitioned to a blocked state.
-    /// Used by the idle-detection path to fire `NeedsAttention` after a
-    /// debounce window of continuous idleness (a tool like claude/copilot
-    /// blocked on stdin for ≥ 2 s while the tab is unfocused).
-    #[cfg(target_os = "macos")]
-    pub child_idle_since: Option<Instant>,
-
     /// `true` when the current `NeedsAttention` was triggered by a terminal
     /// BEL. Sticky-on-unfocus: polling must NOT clear a bell-triggered
     /// attention even if the child resumes work; only focus gain clears it.
@@ -626,9 +619,6 @@ impl Display {
             tab_user_title: None,
             #[cfg(target_os = "macos")]
             tab_activity: TabActivity::default(),
-            #[cfg(target_os = "macos")]
-            child_idle_since: None,
-            #[cfg(target_os = "macos")]
             tab_attention_from_bell: false,
             #[cfg(target_os = "macos")]
             budget_blocked: false,

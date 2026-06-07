@@ -56,6 +56,7 @@ $(APP_NAME)-%: $(TARGET)-%
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
 	@cp -fp $(COMPLETIONS) $(APP_COMPLETIONS_DIR)
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
+	@xattr -cr "$(APP_DIR)/$(APP_NAME)"
 	@codesign --remove-signature "$(APP_DIR)/$(APP_NAME)"
 	@codesign --force --deep --sign - "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"

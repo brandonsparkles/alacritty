@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{CStr, CString, IntoStringError};
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -84,6 +85,35 @@ pub fn list_children(parent_pid: c_int) -> Vec<c_int> {
     let n = (actual as usize) / std::mem::size_of::<c_int>();
     // The kernel can write trailing zero entries; ignore them.
     buf.into_iter().take(n).filter(|&p| p > 0).collect()
+}
+
+/// Return descendants of `parent_pid`, excluding `parent_pid` itself.
+///
+/// AI CLIs often run through one or more wrapper processes. Walking a bounded
+/// tree lets tab activity use one marker for codex, claude, copilot, and their
+/// wrapped binaries without chasing unrelated process trees.
+pub fn list_descendants(parent_pid: c_int, max_depth: usize) -> Vec<c_int> {
+    let mut descendants = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::from([(parent_pid, 0usize)]);
+    visited.insert(parent_pid);
+
+    while let Some((pid, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        for child in list_children(pid) {
+            if !visited.insert(child) {
+                continue;
+            }
+
+            descendants.push(child);
+            queue.push_back((child, depth + 1));
+        }
+    }
+
+    descendants
 }
 
 /// Return the full filesystem path of the binary backing `pid`, resolving
@@ -210,28 +240,6 @@ pub fn argv(pid: c_int) -> Option<Vec<String>> {
     (!args.is_empty()).then_some(args)
 }
 
-/// `true` if the process is blocked (state SSLEEP/SSTOP) rather than runnable.
-///
-/// We use this on the shell's direct children to distinguish "the foreground
-/// subprocess is doing work" from "the foreground subprocess is waiting for
-/// user input". When `claude`/`codex`/`copilot` finishes a turn it blocks on
-/// `read()` from stdin; macOS reports its task as SSLEEP.
-///
-/// Returns `false` on any error (treating it as "still working" — better to
-/// undercount idle than to spuriously raise the attention indicator).
-pub fn is_idle(pid: c_int) -> bool {
-    let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
-    let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
-    let res = unsafe {
-        sys::proc_pidinfo(pid, sys::PROC_PIDTBSDINFO, 0, info.as_mut_ptr() as *mut c_void, size)
-    };
-    if res != size {
-        return false;
-    }
-    let info = unsafe { info.assume_init() };
-    matches!(info.pbi_status, sys::SSLEEP | sys::SSTOP)
-}
-
 pub fn cwd(pid: c_int) -> Result<PathBuf, Error> {
     let mut info = MaybeUninit::<sys::proc_vnodepathinfo>::uninit();
     let info_ptr = info.as_mut_ptr() as *mut c_void;
@@ -261,9 +269,6 @@ mod sys {
     pub const PROC_PPID_ONLY: u32 = 6;
 
     // Process states from <sys/proc.h>.
-    pub const SSLEEP: u32 = 3;
-    pub const SSTOP: u32 = 4;
-
     type gid_t = c_int;
     type off_t = c_longlong;
     type uid_t = c_int;
