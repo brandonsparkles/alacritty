@@ -16,7 +16,7 @@ non-macOS code never reaches.
 | **Two-finger swipe between tabs** | Horizontal trackpad pan accumulating ≥ 50 px (within 25° of horizontal) fires `SelectNextTab` / `SelectPreviousTab`. Swipe right → previous, swipe left → next (Apple swipe-between-pages convention). |
 | **Inline tab rename** | `Cmd+Shift+R` opens a live prompt — keystrokes update the NSWindowTab title in place. `Enter` commits, `Esc` cancels, `Ctrl+W` deletes a word, `Ctrl+U` clears, `Backspace` deletes a character. |
 | **Reset tab title** | `Cmd+Shift+Opt+R` clears any user override, reverting to the auto-derived window title. |
-| **Activity indicator** | A `⠿` prefix is added to the tab label whenever the shell has any active descendant process (vim, codex, claude, copilot, sleep, etc.). Detection: a bounded `proc_listpids(PROC_PPID_ONLY, pid)` tree walk every 500 ms — works regardless of wrappers or how the subprocess manages its process group. |
+| **Activity indicator** | A square spinner prefix (`◰`/`◳`/`◲`/`◱`) is added to the tab label whenever the PTY root is a non-shell command or the shell has any active descendant process (vim, codex, claude, copilot, sleep, etc.). Detection: a bounded `proc_listpids(PROC_PPID_ONLY, pid)` tree walk plus root-process classification every 500 ms — works regardless of wrappers, restored direct commands, or how the subprocess manages its process group. |
 | **Needs-attention indicator** | A `🔵` prefix is added when the terminal bell rings while the tab is unfocused. Cleared on focus. |
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
 | **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
@@ -25,7 +25,7 @@ non-macOS code never reaches.
 | **Cmd+A select all** | Selects the entire terminal contents (scrollback + visible area). Standard macOS shortcut, missing from upstream. |
 | **Cmd-drag local selection** | In terminal mouse-reporting apps (Claude/Codex/Copilot chats, TUIs, etc.), holding `Cmd` while dragging now forces local text selection on macOS, matching the existing `Shift` bypass but with a native-feeling modifier. Use `Cmd+C` to copy; selection alone does not copy unless `selection.save_to_clipboard = true` in your config. |
 | **Budget enforcement** | Daily focused-time cap + 02:00–08:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown until the next 08:00 Central reset. One TOML-configured courtesy extension per day is enabled by default. See [Budget enforcement](#budget-enforcement) below. |
-| **Window-title activity prefix** | The `⠿` / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
+| **Window-title activity prefix** | The square spinner / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
 
 ## Keybindings reference
 
@@ -68,7 +68,7 @@ action = "ClearInputLine"
 ## Configuration interactions
 
 - `window.dynamic_title = false` is respected: the static window title is
-  used as the base for the activity prefix (so you see `⠿ Alacritty`
+  used as the base for the activity prefix (so you see `◰ Alacritty`
   instead of `⠿ <shell-derived-title>`). Cmd+Shift+R rename overrides
   still work and compose with the prefix.
 - `window.decorations = "None"` disables all native tab features (upstream

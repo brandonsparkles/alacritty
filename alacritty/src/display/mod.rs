@@ -365,10 +365,12 @@ pub enum TabActivity {
 #[cfg(target_os = "macos")]
 impl TabActivity {
     /// Icon prefix (with trailing space) inserted before the tab label.
-    pub fn prefix(self) -> Option<&'static str> {
+    pub fn prefix(self, frame: usize) -> Option<&'static str> {
         match self {
-            // Static braille glyph; an animated frame cycle is a follow-up.
-            TabActivity::Working => Some("⠿ "),
+            TabActivity::Working => {
+                const FRAMES: &[&str] = &["◰ ", "◳ ", "◲ ", "◱ "];
+                Some(FRAMES[frame % FRAMES.len()])
+            },
             // U+1F535 LARGE BLUE CIRCLE.
             TabActivity::NeedsAttention => Some("🔵 "),
             TabActivity::Idle => None,
@@ -435,6 +437,9 @@ pub struct Display {
     /// macOS native tabs only.
     #[cfg(target_os = "macos")]
     pub tab_activity: TabActivity,
+
+    #[cfg(target_os = "macos")]
+    pub tab_activity_frame: usize,
 
     /// `true` when the current `NeedsAttention` was triggered by a terminal
     /// BEL. Sticky-on-unfocus: polling must NOT clear a bell-triggered
@@ -619,6 +624,8 @@ impl Display {
             tab_user_title: None,
             #[cfg(target_os = "macos")]
             tab_activity: TabActivity::default(),
+            #[cfg(target_os = "macos")]
+            tab_activity_frame: 0,
             tab_attention_from_bell: false,
             #[cfg(target_os = "macos")]
             budget_blocked: false,
@@ -650,7 +657,7 @@ impl Display {
             self.window.set_title(composed);
             return;
         }
-        let prefix = self.tab_activity.prefix();
+        let prefix = self.tab_activity.prefix(self.tab_activity_frame);
         // Source for the title body: explicit user override, else the last
         // shell-provided title. Never read window.title() back — that's
         // already prefix-composed and would cause re-prefixing.

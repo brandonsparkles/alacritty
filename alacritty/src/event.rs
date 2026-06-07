@@ -2651,12 +2651,33 @@ pub struct AccumulatedScroll {
     pub y: f64,
 }
 
+#[cfg(target_os = "macos")]
+fn is_idle_shell_process(name: &str) -> bool {
+    matches!(
+        name,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "mksh"
+            | "yash"
+            | "csh"
+            | "tcsh"
+            | "nu"
+            | "elvish"
+            | "xonsh"
+            | "pwsh"
+    )
+}
+
 impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     /// Poll shell descendants and reflect activity in the native macOS tab title.
     ///
     /// State transitions:
-    ///   - no shell descendants                      -> `Idle`
-    ///   - any shell descendant is alive             -> `Working` (⠿)
+    ///   - idle shell with no descendants            -> `Idle`
+    ///   - direct command root or any descendant     -> `Working` (square spinner)
     ///
     /// Bell-triggered `NeedsAttention` (set by `TerminalEvent::Bell`) is sticky
     /// until focus gain; `tab_attention_from_bell` tracks that path.
@@ -2676,10 +2697,27 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
             return;
         }
 
-        let children = crate::macos::proc::list_descendants(self.ctx.shell_pid as i32, 4);
-        let next = if children.is_empty() { TabActivity::Idle } else { TabActivity::Working };
+        let shell_pid = self.ctx.shell_pid as i32;
+        let children = crate::macos::proc::list_descendants(shell_pid, 4);
+        let root_is_command = crate::macos::proc::pid_path(shell_pid)
+            .and_then(|path| path.file_name().map(|name| name.to_owned()))
+            .and_then(|name| name.to_str().map(str::to_owned))
+            .is_some_and(|name| !is_idle_shell_process(&name));
+        let next = if root_is_command || !children.is_empty() {
+            TabActivity::Working
+        } else {
+            TabActivity::Idle
+        };
+        let animate = next == TabActivity::Working;
 
-        if next != self.ctx.display.tab_activity {
+        if animate {
+            self.ctx.display.tab_activity_frame =
+                self.ctx.display.tab_activity_frame.wrapping_add(1);
+        } else {
+            self.ctx.display.tab_activity_frame = 0;
+        }
+
+        if next != self.ctx.display.tab_activity || animate {
             self.ctx.display.tab_activity = next;
             self.ctx.display.apply_tab_title();
         }
