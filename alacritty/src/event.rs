@@ -1360,8 +1360,9 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         // Update selection.
         if vi_mode && self.terminal.selection.as_ref().is_some_and(|s| !s.is_empty()) {
             self.update_selection(self.terminal.vi_mode_cursor.point, Side::Right);
-        } else if self.mouse.left_button_state == ElementState::Pressed
-            || self.mouse.right_button_state == ElementState::Pressed
+        } else if !self.mouse.scrollbar_dragging
+            && (self.mouse.left_button_state == ElementState::Pressed
+                || self.mouse.right_button_state == ElementState::Pressed)
         {
             let display_offset = self.terminal.grid().display_offset();
             let point = self.mouse.point(&self.size_info(), display_offset);
@@ -2578,6 +2579,7 @@ pub struct Mouse {
     pub block_hint_launcher: bool,
     pub hint_highlight_dirty: bool,
     pub inside_text_area: bool,
+    pub scrollbar_dragging: bool,
     pub x: usize,
     pub y: usize,
     /// Accumulated horizontal pixels for the current two-finger pan gesture (macOS tab swipe).
@@ -2605,6 +2607,7 @@ impl Default for Mouse {
             hint_highlight_dirty: Default::default(),
             block_hint_launcher: Default::default(),
             inside_text_area: Default::default(),
+            scrollbar_dragging: Default::default(),
             accumulated_scroll: Default::default(),
             x: Default::default(),
             y: Default::default(),

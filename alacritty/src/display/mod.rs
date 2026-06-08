@@ -81,6 +81,13 @@ const SHORTENER: char = '…';
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
 
+/// Visual scrollbar dimensions.
+pub(crate) const SCROLLBAR_WIDTH: f32 = 6.;
+pub(crate) const SCROLLBAR_MARGIN: f32 = 2.;
+pub(crate) const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 24.;
+const SCROLLBAR_TRACK_ALPHA: f32 = 0.18;
+const SCROLLBAR_THUMB_ALPHA: f32 = 0.65;
+
 #[derive(Debug)]
 pub enum Error {
     /// Error with window management.
@@ -1039,6 +1046,8 @@ impl Display {
         // Draw cursor.
         rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
 
+        self.draw_scrollbar(config, total_lines, display_offset, &mut rects);
+
         // Push visual bell after url/underline/strikeout rects.
         let visual_bell_intensity = self.visual_bell.intensity();
         if visual_bell_intensity != 0. {
@@ -1518,6 +1527,74 @@ impl Display {
             let glyph_cache = &mut self.glyph_cache;
             self.renderer.draw_string(point, fg, bg, text.chars(), &self.size_info, glyph_cache);
         }
+    }
+
+    /// Draw the scrollback scrollbar.
+    fn draw_scrollbar(
+        &mut self,
+        config: &UiConfig,
+        total_lines: usize,
+        display_offset: usize,
+        rects: &mut Vec<RenderRect>,
+    ) {
+        if !config.scrolling.scrollbar || total_lines <= self.size_info.screen_lines() {
+            return;
+        }
+
+        let viewport_lines = self.size_info.screen_lines();
+        let history_lines = total_lines - viewport_lines;
+        if history_lines == 0 {
+            return;
+        }
+
+        let grid_right = self.size_info.padding_x()
+            + self.size_info.columns() as f32 * self.size_info.cell_width();
+        let x = (grid_right - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN).max(0.);
+        let y = self.size_info.padding_y();
+        let height = viewport_lines as f32 * self.size_info.cell_height();
+
+        let thumb_height =
+            (height * viewport_lines as f32 / total_lines as f32).max(SCROLLBAR_MIN_THUMB_HEIGHT);
+        let thumb_height = thumb_height.min(height);
+        let thumb_range = (height - thumb_height).max(0.);
+        let scroll_from_top = history_lines.saturating_sub(display_offset) as f32;
+        let thumb_y = y + thumb_range * scroll_from_top / history_lines as f32;
+
+        rects.push(RenderRect::new(
+            x,
+            y,
+            SCROLLBAR_WIDTH,
+            height,
+            config.colors.primary.foreground,
+            SCROLLBAR_TRACK_ALPHA,
+        ));
+        rects.push(RenderRect::new(
+            x,
+            thumb_y,
+            SCROLLBAR_WIDTH,
+            thumb_height,
+            config.colors.primary.foreground,
+            SCROLLBAR_THUMB_ALPHA,
+        ));
+
+        let damage_x = x as i32;
+        let damage_y = y as i32;
+        let damage_width = (SCROLLBAR_WIDTH + SCROLLBAR_MARGIN).ceil() as i32;
+        let damage_height = height.ceil() as i32;
+        self.damage_tracker.frame().add_viewport_rect(
+            &self.size_info,
+            damage_x,
+            damage_y,
+            damage_width,
+            damage_height,
+        );
+        self.damage_tracker.next_frame().add_viewport_rect(
+            &self.size_info,
+            damage_x,
+            damage_y,
+            damage_width,
+            damage_height,
+        );
     }
 
     /// Highlight damaged rects.

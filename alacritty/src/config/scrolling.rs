@@ -10,13 +10,14 @@ pub const MAX_SCROLLBACK_LINES: u32 = 100_000;
 #[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Scrolling {
     pub multiplier: u8,
+    pub scrollbar: bool,
 
     history: ScrollingHistory,
 }
 
 impl Default for Scrolling {
     fn default() -> Self {
-        Self { multiplier: 3, history: Default::default() }
+        Self { multiplier: 3, scrollbar: true, history: Default::default() }
     }
 }
 

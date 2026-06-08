@@ -43,7 +43,9 @@ use crate::config::{
 };
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
-use crate::display::{Display, SizeInfo};
+use crate::display::{
+    Display, SCROLLBAR_MARGIN, SCROLLBAR_MIN_THUMB_HEIGHT, SCROLLBAR_WIDTH, SizeInfo,
+};
 use crate::event::{
     ClickState, Event, EventType, InlineSearchState, Mouse, TouchPurpose, TouchZoom,
 };
@@ -587,6 +589,17 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
 
+        if self.ctx.mouse().scrollbar_dragging {
+            if lmb_pressed {
+                self.scroll_to_scrollbar_position(y);
+                self.ctx.window().set_mouse_cursor(CursorIcon::Default);
+                self.ctx.mouse_mut().block_hint_launcher = true;
+            } else {
+                self.ctx.mouse_mut().scrollbar_dragging = false;
+            }
+            return;
+        }
+
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
 
@@ -811,6 +824,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
+        if button == MouseButton::Left && mem::take(&mut self.ctx.mouse_mut().scrollbar_dragging) {
+            return;
+        }
+
         if !uses_local_selection(self.ctx.mouse_mode(), self.ctx.modifiers().state()) {
             let code = match button {
                 MouseButton::Left => 0,
@@ -1173,6 +1190,24 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             _ => (),
         }
 
+        if button == MouseButton::Left {
+            match state {
+                ElementState::Pressed if self.over_scrollbar() => {
+                    self.ctx.mouse_mut().click_state = ClickState::None;
+                    self.ctx.mouse_mut().block_hint_launcher = true;
+                    self.ctx.mouse_mut().scrollbar_dragging = true;
+                    self.scroll_to_scrollbar_position(self.ctx.mouse().y);
+                    self.ctx.window().set_mouse_cursor(CursorIcon::Default);
+                    return;
+                },
+                ElementState::Released if self.ctx.mouse().scrollbar_dragging => {
+                    self.ctx.mouse_mut().scrollbar_dragging = false;
+                    return;
+                },
+                _ => (),
+            }
+        }
+
         // Skip normal mouse events if the message bar has been clicked.
         if self.message_bar_cursor_state() == Some(CursorIcon::Pointer)
             && state == ElementState::Pressed
@@ -1287,12 +1322,83 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         if let Some(mouse_state) = self.message_bar_cursor_state() {
             mouse_state
+        } else if self.over_scrollbar() {
+            CursorIcon::Default
         } else if self.ctx.display().highlighted_hint.as_ref().is_some_and(hint_highlighted) {
             CursorIcon::Pointer
         } else if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
             CursorIcon::Default
         } else {
             CursorIcon::Text
+        }
+    }
+
+    /// Scrollbar track geometry as `(x, y, height)` in viewport pixels.
+    fn scrollbar_geometry(&self) -> Option<(f64, f64, f64)> {
+        if !self.ctx.config().scrolling.scrollbar {
+            return None;
+        }
+
+        let size = self.ctx.size_info();
+        let total_lines = self.ctx.terminal().grid().total_lines();
+        let viewport_lines = size.screen_lines();
+        if total_lines <= viewport_lines {
+            return None;
+        }
+
+        let grid_right = size.padding_x() + size.columns() as f32 * size.cell_width();
+        let x = (grid_right - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN).max(0.) as f64;
+        let y = size.padding_y() as f64;
+        let height = viewport_lines as f64 * size.cell_height() as f64;
+
+        Some((x, y, height))
+    }
+
+    /// Check whether the mouse is above the scrollback scrollbar.
+    fn over_scrollbar(&self) -> bool {
+        let mouse = self.ctx.mouse();
+        let Some((x, y, height)) = self.scrollbar_geometry() else {
+            return false;
+        };
+
+        let mouse_x = mouse.x as f64;
+        let mouse_y = mouse.y as f64;
+        mouse_x >= x
+            && mouse_x <= x + f64::from(SCROLLBAR_WIDTH + SCROLLBAR_MARGIN)
+            && mouse_y >= y
+            && mouse_y <= y + height
+    }
+
+    /// Move the scrollback viewport based on a click or drag within the scrollbar.
+    fn scroll_to_scrollbar_position(&mut self, y: usize) {
+        let Some((_, track_y, track_height)) = self.scrollbar_geometry() else {
+            return;
+        };
+
+        let size = self.ctx.size_info();
+        let viewport_lines = size.screen_lines();
+        let total_lines = self.ctx.terminal().grid().total_lines();
+        let history_lines = total_lines.saturating_sub(viewport_lines);
+        if history_lines == 0 {
+            return;
+        }
+
+        let thumb_height = (track_height * viewport_lines as f64 / total_lines as f64)
+            .max(f64::from(SCROLLBAR_MIN_THUMB_HEIGHT))
+            .min(track_height);
+        let thumb_range = (track_height - thumb_height).max(0.);
+        if thumb_range == 0. {
+            return;
+        }
+
+        let scroll_from_top =
+            ((y as f64 - track_y - thumb_height / 2.) / thumb_range).clamp(0., 1.);
+        let target_offset =
+            history_lines.saturating_sub((scroll_from_top * history_lines as f64).round() as usize);
+        let current_offset = self.ctx.terminal().grid().display_offset();
+        let delta = target_offset as i32 - current_offset as i32;
+        if delta != 0 {
+            self.ctx.scroll(Scroll::Delta(delta));
         }
     }
 
