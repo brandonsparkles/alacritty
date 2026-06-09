@@ -79,6 +79,7 @@ fi
 
 # Upload the file to the tag's release.
 file_name=${file_path##*/}
+encoded_file_name=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$file_name")
 echo "Uploading asset $file_name to $upload_url..."
 curl -f \
     --http1.1 \
@@ -86,7 +87,7 @@ curl -f \
     -H "Authorization: Bearer $bearer" \
     -H "Content-Type: application/octet-stream" \
     --data-binary @"$file_path" \
-    "$upload_url?name=$file_name" \
+    "$upload_url?name=$encoded_file_name" \
     &> /dev/null \
 || { \
     printf "\e[31mError: Unable to upload asset.\e[0m\n" \
