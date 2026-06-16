@@ -84,7 +84,7 @@ the restore logic:
 
 ```toml
 [ai_resume.claude]
-flags = ["--dangerously-skip-permissions"]
+flags = ["--permission-mode", "auto"]
 
 [ai_resume.codex]
 flags = ["--dangerously-bypass-approvals-and-sandbox"]

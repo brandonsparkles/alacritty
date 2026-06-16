@@ -324,7 +324,7 @@ pub struct WindowOptions {
     #[cfg(target_os = "macos")]
     /// Shell command to dispatch into the new PTY once the shell prompts,
     /// restored from a previous session. Typically an allowlisted AI CLI
-    /// resume command with permissive flags so the tab's prior conversation
+    /// resume command with configured flags so the tab's prior conversation
     /// picks up where it left off.
     /// See `cli_resume.rs`.
     pub restored_resume_command: Option<String>,
