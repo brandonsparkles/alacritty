@@ -15,7 +15,8 @@
 //! | claude               | `~/.claude/sessions/<pid>.json` → `sessionId`  | `claude <flags> --resume <id>`        |
 //! | copilot              | `~/.copilot/logs/process-<ts>-<pid>.log` last  | `copilot <flags> --resume=<id>`       |
 //! |                      | "Registering foreground session: <uuid>" entry |                                       |
-//! | codex / codexpilot   | argv `resume <uuid>` or rollout metadata       | `<program> <flags> resume <id>`       |
+//! | codex / codexpilot   | argv `resume <uuid>`, else the rollout         | `<program> <flags> resume <id>`       |
+//! |                      | `.jsonl` the process holds OPEN                |                                       |
 //!
 //! Tools are matched by their resolved binary path (via `proc_pidpath`),
 //! not `pbi_comm`, because `pbi_comm` is truncated to 15 chars and reflects
@@ -24,11 +25,22 @@
 //! ## Codex caveat
 //!
 //! codex stores sessions as `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`
-//! with no PID-keyed marker we can use to map a fresh running codex process
-//! back to its specific session. If codex was started by our restore command,
-//! argv contains `resume <uuid>` and wins; otherwise we join by process start
-//! time and cwd. We deliberately do not persist `resume --last` because it
-//! makes multiple restored tabs open the same most-recent conversation.
+//! and writes no PID-keyed marker. If codex was started by our restore command,
+//! argv contains `resume <uuid>` and wins; otherwise we read the rollout out of
+//! the process's open-file table.
+//!
+//! We previously joined PID→session by start-time proximity (rollout timestamp
+//! within 10 minutes after `pbi_start_tvsec`, in the process-start date dir).
+//! That silently resolved almost nothing in practice: **resuming a conversation
+//! appends to its ORIGINAL rollout file**, so a session picked from codex's
+//! in-TUI history carries a filename timestamp from the day it was born — days
+//! or weeks before the current process — failing both the date-dir lookup and
+//! the "at or after process start" bound. Only a brand-new conversation that
+//! got its first prompt within 10 minutes of launch ever matched, which is why
+//! a multi-tab restore came back with at most one live codex session.
+//!
+//! We deliberately do not persist `resume --last` because it makes multiple
+//! restored tabs open the same most-recent conversation.
 
 #![cfg(target_os = "macos")]
 
@@ -229,26 +241,13 @@ fn codex_program_for_binary(p: &str) -> Option<&'static str> {
     None
 }
 
-/// codex doesn't write PID-keyed session metadata anywhere, but each
-/// codex process creates exactly one rollout `.jsonl` file shortly after
-/// it starts:
+/// codex doesn't write PID-keyed session metadata anywhere, but it keeps the
+/// rollout `.jsonl` of every session it is serving OPEN:
 ///
 ///   `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<iso-ts>-<session-uuid>.jsonl`
 ///
-/// We can recover the per-PID session ID by joining `pbi_start_tvsec`
-/// against the filename's timestamp:
-///
-///  1. Read the codex process's start time.
-///  2. Walk the rollouts in today's and yesterday's date dirs (handles a
-///     codex session that spans midnight).
-///  3. Open each rollout's first record (a `session_meta` line) and keep
-///     only those whose `payload.cwd` matches the tab's cwd AND whose
-///     `payload.source` is *not* a `subagent` (we want user-initiated
-///     sessions, not codex's internal subagent rollouts).
-///  4. Score each candidate by `|filename_timestamp - process_start|` and
-///     pick the smallest delta within a reasonable window.
-///
-/// Returns `None` when no exact session can be recovered. Replaying
+/// So we read the process's open-file table instead of guessing from
+/// timestamps. Returns `None` when no session can be recovered. Replaying
 /// `codex resume --last` is intentionally avoided because it makes multiple
 /// restored tabs collapse into the same newest conversation.
 fn codex_resume(
@@ -370,146 +369,106 @@ fn codex_resume_id_from_args(args: &[&str]) -> Option<String> {
 }
 
 fn codex_session_for_pid(pid: c_int, cwd: &Path) -> Option<String> {
-    let start_tvsec = crate::macos::proc::start_tvsec(pid)?;
-    let cwd_str = cwd.to_str()?;
-
-    let mut sessions_root = home::home_dir()?;
-    sessions_root.push(".codex");
-    sessions_root.push("sessions");
-
-    codex_session_for_pid_with(&sessions_root, start_tvsec, cwd_str)
+    let open_paths = crate::macos::proc::open_file_paths(pid);
+    codex_session_from_open_paths(&open_paths, cwd.to_str().unwrap_or(""))
 }
 
-/// Testable inner implementation. Accepts the sessions root directory and
-/// process start timestamp as parameters so tests can work with a `TempDir`
-/// and fabricated timestamps without calling into the kernel or `home_dir`.
-fn codex_session_for_pid_with(
-    sessions_root: &Path,
-    start_tvsec: u64,
-    cwd_str: &str,
-) -> Option<String> {
-    // Walk the date dirs touched by the accepted rollout window. Candidates
-    // must be within 10 minutes after process start, so wall-clock "today"
-    // is irrelevant and makes long-running sessions/test fixtures stale.
-    let start_dt = chrono::DateTime::from_timestamp(i64::try_from(start_tvsec).ok()?, 0)?;
-    let window_end = start_dt + chrono::Duration::seconds(600);
-    let date_dirs =
-        [date_dir_for(sessions_root, start_dt), date_dir_for(sessions_root, window_end)];
-
-    // We want the rollout this codex process CREATED — which must have a
-    // timestamp at or after the process start. Picking "closest |Δt|" is
-    // wrong for multi-codex-same-cwd: a slightly-older rollout written by
-    // a sibling codex can win for both PIDs. Pick the EARLIEST rollout
-    // whose timestamp is >= process start. UUIDs already claimed by a
-    // sibling window in the same save-tick are skipped, so two codex
-    // tabs that started in the same second still resolve to distinct
-    // sessions.
+/// Testable inner implementation. Takes the already-collected list of open
+/// file paths so tests can supply fixtures without calling into the kernel.
+///
+/// A busy codex process holds MANY rollouts open at once: one per in-flight
+/// subagent thread plus the user's own conversation. Only the latter is
+/// meaningful to resume, and it is distinguishable — subagent rollouts carry
+/// `payload.source.subagent`, the user session carries `source: "cli"`.
+///
+/// Ranking among surviving candidates is `(cwd match, mtime)`, highest wins.
+/// Unlike the old timestamp matcher, a cwd mismatch only DEMOTES a candidate
+/// rather than rejecting it: the open fd already proves this process owns the
+/// session, so a user who `cd`s before launching codex (making the tab's cwd
+/// differ from the recorded session cwd) should still get their conversation
+/// back. mtime breaks the remaining tie toward the most recently active
+/// conversation, which is the right answer after an in-process `/new`.
+fn codex_session_from_open_paths(open_paths: &[std::path::PathBuf], cwd: &str) -> Option<String> {
+    // UUIDs already taken by a sibling window in this save-tick are skipped.
+    // Distinct codex processes hold distinct fds so collisions shouldn't
+    // happen, but claiming keeps two tabs from ever persisting the same id.
     let claimed: HashSet<String> = claimed_set().lock().map(|g| g.clone()).unwrap_or_default();
-    let mut earliest: Option<(u64, String)> = None;
-    for dir in date_dirs.iter().flatten() {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let fname = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if !fname.starts_with("rollout-") || !fname.ends_with(".jsonl") {
-                continue;
-            }
-            // `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl`
-            let body = &fname["rollout-".len()..fname.len() - ".jsonl".len()];
-            if body.len() <= 20 {
-                continue;
-            }
-            let ts_part = &body[..19];
-            let uuid_part = &body[20..];
-            let file_ts = match parse_codex_ts(ts_part) {
-                Some(t) => t,
-                None => continue,
-            };
-            // Must be at or after process start AND within 10 minutes.
-            // 10-minute window accommodates a slow codex startup or a
-            // delayed first user prompt that triggers rollout creation.
-            if file_ts < start_tvsec || file_ts > start_tvsec + 600 {
-                continue;
-            }
-            if claimed.contains(uuid_part) {
-                continue;
-            }
-            if !rollout_matches_cwd_and_user(&path, cwd_str) {
-                continue;
-            }
-            if earliest.as_ref().is_none_or(|(t, _)| file_ts < *t) {
-                earliest = Some((file_ts, uuid_part.to_string()));
-            }
+
+    let mut best: Option<((bool, i64), String)> = None;
+    for path in open_paths {
+        let Some(uuid) = rollout_uuid_from_path(path) else { continue };
+        if claimed.contains(&uuid) {
+            continue;
+        }
+        let Some(meta) = rollout_session_meta(path) else { continue };
+        if meta.is_subagent {
+            continue;
+        }
+        let rank = (meta.cwd == cwd, rollout_mtime(path));
+        if best.as_ref().is_none_or(|(best_rank, _)| *best_rank < rank) {
+            best = Some((rank, uuid));
         }
     }
-    if let Some((_, uuid)) = earliest.as_ref() {
-        if let Ok(mut g) = claimed_set().lock() {
-            g.insert(uuid.clone());
-        }
+
+    let uuid = best.map(|(_, uuid)| uuid)?;
+    if let Ok(mut g) = claimed_set().lock() {
+        g.insert(uuid.clone());
     }
-    earliest.map(|(_, uuid)| uuid)
+    Some(uuid)
 }
 
-fn date_dir_for(root: &Path, dt: chrono::DateTime<chrono::Utc>) -> Option<std::path::PathBuf> {
-    use chrono::Datelike;
-    // Codex anchors both its date dirs and rollout-filename timestamps to
-    // LOCAL time, not UTC (verified empirically — a Chicago user running
-    // codex at 20:08 local writes files into `/2026/05/21/` even though
-    // UTC is already 01:08 of the next day).
-    let local = dt.with_timezone(&chrono_tz::America::Chicago);
-    let mut p = root.to_path_buf();
-    p.push(format!("{:04}", local.year()));
-    p.push(format!("{:02}", local.month()));
-    p.push(format!("{:02}", local.day()));
-    Some(p)
+/// Extract the session UUID from a `rollout-<iso-ts>-<uuid>.jsonl` path.
+/// `None` for any path that isn't a codex rollout.
+fn rollout_uuid_from_path(path: &Path) -> Option<String> {
+    // Guard on the containing `.codex/sessions` tree so an unrelated file that
+    // happens to be named `rollout-…jsonl` can't be mistaken for a session.
+    if !path.to_str()?.contains("/.codex/sessions/") {
+        return None;
+    }
+    let fname = path.file_name()?.to_str()?;
+    if !fname.starts_with("rollout-") || !fname.ends_with(".jsonl") {
+        return None;
+    }
+    // `rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl` — 19-char timestamp, then the uuid.
+    let body = &fname["rollout-".len()..fname.len() - ".jsonl".len()];
+    if body.len() <= 20 {
+        return None;
+    }
+    Some(body[20..].to_string())
 }
 
-fn parse_codex_ts(s: &str) -> Option<u64> {
-    // Format: "YYYY-MM-DDTHH-MM-SS". Codex emits these in the user's
-    // local timezone (NOT UTC). For a Chicago user that's CST/CDT —
-    // chrono-tz handles DST automatically.
-    use chrono::TimeZone;
-    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H-%M-%S").ok()?;
-    let dt = chrono_tz::America::Chicago.from_local_datetime(&naive).single()?;
-    Some(dt.timestamp() as u64)
+/// Last-modified time in whole seconds, or 0 when unreadable. Used only for
+/// ranking, so a missing value just sorts last.
+fn rollout_mtime(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-fn rollout_matches_cwd_and_user(path: &Path, cwd: &str) -> bool {
-    use std::io::{BufRead, BufReader};
-    let f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
+struct RolloutMeta {
+    cwd: String,
+    is_subagent: bool,
+}
+
+/// Parse the leading `session_meta` record of a rollout.
+fn rollout_session_meta(path: &Path) -> Option<RolloutMeta> {
+    let f = File::open(path).ok()?;
     let mut line = String::new();
-    if BufReader::new(f).read_line(&mut line).is_err() {
-        return false;
-    }
-    let v: serde_json::Value = match serde_json::from_str(&line) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let payload = match v.get("payload") {
-        Some(p) => p,
-        None => return false,
-    };
-    let file_cwd = payload.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
-    if file_cwd != cwd {
-        return false;
-    }
-    // Reject subagent rollouts — only user-initiated sessions are
-    // meaningful to resume.
-    if let Some(source) = payload.get("source") {
-        if source.is_object() && source.get("subagent").is_some() {
-            return false;
-        }
-    }
-    true
+    BufReader::new(f).read_line(&mut line).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+    let payload = v.get("payload")?;
+    // Subagent rollouts carry `source: {"subagent": {...}}`; user-initiated
+    // sessions carry `source: "cli"`.
+    let is_subagent = payload
+        .get("source")
+        .is_some_and(|source| source.is_object() && source.get("subagent").is_some());
+    Some(RolloutMeta {
+        cwd: payload.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+        is_subagent,
+    })
 }
 
 #[cfg(test)]
@@ -684,196 +643,195 @@ mod tests {
         config
     }
 
-    // ── parse_codex_ts ────────────────────────────────────────────────────
+    // ── rollout_uuid_from_path ────────────────────────────────────────────
 
     #[test]
-    fn parse_codex_ts_valid_cst() {
-        // 2026-01-15 10:00:00 CST (UTC-6) = 2026-01-15 16:00:00 UTC.
-        // Verified: chrono-tz parses this to unix 1768492800.
-        let ts = parse_codex_ts("2026-01-15T10-00-00");
-        assert!(ts.is_some(), "should parse valid CST timestamp");
-        let v = ts.unwrap();
-        assert_eq!(v, 1768492800, "unexpected unix timestamp: {v}");
+    fn rollout_uuid_parses_session_path() {
+        let p = std::path::PathBuf::from(
+            "/Users/x/.codex/sessions/2026/07/25/rollout-2026-07-25T16-11-06-019f9b1e-1076-7d10-941b-136a6d4291ad.jsonl",
+        );
+        assert_eq!(
+            rollout_uuid_from_path(&p).as_deref(),
+            Some("019f9b1e-1076-7d10-941b-136a6d4291ad")
+        );
     }
 
     #[test]
-    fn parse_codex_ts_valid_cdt() {
-        // 2026-07-04 12:00:00 CDT (UTC-5) = 2026-07-04 17:00:00 UTC.
-        // Verified: chrono-tz parses this to unix 1783184400.
-        let ts = parse_codex_ts("2026-07-04T12-00-00");
-        assert!(ts.is_some(), "should parse valid CDT timestamp");
-        let v = ts.unwrap();
-        assert_eq!(v, 1783184400, "unexpected unix timestamp: {v}");
+    fn rollout_uuid_rejects_non_session_paths() {
+        // Right name, wrong tree — an ordinary open file must never be
+        // mistaken for a session.
+        let outside = std::path::PathBuf::from(
+            "/tmp/rollout-2026-07-25T16-11-06-019f9b1e-1076-7d10-941b-136a6d4291ad.jsonl",
+        );
+        assert!(rollout_uuid_from_path(&outside).is_none());
+
+        // Right tree, not a rollout.
+        let other =
+            std::path::PathBuf::from("/Users/x/.codex/sessions/2026/07/25/notes.jsonl");
+        assert!(rollout_uuid_from_path(&other).is_none());
+
+        // Truncated body with no uuid.
+        let short = std::path::PathBuf::from(
+            "/Users/x/.codex/sessions/2026/07/25/rollout-2026-07-25T16-11-06.jsonl",
+        );
+        assert!(rollout_uuid_from_path(&short).is_none());
     }
 
-    #[test]
-    fn parse_codex_ts_spring_forward_nonexistent_time_returns_none() {
-        // 2026-03-08 02:30:00 local (Chicago) doesn't exist — clocks spring
-        // forward from 02:00 to 03:00. `single()` returns None.
-        let ts = parse_codex_ts("2026-03-08T02-30-00");
-        assert!(ts.is_none(), "nonexistent DST spring-forward time should return None");
-    }
+    // ── codex_session_from_open_paths ─────────────────────────────────────
 
-    #[test]
-    fn parse_codex_ts_fall_back_ambiguous_time_returns_none() {
-        // 2026-11-01 01:30:00 local (Chicago) is ambiguous — clocks fall
-        // back from 02:00 to 01:00, so 01:30 occurs twice. `single()` returns None.
-        let ts = parse_codex_ts("2026-11-01T01-30-00");
-        assert!(ts.is_none(), "ambiguous DST fall-back time should return None");
-    }
-
-    #[test]
-    fn parse_codex_ts_malformed_returns_none() {
-        assert!(parse_codex_ts("not-a-timestamp").is_none());
-        assert!(parse_codex_ts("").is_none());
-        assert!(parse_codex_ts("2026/01/01 10:00:00").is_none());
-    }
-
-    // ── codex_session_for_pid_with ────────────────────────────────────────
-
-    /// Build a session file tree and return the sessions root path.
+    /// Write a rollout fixture and return its path.
     ///
-    /// Each entry in `rollouts` is:
-    ///   `(date_subpath, ts_str, uuid, cwd, is_subagent)`
-    ///
-    /// `date_subpath` is relative under `sessions_root`, e.g. `"2026/05/21"`.
-    fn make_sessions_root(
+    /// `source` is the raw JSON for `payload.source` — `"\"cli\""` for a user
+    /// session, `r#"{"subagent": {...}}"#` for a subagent thread.
+    fn make_rollout(
         tmp: &tempfile::TempDir,
-        rollouts: &[(&str, &str, &str, &str, bool)],
+        date_sub: &str,
+        ts: &str,
+        uuid: &str,
+        cwd: &str,
+        is_subagent: bool,
     ) -> std::path::PathBuf {
-        let root = tmp.path().join("sessions");
-        for (date_sub, ts, uuid, cwd, is_subagent) in rollouts {
-            let dir = root.join(date_sub);
-            std::fs::create_dir_all(&dir).unwrap();
-            let fname = format!("rollout-{}-{}.jsonl", ts, uuid);
-            let source = if *is_subagent { r#"{"subagent": true}"# } else { r#""user""# };
-            let line = format!(
-                r#"{{"type":"session_meta","payload":{{"cwd":"{}","source":{}}}}}"#,
-                cwd, source
-            );
-            std::fs::write(dir.join(fname), line).unwrap();
-        }
-        root
+        // Mirror the real layout so the `/.codex/sessions/` guard is exercised.
+        let dir = tmp.path().join(".codex").join("sessions").join(date_sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-{}-{}.jsonl", ts, uuid));
+        let source = if is_subagent {
+            r#"{"subagent": {"thread_spawn": {"parent_thread_id": "019f9b1f-687f-7ae2"}}}"#
+        } else {
+            r#""cli""#
+        };
+        let line = format!(
+            r#"{{"type":"session_meta","payload":{{"cwd":"{}","source":{}}}}}"#,
+            cwd, source
+        );
+        std::fs::write(&path, line).unwrap();
+        path
     }
 
-    /// Parse a Chicago-local timestamp string ("YYYY-MM-DDTHH-MM-SS") to unix seconds.
-    /// Panics if the timestamp is invalid — test helper only.
-    fn ts_to_unix(s: &str) -> u64 {
-        parse_codex_ts(s).unwrap_or_else(|| panic!("bad ts: {s}"))
+    /// Stamp a file's mtime, so ranking tests don't depend on write order.
+    fn set_mtime(path: &Path, unix_secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs)).unwrap();
     }
 
     #[test]
-    fn earliest_after_start_wins() {
-        // Two rollouts for the same cwd: one at T+1, one at T+60. The one at T+1 wins.
+    fn open_rollout_resolves_regardless_of_age() {
+        // The regression this whole path exists for: a resumed conversation's
+        // rollout is dated days before the process, which the old start-time
+        // matcher rejected outright. Held open, it must still resolve.
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
-        let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        // T+1 = start+1 s, T+60 = start+60s.
-        // Build filenames from Chicago local equivalents of start+1 and start+60.
-        // Since start is in CDT (UTC-5), start_ts = 10:00 CDT = 15:00 UTC.
-        // start+1: ts string "2026-05-21T10-00-01" → parse_codex_ts would give start_ts+1,
-        // but parse_codex_ts only handles exact local-time strings; use distinct minute offsets.
-        let ts_early = "2026-05-21T10-01-00"; // 10:01 CDT = start+60s
-        let ts_late = "2026-05-21T10-05-00"; // 10:05 CDT = start+300s
-        let root = make_sessions_root(
-            &tmp,
-            &[
-                ("2026/05/21", ts_early, "uuid-early", cwd, false),
-                ("2026/05/21", ts_late, "uuid-late", cwd, false),
-            ],
-        );
+        let old = make_rollout(&tmp, "2026/07/11", "2026-07-11T16-36-37", "uuid-old", cwd, false);
         begin_save_tick();
-        let result = codex_session_for_pid_with(&root, start_ts, cwd).unwrap();
-        assert_eq!(result, "uuid-early", "earlier timestamp should win");
+        assert_eq!(
+            codex_session_from_open_paths(&[old], cwd).as_deref(),
+            Some("uuid-old"),
+            "an old-but-open rollout should resolve"
+        );
     }
 
     #[test]
-    fn cwd_mismatch_is_rejected() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        let root = make_sessions_root(
-            &tmp,
-            &[("2026/05/21", "2026-05-21T10-01-00", "uuid-wrong-cwd", "/other/project", false)],
-        );
-        begin_save_tick();
-        let result = codex_session_for_pid_with(&root, start_ts, "/Users/x/project");
-        assert!(result.is_none(), "cwd mismatch should be rejected");
-    }
-
-    #[test]
-    fn subagent_source_is_rejected() {
+    fn subagent_rollouts_are_ignored() {
+        // Shape taken from a live busy codex: one `cli` session plus a pile of
+        // subagent threads, all held open by the same process.
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
-        let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        let root = make_sessions_root(
-            &tmp,
-            &[("2026/05/21", "2026-05-21T10-01-00", "uuid-subagent", cwd, true)],
-        );
+        let user = make_rollout(&tmp, "2026/07/25", "2026-07-25T16-12-34", "uuid-user", cwd, false);
+        let sub_a = make_rollout(&tmp, "2026/07/27", "2026-07-27T04-20-32", "uuid-sub-a", cwd, true);
+        let sub_b = make_rollout(&tmp, "2026/07/27", "2026-07-27T11-14-51", "uuid-sub-b", cwd, true);
+        // Subagents are NEWER than the user session — mtime must not save them.
+        set_mtime(&user, 1_000);
+        set_mtime(&sub_a, 9_000);
+        set_mtime(&sub_b, 9_999);
+
         begin_save_tick();
-        let result = codex_session_for_pid_with(&root, start_ts, cwd);
-        assert!(result.is_none(), "subagent rollout should be rejected");
+        assert_eq!(
+            codex_session_from_open_paths(&[sub_a, user, sub_b], cwd).as_deref(),
+            Some("uuid-user"),
+            "only the user-initiated session should be resumable"
+        );
     }
 
     #[test]
-    fn rollout_before_process_start_is_rejected() {
+    fn cwd_match_outranks_mtime() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
-        let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        // Rollout at 09:58 is 2 minutes BEFORE process start.
-        let root = make_sessions_root(
-            &tmp,
-            &[("2026/05/21", "2026-05-21T09-58-00", "uuid-before", cwd, false)],
-        );
+        let elsewhere =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-00-00", "uuid-other", "/other", false);
+        let here =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-01-00", "uuid-here", cwd, false);
+        set_mtime(&here, 1_000);
+        set_mtime(&elsewhere, 9_000);
+
         begin_save_tick();
-        let result = codex_session_for_pid_with(&root, start_ts, cwd);
-        assert!(result.is_none(), "rollout before process start should be rejected");
+        assert_eq!(
+            codex_session_from_open_paths(&[elsewhere, here], cwd).as_deref(),
+            Some("uuid-here"),
+            "the session matching the tab's cwd should win despite older mtime"
+        );
     }
 
     #[test]
-    fn rollout_more_than_10min_after_start_is_rejected() {
+    fn cwd_mismatch_is_demoted_not_rejected() {
+        // Launching codex after a `cd` leaves the tab cwd differing from the
+        // recorded session cwd. The open fd still proves ownership.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let other =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-00-00", "uuid-other", "/other", false);
+        begin_save_tick();
+        assert_eq!(
+            codex_session_from_open_paths(&[other], "/Users/x/project").as_deref(),
+            Some("uuid-other"),
+            "sole candidate should resolve even when cwd differs"
+        );
+    }
+
+    #[test]
+    fn newest_wins_among_equal_cwd() {
+        // After an in-process `/new`, codex may still hold the prior
+        // conversation open; the active one is the more recently written.
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
-        let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        // Rollout at 10:11 = start + 11 min > 10-min window.
-        let root = make_sessions_root(
-            &tmp,
-            &[("2026/05/21", "2026-05-21T10-11-00", "uuid-too-late", cwd, false)],
-        );
+        let older =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-00-00", "uuid-older", cwd, false);
+        let newer =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-01-00", "uuid-newer", cwd, false);
+        set_mtime(&older, 1_000);
+        set_mtime(&newer, 2_000);
+
         begin_save_tick();
-        let result = codex_session_for_pid_with(&root, start_ts, cwd);
-        assert!(result.is_none(), "rollout >10 min after start should be rejected");
+        assert_eq!(
+            codex_session_from_open_paths(&[older, newer], cwd).as_deref(),
+            Some("uuid-newer")
+        );
     }
 
     #[test]
     fn claimed_uuid_is_not_returned_twice() {
-        // Two calls with the same sessions root simulate two tabs with the same cwd.
-        // The first call claims the earliest UUID; the second must return the next.
+        // Two tabs in one save tick must never persist the same session id.
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
-        let start_ts = ts_to_unix("2026-05-21T10-00-00");
-        let root = make_sessions_root(
-            &tmp,
-            &[
-                ("2026/05/21", "2026-05-21T10-01-00", "uuid-first", cwd, false),
-                ("2026/05/21", "2026-05-21T10-02-00", "uuid-second", cwd, false),
-            ],
-        );
-        // Reset claimed set as begin_save_tick would do at the start of a save cycle.
+        let first =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-01-00", "uuid-first", cwd, false);
+        let second =
+            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-02-00", "uuid-second", cwd, false);
+        set_mtime(&first, 2_000);
+        set_mtime(&second, 1_000);
+
         begin_save_tick();
-        let first = codex_session_for_pid_with(&root, start_ts, cwd);
-        // Don't call begin_save_tick between tabs — same save tick.
-        let second = codex_session_for_pid_with(&root, start_ts, cwd);
-        assert_eq!(first.as_deref(), Some("uuid-first"), "first tab should get earliest");
-        assert_eq!(second.as_deref(), Some("uuid-second"), "second tab should get next");
+        let paths = vec![first, second];
+        let a = codex_session_from_open_paths(&paths, cwd);
+        // No begin_save_tick between tabs — same save tick.
+        let b = codex_session_from_open_paths(&paths, cwd);
+        assert_eq!(a.as_deref(), Some("uuid-first"));
+        assert_eq!(b.as_deref(), Some("uuid-second"), "second tab must not reuse the first id");
     }
 
     #[test]
-    fn no_rollouts_returns_none() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path().join("sessions");
-        std::fs::create_dir_all(&root).unwrap();
+    fn no_open_rollouts_returns_none() {
         begin_save_tick();
-        let result = codex_session_for_pid_with(&root, 1_000_000, "/any/cwd");
-        assert!(result.is_none());
+        let unrelated = std::path::PathBuf::from("/usr/lib/libSystem.dylib");
+        assert!(codex_session_from_open_paths(&[unrelated], "/any/cwd").is_none());
+        assert!(codex_session_from_open_paths(&[], "/any/cwd").is_none());
     }
 }

@@ -164,10 +164,13 @@ pub fn comm(pid: c_int) -> Option<String> {
 }
 
 /// Wall-clock time (Unix seconds) when `pid` started, via the kernel's
-/// `pbi_start_tvsec`. `None` on any error. Used by `cli_resume.rs` to
-/// match a running codex process to its rollout `.jsonl` file (codex
-/// writes no PID-keyed metadata, but its rollout filenames encode the
-/// session-start timestamp, so we can join by proximity).
+/// `pbi_start_tvsec`. `None` on any error.
+///
+/// Currently unused — `cli_resume.rs` used to join codex processes to their
+/// rollout files by start-time proximity, but that heuristic breaks for
+/// resumed sessions (see [`open_file_paths`]). Kept available for future
+/// callers that want process age.
+#[allow(dead_code)]
 pub fn start_tvsec(pid: c_int) -> Option<u64> {
     let mut info = MaybeUninit::<sys::proc_bsdinfo>::uninit();
     let size = mem::size_of::<sys::proc_bsdinfo>() as c_int;
@@ -240,6 +243,73 @@ pub fn argv(pid: c_int) -> Option<Vec<String>> {
     (!args.is_empty()).then_some(args)
 }
 
+/// Return the filesystem paths of every regular file `pid` currently holds
+/// open. Silently skips fds that aren't vnodes or that vanish mid-walk.
+///
+/// This is the authoritative way to tie a process to the session file it
+/// owns. `cli_resume.rs` uses it for codex, which writes no PID-keyed
+/// metadata: joining a codex PID to its rollout `.jsonl` by start-time
+/// proximity fails outright for resumed conversations, because codex appends
+/// to the ORIGINAL rollout rather than creating a new one — so the filename
+/// timestamp is the birth of the conversation, often days before the process.
+/// The open fd has no such skew.
+pub fn open_file_paths(pid: c_int) -> Vec<PathBuf> {
+    // First call with a null buffer asks the kernel how many bytes it needs.
+    let needed =
+        unsafe { sys::proc_pidinfo(pid, sys::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+
+    let count = needed as usize / mem::size_of::<sys::proc_fdinfo>();
+    // Add slack — the fd table can grow between the size query and the read.
+    let mut buf: Vec<sys::proc_fdinfo> =
+        vec![sys::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; count + 16];
+    let buf_bytes = (buf.len() * mem::size_of::<sys::proc_fdinfo>()) as c_int;
+    let actual = unsafe {
+        sys::proc_pidinfo(
+            pid,
+            sys::PROC_PIDLISTFDS,
+            0,
+            buf.as_mut_ptr() as *mut c_void,
+            buf_bytes,
+        )
+    };
+    if actual <= 0 {
+        return Vec::new();
+    }
+    let n = actual as usize / mem::size_of::<sys::proc_fdinfo>();
+
+    let size = mem::size_of::<sys::vnode_fdinfowithpath>() as c_int;
+    let mut paths = Vec::new();
+    for entry in buf.iter().take(n) {
+        if entry.proc_fdtype != sys::PROX_FDTYPE_VNODE {
+            continue;
+        }
+        let mut info = MaybeUninit::<sys::vnode_fdinfowithpath>::uninit();
+        let res = unsafe {
+            sys::proc_pidfdinfo(
+                pid,
+                entry.proc_fd,
+                sys::PROC_PIDFDVNODEPATHINFO,
+                info.as_mut_ptr() as *mut c_void,
+                size,
+            )
+        };
+        // A closed/replaced fd returns a short read; skip rather than fail the walk.
+        if res != size {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        let c_str = unsafe { CStr::from_ptr(info.pvip.vip_path.as_ptr()) };
+        match c_str.to_str() {
+            Ok(s) if !s.is_empty() => paths.push(PathBuf::from(s)),
+            _ => continue,
+        }
+    }
+    paths
+}
+
 pub fn cwd(pid: c_int) -> Result<PathBuf, Error> {
     let mut info = MaybeUninit::<sys::proc_vnodepathinfo>::uninit();
     let info_ptr = info.as_mut_ptr() as *mut c_void;
@@ -264,6 +334,13 @@ mod sys {
 
     pub const PROC_PIDVNODEPATHINFO: c_int = 9;
     pub const PROC_PIDTBSDINFO: c_int = 3;
+    pub const PROC_PIDLISTFDS: c_int = 1;
+
+    /// `proc_pidfdinfo` flavor: vnode info plus the resolved path.
+    pub const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+
+    /// `proc_fdinfo.proc_fdtype` for a vnode (regular file, dir, …).
+    pub const PROX_FDTYPE_VNODE: u32 = 1;
 
     /// `proc_listpids` selector: return PIDs whose parent matches `typeinfo`.
     pub const PROC_PPID_ONLY: u32 = 6;
@@ -329,6 +406,31 @@ mod sys {
         pub pvi_rdir: vnode_info_path,
     }
 
+    /// One entry of the `PROC_PIDLISTFDS` array.
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct proc_fdinfo {
+        pub proc_fd: i32,
+        pub proc_fdtype: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    pub struct proc_fileinfo {
+        pub fi_openflags: u32,
+        pub fi_status: u32,
+        pub fi_offset: off_t,
+        pub fi_type: i32,
+        pub fi_guardflags: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct vnode_fdinfowithpath {
+        pub pfi: proc_fileinfo,
+        pub pvip: vnode_info_path,
+    }
+
     /// Layout matches `struct proc_bsdinfo` from `<sys/proc_info.h>`. We only
     /// read `pbi_status`; the other fields are present to keep the struct's
     /// size correct (proc_pidinfo validates the buffer size against this).
@@ -368,6 +470,14 @@ mod sys {
             buffersize: c_int,
         ) -> c_int;
 
+        pub fn proc_pidfdinfo(
+            pid: c_int,
+            fd: c_int,
+            flavor: c_int,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+
         pub fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
 
         pub fn proc_listpids(
@@ -388,5 +498,24 @@ mod tests {
     #[test]
     fn cwd_matches_current_dir() {
         assert_eq!(cwd(process::id() as i32).ok(), env::current_dir().ok());
+    }
+
+    #[test]
+    fn open_file_paths_sees_our_own_open_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("held-open.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let _held = std::fs::File::open(&path).unwrap();
+
+        let paths = open_file_paths(process::id() as i32);
+        // Compare canonicalized paths — the kernel reports the resolved path
+        // (e.g. /private/var/... for a /var/... TempDir on macOS).
+        let want = path.canonicalize().unwrap();
+        assert!(
+            paths.iter().any(|p| *p == want),
+            "expected {} among {} open paths",
+            want.display(),
+            paths.len()
+        );
     }
 }
