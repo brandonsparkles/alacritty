@@ -20,23 +20,28 @@
 //! ### Threading model
 //!
 //! The daemon runs as a single background thread spawned at process
-//! startup. It re-reads `usage.json` from disk on every request — stale
-//! by at most one tick (1 s). For POST /courtesy, the daemon writes
-//! directly to `usage.json`; the main thread's in-memory copy refreshes
-//! on the next tick via the standard load path.
+//! startup. It shares the live `Arc<Mutex<Budget>>` with the event loop's
+//! 1-second ticker, so `GET /usage` serves the in-memory state without
+//! touching disk. `POST /courtesy` / `POST /weekly-extension` grant on the
+//! shared state (and persist it), then dispatch the matching user event
+//! through the `EventLoopProxy` so the lockout overlay and tab titles
+//! refresh immediately instead of waiting for the next tick.
 
 #![cfg(target_os = "macos")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use log::debug;
 use serde::Serialize;
+use winit::event_loop::EventLoopProxy;
 
 use crate::budget::{BlockReason, Budget, WeeklyExtensionError};
 use crate::config::budget::BudgetConfig;
+use crate::event::{Event, EventType};
 
 /// Default port — chosen to be high, unlikely to collide, easy to recall.
 /// Used by the pomodoro card to poll `127.0.0.1:38121/usage`.
@@ -91,13 +96,21 @@ struct UsagePayload {
     timezone: String,
 }
 
+/// Lock the shared budget, surviving poisoning: enforcement must keep
+/// working even if another thread panicked while holding the lock.
+fn lock_budget(budget: &Mutex<Budget>) -> MutexGuard<'_, Budget> {
+    budget.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Spawn the daemon on a background thread. Returns immediately. The
 /// thread is detached — there's no shutdown path because we want the
 /// daemon alive for the entire lifetime of the process.
 ///
 /// `config_provider` returns a fresh `BudgetConfig` per request so live
-/// config-reload changes are reflected in the wire payload.
-pub fn spawn<F>(port: u16, config_provider: F)
+/// config-reload changes are reflected in the wire payload. `budget` is
+/// the live state shared with the event loop's ticker; `proxy` lets the
+/// POST handlers nudge the UI (overlay/tab titles) right after a grant.
+pub fn spawn<F>(port: u16, config_provider: F, budget: Arc<Mutex<Budget>>, proxy: EventLoopProxy<Event>)
 where
     F: Fn() -> BudgetConfig + Send + Sync + 'static,
 {
@@ -122,7 +135,7 @@ where
                     },
                 };
                 let cfg = config_provider();
-                if let Err(err) = handle(stream, &cfg) {
+                if let Err(err) = handle(stream, &cfg, &budget, &proxy) {
                     debug!("budget daemon: handler error: {err}");
                 }
             }
@@ -130,7 +143,12 @@ where
         .expect("budget daemon thread spawn");
 }
 
-fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
+fn handle(
+    mut stream: TcpStream,
+    cfg: &BudgetConfig,
+    budget: &Mutex<Budget>,
+    proxy: &EventLoopProxy<Event>,
+) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
@@ -155,15 +173,28 @@ fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
     match (method, path) {
         ("OPTIONS", _) => write_response(&mut stream, 204, "No Content", "", "")?,
         ("GET", "/usage") => {
-            let body = serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
+            let body =
+                serde_json::to_string(&snapshot(cfg, budget)).unwrap_or_else(|_| "{}".into());
             write_response(&mut stream, 200, "OK", "application/json", &body)?;
         },
         ("POST", "/courtesy") => {
-            let mut budget = Budget::load_or_default(cfg);
-            let was_used = budget.courtesy_used;
-            if budget.grant_courtesy(cfg) {
-                budget.save();
-                let body = serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
+            let (granted, was_used) = {
+                let mut budget = lock_budget(budget);
+                budget.refresh_day_boundary(cfg);
+                let was_used = budget.courtesy_used;
+                let granted = budget.grant_courtesy(cfg);
+                if granted {
+                    budget.save();
+                }
+                (granted, was_used)
+            };
+            if granted {
+                // Nudge the event loop so the lockout overlay / 🔒 title
+                // clear immediately; the grant itself already happened on
+                // the shared state above.
+                let _ = proxy.send_event(Event::new(EventType::GrantCourtesy, None));
+                let body =
+                    serde_json::to_string(&snapshot(cfg, budget)).unwrap_or_else(|_| "{}".into());
                 write_response(&mut stream, 200, "OK", "application/json", &body)?;
             } else if !cfg.allow_courtesy {
                 let body = r#"{"error":"courtesy_disabled"}"#;
@@ -177,12 +208,19 @@ fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
             }
         },
         ("POST", "/weekly-extension") => {
-            let mut budget = Budget::load_or_default(cfg);
-            match budget.grant_weekly_extension(cfg) {
-                Ok(()) => {
+            let result = {
+                let mut budget = lock_budget(budget);
+                let result = budget.grant_weekly_extension(cfg);
+                if result.is_ok() {
                     budget.save();
-                    let body =
-                        serde_json::to_string(&snapshot(cfg)).unwrap_or_else(|_| "{}".into());
+                }
+                result
+            };
+            match result {
+                Ok(()) => {
+                    let _ = proxy.send_event(Event::new(EventType::GrantWeeklyExtension, None));
+                    let body = serde_json::to_string(&snapshot(cfg, budget))
+                        .unwrap_or_else(|_| "{}".into());
                     write_response(&mut stream, 200, "OK", "application/json", &body)?;
                 },
                 Err(WeeklyExtensionError::Disabled) => {
@@ -210,8 +248,11 @@ fn handle(mut stream: TcpStream, cfg: &BudgetConfig) -> std::io::Result<()> {
     Ok(())
 }
 
-fn snapshot(cfg: &BudgetConfig) -> UsagePayload {
-    let mut budget = Budget::load_or_default(cfg);
+fn snapshot(cfg: &BudgetConfig, budget: &Mutex<Budget>) -> UsagePayload {
+    // Clone the live shared state; roll the day on the clone only so a
+    // read-only GET never mutates state the ticker owns (the tick performs
+    // the same idempotent rollover within a second anyway).
+    let mut budget = lock_budget(budget).clone();
     budget.refresh_day_boundary(cfg);
     let reason = budget.block_status(cfg);
     let blocked = reason.is_some();

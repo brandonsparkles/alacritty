@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -109,9 +111,27 @@ pub struct Processor {
     session_restore_pending: usize,
     /// Daily usage budget — enforces the 3-hour cap and 02:00–08:00 sleep
     /// window. Ticked once per second while any window is focused; persisted
-    /// to `~/Library/Application Support/org.alacritty/usage.json`.
+    /// to `~/Library/Application Support/org.alacritty/usage.json`. Shared
+    /// with the localhost HTTP daemon thread, which serves `/usage` from it
+    /// and grants courtesy/weekly extensions on it directly.
     #[cfg(target_os = "macos")]
-    budget: crate::budget::Budget,
+    budget: Arc<Mutex<crate::budget::Budget>>,
+    /// Live copy of `[budget]` config shared with the HTTP daemon so its
+    /// wire payload tracks TOML live-reloads. Written by the ConfigReload
+    /// handler; read per request by the daemon. Display-only for the
+    /// daemon — in-process enforcement always reads `self.config.budget`.
+    #[cfg(target_os = "macos")]
+    budget_config_shared: Arc<RwLock<crate::config::budget::BudgetConfig>>,
+    /// When the budget state last hit disk. Ticks that change no persisted
+    /// field skip the write; a ~60s heartbeat keeps `updated_at` fresh on
+    /// disk while idle. Counting ticks always write (loss bound ≤1s).
+    #[cfg(target_os = "macos")]
+    budget_last_save: Option<Instant>,
+    /// Background worker that owns the expensive part of session saves
+    /// (proc-tree walks, fd tables, log scans, JSON write) so the 3s tick
+    /// costs the event loop only a cheap per-window seed collection.
+    #[cfg(target_os = "macos")]
+    session_save_worker: crate::session::SaveWorker,
     /// Window currently hosting the 1-second budget ticker (macOS). Mirrors
     /// the session_save_host pattern so the timer survives window closes.
     #[cfg(target_os = "macos")]
@@ -177,6 +197,10 @@ impl Processor {
         config: UiConfig,
         cli_options: CliOptions,
         event_loop: &EventLoop<Event>,
+        #[cfg(target_os = "macos")] budget: Arc<Mutex<crate::budget::Budget>>,
+        #[cfg(target_os = "macos")] budget_config_shared: Arc<
+            RwLock<crate::config::budget::BudgetConfig>,
+        >,
     ) -> Processor {
         let proxy = event_loop.create_proxy();
         let scheduler = Scheduler::new(proxy.clone());
@@ -198,11 +222,6 @@ impl Processor {
             config_monitor =
                 ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
         }
-
-        // Materialize the persisted budget state before `config` is moved
-        // into the Rc, so we can pass the policy by reference.
-        #[cfg(target_os = "macos")]
-        let budget = crate::budget::Budget::load_or_default(&config.budget);
 
         // Register the event-loop proxy with the lockout overlay so its
         // lockout overlay buttons can dispatch budget events back into the loop.
@@ -228,6 +247,12 @@ impl Processor {
             session_restore_pending: 0,
             #[cfg(target_os = "macos")]
             budget,
+            #[cfg(target_os = "macos")]
+            budget_config_shared,
+            #[cfg(target_os = "macos")]
+            budget_last_save: None,
+            #[cfg(target_os = "macos")]
+            session_save_worker: crate::session::SaveWorker::spawn(),
             #[cfg(target_os = "macos")]
             budget_tick_host: None,
             #[cfg(target_os = "macos")]
@@ -359,21 +384,21 @@ impl Processor {
 
     /// Persist a snapshot of every open window to the macOS saved-state
     /// directory. Called whenever the window set or window state changes.
+    ///
+    /// Only the cheap per-window seed (pid, title, geometry) is collected
+    /// here; the proc-tree walks, fd-table reads, log scans, and the JSON
+    /// write happen on the session-save worker thread so the winit event
+    /// loop never blocks on them.
     #[cfg(target_os = "macos")]
     fn save_session(&self) {
         if self.session_restore_pending > 0 {
             return;
         }
-        // Reset the per-tick codex-UUID claim set so each window's
-        // session_snapshot resolves codex's per-PID rollout against a
-        // fresh slate. This is what stops two codex tabs whose PIDs
-        // started in the same second from both grabbing the same
-        // "earliest" rollout.
-        crate::cli_resume::begin_save_tick();
-        let windows: Vec<_> =
-            self.windows.values().filter_map(|wc| wc.session_snapshot()).collect();
-        let session = crate::session::Session { version: 1, windows };
-        session.save();
+        let windows: Vec<_> = self.windows.values().map(|wc| wc.session_seed()).collect();
+        self.session_save_worker.request(crate::session::SaveRequest {
+            windows,
+            ai_resume: self.config.ai_resume.clone(),
+        });
     }
 
     /// Mark one restore replay unit complete.
@@ -668,6 +693,18 @@ impl ApplicationHandler<Event> for Processor {
                 if let Ok(config) = config::reload(&path, &mut self.cli_options) {
                     self.config = Rc::new(config);
 
+                    // Publish the reloaded [budget] policy to the HTTP
+                    // daemon so its wire payload (cap, courtesy sizes,
+                    // blocked math) tracks the live config.
+                    #[cfg(target_os = "macos")]
+                    {
+                        *self
+                            .budget_config_shared
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            self.config.budget.clone();
+                    }
+
                     // Restart config monitor if imports changed.
                     if let Some(monitor) = self.config_monitor.take() {
                         let paths = &self.config.config_paths;
@@ -696,19 +733,27 @@ impl ApplicationHandler<Event> for Processor {
             // Processor's Budget directly.
             #[cfg(target_os = "macos")]
             (EventType::GrantCourtesy, _) => {
-                if self.budget.grant_courtesy(&self.config.budget) {
-                    self.budget.save();
+                let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+                let granted = budget.grant_courtesy(&self.config.budget);
+                if granted {
+                    budget.save();
+                }
+                // The daemon's POST /courtesy performs the grant on the
+                // shared state itself and dispatches this event purely to
+                // refresh the UI — so also push when a courtesy is already
+                // in effect, not only when this call granted it.
+                if granted || budget.courtesy_active(&self.config.budget) {
                     // Immediately push the unlocked state to every window
                     // so the lock indicator + overlay clear without
                     // waiting for the next tick.
-                    let reason = self.budget.block_status(&self.config.budget);
-                    let unlock = self.budget.seconds_until_unlock(&self.config.budget);
+                    let reason = budget.block_status(&self.config.budget);
+                    let unlock = budget.seconds_until_unlock(&self.config.budget);
                     let still_blocked = reason.is_some();
                     let weekly_extension_available =
-                        self.budget.weekly_extension_available(&self.config.budget)
+                        budget.weekly_extension_available(&self.config.budget)
                             && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     let weekly_extension_remaining_seconds =
-                        self.budget.weekly_extension_remaining_seconds(&self.config.budget);
+                        budget.weekly_extension_remaining_seconds(&self.config.budget);
                     let weekly_extension_visible =
                         matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     for wc in self.windows.values_mut() {
@@ -736,20 +781,26 @@ impl ApplicationHandler<Event> for Processor {
             // lockout overlay button or Cmd+Shift+Ctrl+W.
             #[cfg(target_os = "macos")]
             (EventType::GrantWeeklyExtension, _) => {
-                if self.budget.grant_weekly_extension(&self.config.budget).is_ok() {
-                    self.budget.save();
-                    let reason = self.budget.block_status(&self.config.budget);
-                    let unlock = self.budget.seconds_until_unlock(&self.config.budget);
+                let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+                let granted = budget.grant_weekly_extension(&self.config.budget).is_ok();
+                if granted {
+                    budget.save();
+                }
+                // As with GrantCourtesy: the daemon grants on the shared
+                // state and dispatches this event for the UI push only.
+                if granted || budget.weekly_extension_active(&self.config.budget) {
+                    let reason = budget.block_status(&self.config.budget);
+                    let unlock = budget.seconds_until_unlock(&self.config.budget);
                     let still_blocked = reason.is_some();
                     let courtesy_available = self.config.budget.allow_courtesy
                         && self.config.budget.courtesy_seconds > 0
-                        && !self.budget.courtesy_used
+                        && !budget.courtesy_used
                         && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     let weekly_extension_available =
-                        self.budget.weekly_extension_available(&self.config.budget)
+                        budget.weekly_extension_available(&self.config.budget)
                             && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     let weekly_extension_remaining_seconds =
-                        self.budget.weekly_extension_remaining_seconds(&self.config.budget);
+                        budget.weekly_extension_remaining_seconds(&self.config.budget);
                     let weekly_extension_visible =
                         matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     for wc in self.windows.values_mut() {
@@ -789,10 +840,10 @@ impl ApplicationHandler<Event> for Processor {
                         }
                     }
                 } else {
-                    let persisted = crate::budget::Budget::load_or_default(&cfg);
-                    if persisted.updated_at > self.budget.updated_at {
-                        self.budget = persisted;
-                    }
+                    // The daemon shares this state (Arc<Mutex>), so its
+                    // courtesy/extension grants are already visible here —
+                    // no per-tick disk re-read is needed.
+                    let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
 
                     let any_focused = self.any_window_focused();
                     let now = std::time::Instant::now();
@@ -817,27 +868,43 @@ impl ApplicationHandler<Event> for Processor {
                         self.app_focus_state,
                         AppFocusState::Active | AppFocusState::InGrace(_)
                     );
+                    let before = budget.clone();
                     if counts {
-                        self.budget.tick(&cfg, 1);
+                        budget.tick(&cfg, 1);
                     } else {
-                        self.budget.refresh_day_boundary(&cfg);
+                        budget.refresh_day_boundary(&cfg);
                     }
-                    self.budget.save();
+                    // The state is re-validated every second even when no
+                    // counter moved; stamp it so the daemon's /usage
+                    // payload keeps a fresh updated_at.
+                    budget.touch();
+                    // Persist every tick that changed a counted field —
+                    // the crash loss bound while time is being counted
+                    // stays ≤1s. Idle ticks (Hidden, nothing accrued)
+                    // skip the write except a ~60s updated_at heartbeat.
+                    let changed = !budget.same_persistent_state(&before);
+                    let heartbeat_due = self
+                        .budget_last_save
+                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+                    if changed || heartbeat_due {
+                        budget.save();
+                        self.budget_last_save = Some(Instant::now());
+                    }
 
                     // Push current block state to every window so the
                     // input handler can filter keystrokes + the tab-title
                     // composer can show the 🔒 countdown.
-                    let reason = self.budget.block_status(&cfg);
-                    let unlock = self.budget.seconds_until_unlock(&cfg);
+                    let reason = budget.block_status(&cfg);
+                    let unlock = budget.seconds_until_unlock(&cfg);
                     let blocked = reason.is_some();
                     let courtesy_available = cfg.allow_courtesy
                         && cfg.courtesy_seconds > 0
-                        && !self.budget.courtesy_used
+                        && !budget.courtesy_used
                         && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
-                    let weekly_extension_available = self.budget.weekly_extension_available(&cfg)
+                    let weekly_extension_available = budget.weekly_extension_available(&cfg)
                         && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     let weekly_extension_remaining_seconds =
-                        self.budget.weekly_extension_remaining_seconds(&cfg);
+                        budget.weekly_extension_remaining_seconds(&cfg);
                     let weekly_extension_visible =
                         matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     for wc in self.windows.values_mut() {
@@ -2693,11 +2760,30 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     fn poll_tab_activity(&mut self) {
         use crate::display::TabActivity;
 
+        /// Poll stride while occluded: 8 × 500ms ticks ≈ one proc-tree
+        /// walk every 4s instead of 2Hz.
+        const OCCLUDED_TAB_POLL_STRIDE: u32 = 8;
+
         // Bell-triggered NeedsAttention is sticky; only focus gain clears it.
         if self.ctx.display.tab_activity == TabActivity::NeedsAttention
             && self.ctx.display.tab_attention_from_bell
         {
             return;
+        }
+
+        // While the window is occluded (budget grace `NSApp.hide()`,
+        // minimize, full cover) neither the tab strip nor the title bar is
+        // on screen, so the spinner has no audience — drop the proc-tree
+        // poll to ~4s. The first tick after visibility returns resets the
+        // stride and polls immediately, restoring normal 500ms cadence.
+        if *self.ctx.occluded {
+            let ticks = self.ctx.display.tab_poll_ticks_occluded;
+            self.ctx.display.tab_poll_ticks_occluded = ticks.wrapping_add(1);
+            if ticks % OCCLUDED_TAB_POLL_STRIDE != 0 {
+                return;
+            }
+        } else {
+            self.ctx.display.tab_poll_ticks_occluded = 0;
         }
 
         let shell_pid = self.ctx.shell_pid as i32;

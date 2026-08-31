@@ -448,6 +448,14 @@ pub struct Display {
     #[cfg(target_os = "macos")]
     pub tab_activity_frame: usize,
 
+    /// Consecutive `TabActivityTick`s handled while this window was
+    /// occluded (hidden via the budget grace `NSApp.hide()`, minimized,
+    /// or fully covered). Used to stride the proc-tree poll down to ~4s
+    /// while nothing that displays the result is visible; reset to zero
+    /// on the first visible tick so normal 500ms cadence resumes at once.
+    #[cfg(target_os = "macos")]
+    pub tab_poll_ticks_occluded: u32,
+
     /// `true` when the current `NeedsAttention` was triggered by a terminal
     /// BEL. Sticky-on-unfocus: polling must NOT clear a bell-triggered
     /// attention even if the child resumes work; only focus gain clears it.
@@ -633,6 +641,8 @@ impl Display {
             tab_activity: TabActivity::default(),
             #[cfg(target_os = "macos")]
             tab_activity_frame: 0,
+            #[cfg(target_os = "macos")]
+            tab_poll_ticks_occluded: 0,
             tab_attention_from_bell: false,
             #[cfg(target_os = "macos")]
             budget_blocked: false,

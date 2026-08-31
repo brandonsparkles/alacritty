@@ -19,14 +19,19 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ai_resume::AiResumeConfig;
+
 /// Tracked state for a single window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowState {
     /// Working directory of the shell. Used as `--working-directory` when the
     /// window is re-spawned.
@@ -58,7 +63,7 @@ pub struct WindowState {
 }
 
 /// Persisted snapshot of all open windows at the time of save.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     /// Schema version. Bumped if the layout changes incompatibly.
     #[serde(default = "default_version")]
@@ -167,5 +172,139 @@ impl Session {
         if let Some(file) = Self::file() {
             let _ = fs::remove_file(file);
         }
+    }
+}
+
+// ---------- background save worker ----------
+
+/// Cheap per-window facts collected on the winit event-loop thread. The
+/// expensive half of a snapshot (shell cwd, proc-tree walk, fd tables,
+/// copilot log scan, JSON write) is derived from this seed on the worker.
+#[derive(Debug)]
+pub struct WindowSeed {
+    /// PID of the window's shell (PTY child).
+    pub shell_pid: i32,
+    /// User-set tab title override, if any.
+    pub tab_title: Option<String>,
+    /// Window size in physical pixels.
+    pub size: Option<(u32, u32)>,
+    /// Window position in screen coordinates.
+    pub position: Option<(i32, i32)>,
+}
+
+/// One save tick's worth of work handed to the worker thread.
+pub struct SaveRequest {
+    pub windows: Vec<WindowSeed>,
+    pub ai_resume: AiResumeConfig,
+}
+
+/// How long a resolved (or resolved-to-None) resume command may be reused
+/// before the worker re-walks that shell's process tree. A window/PTY
+/// change means a new shell PID, which misses the cache immediately.
+const RESUME_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Background thread that turns [`SaveRequest`]s into `session.json`
+/// writes, keeping proc/file scanning off the event-loop thread.
+///
+/// Crash-staleness contract: the 3s tick cadence is unchanged and each
+/// request is processed in well under a tick, so a crash at any moment
+/// still restores sessions no staler than the previous ~3s bound. Only
+/// the *resume command* may lag up to [`RESUME_CACHE_TTL`] behind, by
+/// design (per-PID cache with lazy re-resolve).
+pub struct SaveWorker {
+    tx: SyncSender<SaveRequest>,
+}
+
+impl SaveWorker {
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SaveRequest>(1);
+        let _ = std::thread::Builder::new().name("alacritty-session-save".to_string()).spawn(
+            move || {
+                // shell PID → (resolved-at, resume command or None).
+                let mut resume_cache: HashMap<i32, (Instant, Option<String>)> = HashMap::new();
+                // Last snapshot that hit disk; identical snapshots skip
+                // the serialize + write entirely.
+                let mut last_saved: Option<Session> = None;
+                while let Ok(request) = rx.recv() {
+                    process_save(request, &mut resume_cache, &mut last_saved);
+                }
+            },
+        );
+        Self { tx }
+    }
+
+    /// Queue one save tick. If the worker is still busy with the previous
+    /// request the tick is dropped — the next 3s tick retries, so the
+    /// staleness bound stays one tick.
+    pub fn request(&self, request: SaveRequest) {
+        match self.tx.try_send(request) {
+            Ok(()) | Err(TrySendError::Full(_)) => (),
+            Err(TrySendError::Disconnected(_)) => {
+                warn!("Session save worker is gone; snapshot dropped");
+            },
+        }
+    }
+}
+
+fn process_save(
+    request: SaveRequest,
+    resume_cache: &mut HashMap<i32, (Instant, Option<String>)>,
+    last_saved: &mut Option<Session>,
+) {
+    // Drop cache entries for windows that no longer exist.
+    resume_cache.retain(|pid, _| request.windows.iter().any(|seed| seed.shell_pid == *pid));
+
+    // Reset the per-tick codex-UUID claim set so each window resolves
+    // codex's per-PID rollout against a fresh slate, then re-claim the
+    // UUIDs held by cache-fresh windows FIRST — otherwise a sibling
+    // window resolving fresh in this tick could grab a UUID a cached
+    // window still owns.
+    crate::cli_resume::begin_save_tick();
+    for seed in &request.windows {
+        if let Some((resolved_at, Some(command))) = resume_cache.get(&seed.shell_pid) {
+            if resolved_at.elapsed() < RESUME_CACHE_TTL {
+                crate::cli_resume::claim_saved_resume_command(command);
+            }
+        }
+    }
+
+    let mut windows = Vec::with_capacity(request.windows.len());
+    for seed in &request.windows {
+        // A window whose shell is gone is skipped, matching the previous
+        // synchronous snapshot behavior.
+        let Ok(working_directory) = crate::macos::proc::cwd(seed.shell_pid) else { continue };
+        let resume_command = match resume_cache.get(&seed.shell_pid) {
+            Some((resolved_at, cached)) if resolved_at.elapsed() < RESUME_CACHE_TTL => {
+                cached.clone()
+            },
+            _ => {
+                let resolved = crate::cli_resume::resume_command_for(
+                    seed.shell_pid,
+                    &working_directory,
+                    &request.ai_resume,
+                );
+                resume_cache.insert(seed.shell_pid, (Instant::now(), resolved.clone()));
+                resolved
+            },
+        };
+        windows.push(WindowState {
+            working_directory,
+            tab_title: seed.tab_title.clone(),
+            tabbing_id: String::new(),
+            size: seed.size,
+            position: seed.position,
+            resume_command,
+        });
+    }
+
+    let session = Session { version: CURRENT_VERSION, windows };
+    if last_saved.as_ref() == Some(&session) {
+        return;
+    }
+    session.save();
+    // Empty snapshots are never written (see `Session::save`), so they
+    // must not update the last-written marker either.
+    if !session.windows.is_empty() {
+        *last_saved = Some(session);
     }
 }

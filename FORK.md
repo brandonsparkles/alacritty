@@ -206,14 +206,22 @@ no daemon).
 }
 ```
 
-Written via atomic temp-file-rename every second. Day rollover happens
-automatically when `date_chicago` no longer matches "today" (per the
-configured timezone + sleep_end_hour offset).
+Written via atomic temp-file-rename on every 1-second tick that changes a
+counter (so the crash loss bound stays ≤1s whenever time is being
+counted), plus a ~60s `updated_at` heartbeat while idle/hidden. The live
+state itself is in-memory, shared between the event loop and the daemon
+thread; the file exists for persistence across relaunches. Day rollover
+happens automatically when `date_chicago` no longer matches "today" (per
+the configured timezone + sleep_end_hour offset).
 
 ### HTTP daemon — `127.0.0.1:38121`
 
 Spawned at startup when `[budget] enabled = true`. Single background
 thread, std::net::TcpListener, hand-rolled HTTP/1.1, no external deps.
+Serves the in-memory budget state shared with the event loop (no disk
+read per request); `POST /courtesy` grants on that shared state and
+dispatches `GrantCourtesy` through the event-loop proxy so the overlay
+clears immediately. Config values in the payload track TOML live-reloads.
 
 **`GET /usage`** → 200 OK, JSON:
 ```json

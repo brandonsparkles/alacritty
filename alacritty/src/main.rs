@@ -220,17 +220,38 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
         log_file: log_cleanup,
     };
 
+    // Materialize the persisted budget state and the live [budget] config,
+    // both shared between the event loop and the daemon thread (macOS only).
+    #[cfg(target_os = "macos")]
+    let budget_state = std::sync::Arc::new(std::sync::Mutex::new(
+        budget::Budget::load_or_default(&config.budget),
+    ));
+    #[cfg(target_os = "macos")]
+    let budget_config = std::sync::Arc::new(std::sync::RwLock::new(config.budget.clone()));
+
     // Spawn the budget daemon (macOS only). Listens on 127.0.0.1:38121
     // for GET /usage + POST /courtesy. Survives until process exit.
     // Exposes counting state even when [budget].enabled = false; enforcement
-    // still stays disabled through Budget::block_status.
+    // still stays disabled through Budget::block_status. Serves the live
+    // shared state; the config handle tracks TOML live-reloads.
     #[cfg(target_os = "macos")]
     {
-        let snapshot = config.budget.clone();
-        budget_daemon::spawn(budget_daemon::DEFAULT_PORT, move || snapshot.clone());
+        let config_handle = budget_config.clone();
+        budget_daemon::spawn(
+            budget_daemon::DEFAULT_PORT,
+            move || {
+                config_handle.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+            },
+            budget_state.clone(),
+            window_event_loop.create_proxy(),
+        );
     }
 
     // Event processor.
+    #[cfg(target_os = "macos")]
+    let mut processor =
+        Processor::new(config, options, &window_event_loop, budget_state, budget_config);
+    #[cfg(not(target_os = "macos"))]
     let mut processor = Processor::new(config, options, &window_event_loop);
 
     // Start event loop and block until shutdown.

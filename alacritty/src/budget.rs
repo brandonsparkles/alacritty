@@ -10,9 +10,12 @@
 //!   * `courtesy_used` / `courtesy_expires_at` — optional once-per-day extension
 //!   * `weekly_extension_*` — optional weekly one-hour extensions
 //!
-//! State lives at `~/Library/Application Support/org.alacritty/usage.json`
-//! and is the single source of truth — read by the lockout overlay, the
-//! localhost HTTP daemon, and the out-of-process pomodoro app.
+//! The live state is a single `Arc<Mutex<Budget>>` shared between the
+//! winit event loop (which ticks it) and the localhost HTTP daemon (which
+//! serves and mutates it). `~/Library/Application Support/org.alacritty/
+//! usage.json` is its crash-safe persistence: written on every tick that
+//! changes a counter (loss bound ≤1s while time is being counted), plus a
+//! periodic `updated_at` heartbeat while idle.
 
 #![cfg(target_os = "macos")]
 
@@ -130,7 +133,7 @@ impl Budget {
     /// Persist atomically (temp file + rename). Errors are logged but
     /// never propagated — the budget keeps running on the in-memory
     /// state even if disk writes fail.
-    pub fn save(&self) {
+    pub fn save(&mut self) {
         let Some(path) = Self::path() else { return };
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
@@ -138,9 +141,8 @@ impl Budget {
                 return;
             }
         }
-        let mut snapshot = self.clone();
-        snapshot.updated_at = unix_now();
-        let json = match serde_json::to_string_pretty(&snapshot) {
+        self.touch();
+        let json = match serde_json::to_string_pretty(self) {
             Ok(s) => s,
             Err(err) => {
                 debug!("Could not serialize budget: {err}");
@@ -156,6 +158,30 @@ impl Budget {
             debug!("Could not rename {} -> {}: {err}", tmp.display(), path.display());
             let _ = fs::remove_file(&tmp);
         }
+    }
+
+    /// Stamp the state as current. `updated_at` is a freshness marker for
+    /// external consumers; the tick stamps it every second so the daemon's
+    /// `/usage` payload stays fresh even on ticks whose disk write is
+    /// skipped (nothing counted, heartbeat not due).
+    pub fn touch(&mut self) {
+        self.updated_at = unix_now();
+    }
+
+    /// True when every persisted field except the `updated_at` freshness
+    /// stamp matches `other`. Used by the tick to skip redundant disk
+    /// writes: any change here (counters, day/week keys, extensions) must
+    /// hit disk immediately, while a pure freshness delta only needs the
+    /// periodic heartbeat.
+    pub fn same_persistent_state(&self, other: &Self) -> bool {
+        self.date_chicago == other.date_chicago
+            && self.active_seconds == other.active_seconds
+            && self.weekly_active_seconds == other.weekly_active_seconds
+            && self.courtesy_used == other.courtesy_used
+            && self.courtesy_expires_at == other.courtesy_expires_at
+            && self.weekly_extension_week == other.weekly_extension_week
+            && self.weekly_extension_used_seconds == other.weekly_extension_used_seconds
+            && self.weekly_extension_expires_at == other.weekly_extension_expires_at
     }
 
     /// Reset the day's accumulators if the current day key has advanced

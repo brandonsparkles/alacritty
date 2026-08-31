@@ -44,9 +44,9 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::raw::c_int;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -70,6 +70,23 @@ fn claimed_set() -> &'static Mutex<HashSet<String>> {
 pub fn begin_save_tick() {
     if let Ok(mut g) = claimed_set().lock() {
         g.clear();
+    }
+}
+
+/// Re-claim the codex session UUID embedded in an already-resolved resume
+/// command. The session-save worker caches resume commands per shell PID;
+/// at the start of a save tick it claims every cache-fresh codex UUID so
+/// a sibling window resolving fresh in the same tick can't take it.
+pub fn claim_saved_resume_command(command: &str) {
+    let args: Vec<&str> = command.split_whitespace().collect();
+    let Some(program) = args.first() else { return };
+    if !(program.ends_with("codex") || program.ends_with("codexpilot")) {
+        return;
+    }
+    if let Some(id) = codex_resume_id_from_args(&args) {
+        if let Ok(mut g) = claimed_set().lock() {
+            g.insert(id);
+        }
     }
 }
 
@@ -190,20 +207,59 @@ fn copilot_resume(pid: c_int, ai_resume: &AiResumeConfig) -> Option<String> {
     }
     let log = matched?;
 
-    let f = File::open(&log).ok()?;
-    let reader = BufReader::new(f);
+    let uuid = copilot_scan_uuid(pid, &log)?;
+    Some(copilot_resume_command(&uuid, ai_resume))
+}
+
+/// Incremental scan state for one copilot per-process log: byte offset of
+/// the first unread line plus the last session UUID seen so far. Keyed by
+/// PID; bounded by the number of distinct copilot processes seen during
+/// this alacritty run.
+struct CopilotScanState {
+    offset: u64,
+    last_uuid: Option<String>,
+}
+
+static COPILOT_SCAN_STATES: OnceLock<Mutex<HashMap<c_int, CopilotScanState>>> = OnceLock::new();
+
+/// Tail-offset incremental read of a copilot log: only bytes appended
+/// since the previous scan are parsed, so a long-lived session doesn't
+/// re-read a growing log end-to-end on every save tick. A file shorter
+/// than the stored offset (rotation/truncation) resets the scan; a
+/// trailing partial line is left unconsumed for the next pass.
+fn copilot_scan_uuid(pid: c_int, log: &Path) -> Option<String> {
     const MARKER: &str = "Registering foreground session: ";
-    let mut last_uuid: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(idx) = line.find(MARKER) {
-            let tail = line[idx + MARKER.len()..].trim();
-            if !tail.is_empty() {
-                last_uuid = Some(tail.to_string());
+
+    let states = COPILOT_SCAN_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states.lock().ok()?;
+    let state = states.entry(pid).or_insert(CopilotScanState { offset: 0, last_uuid: None });
+
+    let mut f = File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len < state.offset {
+        state.offset = 0;
+        state.last_uuid = None;
+    }
+    if len > state.offset {
+        f.seek(SeekFrom::Start(state.offset)).ok()?;
+        let mut appended = Vec::with_capacity((len - state.offset) as usize);
+        f.take(len - state.offset).read_to_end(&mut appended).ok()?;
+        // Consume only complete lines; offsets are tracked in raw bytes so
+        // lossy UTF-8 decoding can't skew them.
+        let consumed = appended.iter().rposition(|&b| b == b'\n').map_or(0, |idx| idx + 1);
+        if consumed > 0 {
+            for line in String::from_utf8_lossy(&appended[..consumed]).lines() {
+                if let Some(idx) = line.find(MARKER) {
+                    let tail = line[idx + MARKER.len()..].trim();
+                    if !tail.is_empty() {
+                        state.last_uuid = Some(tail.to_string());
+                    }
+                }
             }
+            state.offset += consumed as u64;
         }
     }
-    let uuid = last_uuid?;
-    Some(copilot_resume_command(&uuid, ai_resume))
+    state.last_uuid.clone()
 }
 
 fn copilot_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {

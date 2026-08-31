@@ -528,28 +528,19 @@ impl WindowContext {
         self.display.window.id()
     }
 
-    /// Build a snapshot of this window for session persistence (macOS).
+    /// Cheap main-thread facts for the session-save worker (macOS). The
+    /// expensive parts of the snapshot — shell cwd lookup, proc-tree walk,
+    /// fd-table read, AI-CLI resume resolution — happen on the worker
+    /// thread from this seed (see `session::SaveWorker`).
     #[cfg(target_os = "macos")]
-    pub fn session_snapshot(&self) -> Option<crate::session::WindowState> {
-        let working_directory = crate::macos::proc::cwd(self.shell_pid as i32).ok()?;
-        let tab_title = self.display.tab_user_title.clone();
-        let tabbing_id = String::new();
+    pub fn session_seed(&self) -> crate::session::WindowSeed {
         let inner = self.display.window.inner_size();
-        let size = Some((inner.width, inner.height));
-        let position = self.display.window.outer_position().ok().map(|p| (p.x, p.y));
-        let resume_command = crate::cli_resume::resume_command_for(
-            self.shell_pid as i32,
-            &working_directory,
-            &self.config.ai_resume,
-        );
-        Some(crate::session::WindowState {
-            working_directory,
-            tab_title,
-            tabbing_id,
-            size,
-            position,
-            resume_command,
-        })
+        crate::session::WindowSeed {
+            shell_pid: self.shell_pid as i32,
+            tab_title: self.display.tab_user_title.clone(),
+            size: Some((inner.width, inner.height)),
+            position: self.display.window.outer_position().ok().map(|p| (p.x, p.y)),
+        }
     }
 
     /// Send raw bytes to this window's PTY as if they had been typed by the
