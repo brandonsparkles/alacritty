@@ -254,7 +254,7 @@ browser.
 ### Consumers
 
 - Pomodoro BudgetCard (`brandonai` site, `resources/js/pomodoro/components/BudgetCard.tsx`) — polls `/usage` every 5 s, renders countdown + progress bar + courtesy button.
-- Sparkles Pomodoro Tauri app (`~/Projects/sparkles-pomodoro-app/`) — menu-bar tray icon polls `/usage` every 5 s, surfaces "⌛ 2h 14m" or "🔒 Xh Ym".
+- Sparkles Pomodoro Tauri app (`~/Projects/sparkles-pomodoro-app/`) — menu-bar tray icon polls `/usage` (5 s while a pomodoro timer runs, once per minute idle), surfaces "⌛ 2h 14m" or "🔒 Xh Ym".
 
 If alacritty isn't running, both consumers gracefully degrade to a
 "Companion offline" state.
