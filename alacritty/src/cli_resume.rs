@@ -19,7 +19,8 @@
 //! |                      | `.jsonl` the process holds OPEN                |                                       |
 //!
 //! Tools are matched by their resolved binary path (via `proc_pidpath`),
-//! not `pbi_comm`, because `pbi_comm` is truncated to 15 chars and reflects
+//! falling back to the kernel's saved launch path after an upgrade unlinks the
+//! running binary. `pbi_comm` is truncated to 15 chars and reflects
 //! the symlink target's basename (e.g. claude shows as `"2.1.144"`).
 //!
 //! ## Codex caveat
@@ -722,8 +723,7 @@ mod tests {
         assert!(rollout_uuid_from_path(&outside).is_none());
 
         // Right tree, not a rollout.
-        let other =
-            std::path::PathBuf::from("/Users/x/.codex/sessions/2026/07/25/notes.jsonl");
+        let other = std::path::PathBuf::from("/Users/x/.codex/sessions/2026/07/25/notes.jsonl");
         assert!(rollout_uuid_from_path(&other).is_none());
 
         // Truncated body with no uuid.
@@ -793,8 +793,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = "/Users/x/project";
         let user = make_rollout(&tmp, "2026/07/25", "2026-07-25T16-12-34", "uuid-user", cwd, false);
-        let sub_a = make_rollout(&tmp, "2026/07/27", "2026-07-27T04-20-32", "uuid-sub-a", cwd, true);
-        let sub_b = make_rollout(&tmp, "2026/07/27", "2026-07-27T11-14-51", "uuid-sub-b", cwd, true);
+        let sub_a =
+            make_rollout(&tmp, "2026/07/27", "2026-07-27T04-20-32", "uuid-sub-a", cwd, true);
+        let sub_b =
+            make_rollout(&tmp, "2026/07/27", "2026-07-27T11-14-51", "uuid-sub-b", cwd, true);
         // Subagents are NEWER than the user session — mtime must not save them.
         set_mtime(&user, 1_000);
         set_mtime(&sub_a, 9_000);
@@ -814,8 +816,7 @@ mod tests {
         let cwd = "/Users/x/project";
         let elsewhere =
             make_rollout(&tmp, "2026/07/25", "2026-07-25T10-00-00", "uuid-other", "/other", false);
-        let here =
-            make_rollout(&tmp, "2026/07/25", "2026-07-25T10-01-00", "uuid-here", cwd, false);
+        let here = make_rollout(&tmp, "2026/07/25", "2026-07-25T10-01-00", "uuid-here", cwd, false);
         set_mtime(&here, 1_000);
         set_mtime(&elsewhere, 9_000);
 
@@ -881,6 +882,32 @@ mod tests {
         let b = codex_session_from_open_paths(&paths, cwd);
         assert_eq!(a.as_deref(), Some("uuid-first"));
         assert_eq!(b.as_deref(), Some("uuid-second"), "second tab must not reuse the first id");
+    }
+
+    #[test]
+    fn codex_resume_survives_executable_removal() {
+        // A real child holds a rollout open under a Codex vendor path. Removing
+        // its executable reproduces an npm upgrade without launching an AI CLI.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = "/Users/x/project";
+        let rollout =
+            make_rollout(&tmp, "2026/07/11", "2026-07-11T16-36-37", "uuid-upgraded", cwd, false);
+        let executable = tmp.path().join("@openai/codex/bin/codex");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let mut child =
+            crate::macos::proc::tests::spawn_test_executable(&executable, Some(&rollout));
+        std::fs::remove_file(&executable).unwrap();
+
+        begin_save_tick();
+        let command = resume_command_for(
+            std::process::id() as c_int,
+            Path::new(cwd),
+            &test_ai_resume_config(),
+        );
+        // Always reap our fixture before asserting, including the regression case.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(command.as_deref(), Some("codex --toml-codex-flag resume uuid-upgraded"));
     }
 
     #[test]

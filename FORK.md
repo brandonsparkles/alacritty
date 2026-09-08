@@ -122,6 +122,14 @@ should list at least the subprocess you ran. If it does, but the indicator
 is still missing, the 500 ms polling tick may have been unscheduled — relaunch
 to retrigger.
 
+**Codex tabs disappear from saved sessions after an npm update.** The update can
+unlink the executable of a still-running Codex process. macOS then returns no
+`proc_pidpath`, even though the process still holds its conversation rollout open.
+The resolver falls back to the executable path saved by `KERN_PROCARGS2`, then uses
+the same per-process rollout/explicit-session lookup. It never falls back to the
+newest conversation across tabs. Regression checks:
+`cargo test -p alacritty executable_removal -- --test-threads=1`.
+
 **Session doesn't restore.** Verify the saved-state file exists:
 
 ```bash

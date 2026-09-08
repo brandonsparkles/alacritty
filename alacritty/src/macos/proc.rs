@@ -117,8 +117,9 @@ pub fn list_descendants(parent_pid: c_int, max_depth: usize) -> Vec<c_int> {
 }
 
 /// Return the full filesystem path of the binary backing `pid`, resolving
-/// any symlinks the kernel followed at exec time. `None` if the process is
-/// gone or unreadable.
+/// any symlinks the kernel followed at exec time. If an update unlinked the
+/// executable, fall back to the launch path saved in `KERN_PROCARGS2`.
+/// `None` if the process is gone or unreadable.
 ///
 /// We use this in `cli_resume.rs` to identify AI CLIs whose user-visible
 /// command (e.g. `claude`) is a symlink into a version-pinned binary
@@ -130,7 +131,13 @@ pub fn pid_path(pid: c_int) -> Option<std::path::PathBuf> {
     let mut buf = vec![0u8; 4096];
     let n = unsafe { sys::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
     if n <= 0 {
-        return None;
+        // npm can remove a running Codex binary during an upgrade. Its vnode
+        // path is then unavailable, but the kernel still has the launch path.
+        let args = process_args(pid)?;
+        let executable = args.get(mem::size_of::<c_int>()..)?;
+        let end = executable.iter().position(|&byte| byte == 0)?;
+        let path = std::str::from_utf8(&executable[..end]).ok()?;
+        return (!path.is_empty()).then(|| PathBuf::from(path));
     }
     buf.truncate(n as usize);
     let s = std::str::from_utf8(&buf).ok()?.trim_end_matches('\0');
@@ -184,13 +191,10 @@ pub fn start_tvsec(pid: c_int) -> Option<u64> {
     Some(info.pbi_start_tvsec)
 }
 
-/// Return the process argv via `KERN_PROCARGS2`.
-///
-/// Used by `cli_resume.rs` to preserve an explicit `codex resume <uuid>`
-/// command after a restored Codex process is running. The rollout file's
-/// timestamp can be much older than the current process when a session was
-/// resumed, so argv is the durable signal in that case.
-pub fn argv(pid: c_int) -> Option<Vec<String>> {
+/// Read the kernel's saved executable path, argv, and environment. Shared by
+/// executable identification and explicit resume-argument parsing; callers
+/// only expose the path or argv, never the environment.
+fn process_args(pid: c_int) -> Option<Vec<u8>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut buf = vec![0u8; 256 * 1024];
     let mut len = buf.len();
@@ -208,7 +212,12 @@ pub fn argv(pid: c_int) -> Option<Vec<String>> {
         return None;
     }
     buf.truncate(len);
+    Some(buf)
+}
 
+/// Return the process argv, excluding the environment and saved executable path.
+pub fn argv(pid: c_int) -> Option<Vec<String>> {
+    let buf = process_args(pid)?;
     let argc = c_int::from_ne_bytes(buf[..std::mem::size_of::<c_int>()].try_into().ok()?);
     let argc = usize::try_from(argc).ok()?;
     if argc == 0 {
@@ -267,13 +276,7 @@ pub fn open_file_paths(pid: c_int) -> Vec<PathBuf> {
         vec![sys::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; count + 16];
     let buf_bytes = (buf.len() * mem::size_of::<sys::proc_fdinfo>()) as c_int;
     let actual = unsafe {
-        sys::proc_pidinfo(
-            pid,
-            sys::PROC_PIDLISTFDS,
-            0,
-            buf.as_mut_ptr() as *mut c_void,
-            buf_bytes,
-        )
+        sys::proc_pidinfo(pid, sys::PROC_PIDLISTFDS, 0, buf.as_mut_ptr() as *mut c_void, buf_bytes)
     };
     if actual <= 0 {
         return Vec::new();
@@ -490,14 +493,75 @@ mod sys {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    use std::io::{BufRead, Write};
+    use std::path::Path;
     use std::{env, process};
+
+    pub(crate) fn spawn_test_executable(path: &Path, rollout: Option<&Path>) -> process::Child {
+        // Copy our ad-hoc-signed test binary. Relocating Apple platform binaries
+        // such as /bin/sleep can make AMFI kill them before they reach main.
+        std::fs::copy(env::current_exe().unwrap(), path).unwrap();
+        let mut command = process::Command::new(path.canonicalize().unwrap());
+        command
+            .args([
+                "--exact",
+                "macos::proc::tests::executable_removal_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ALACRITTY_TEST_EXECUTABLE_REMOVAL", "1")
+            .env_remove("ALACRITTY_TEST_ROLLOUT")
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::piped());
+        if let Some(rollout) = rollout {
+            command.env("ALACRITTY_TEST_ROLLOUT", rollout);
+        }
+        let mut child = command.spawn().unwrap();
+        let ready = std::io::BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .any(|line| line.unwrap() == "ready");
+        assert!(ready, "fixture exited before opening its rollout");
+        child
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for executable-removal tests"]
+    fn executable_removal_child() {
+        if env::var("ALACRITTY_TEST_EXECUTABLE_REMOVAL").as_deref() != Ok("1") {
+            return;
+        }
+        let _rollout =
+            env::var_os("ALACRITTY_TEST_ROLLOUT").map(|path| std::fs::File::open(path).unwrap());
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_line(&mut String::new()).unwrap();
+    }
 
     #[test]
     fn cwd_matches_current_dir() {
         assert_eq!(cwd(process::id() as i32).ok(), env::current_dir().ok());
+    }
+
+    #[test]
+    fn pid_path_survives_executable_removal() {
+        // npm replaces and unlinks the old vendor binary while Codex keeps running.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let executable = tmp.path().join("codex");
+        let mut child = spawn_test_executable(&executable, None);
+        let expected = executable.canonicalize().unwrap();
+        let pid = child.id() as i32;
+        let before = pid_path(pid);
+        std::fs::remove_file(&executable).unwrap();
+        let after = pid_path(pid);
+        // Always reap our fixture before asserting, including the regression case.
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(before, Some(expected.clone()));
+        assert_eq!(after, Some(expected));
     }
 
     #[test]
