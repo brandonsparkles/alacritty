@@ -19,11 +19,9 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
@@ -198,19 +196,12 @@ pub struct SaveRequest {
     pub ai_resume: AiResumeConfig,
 }
 
-/// How long a resolved (or resolved-to-None) resume command may be reused
-/// before the worker re-walks that shell's process tree. A window/PTY
-/// change means a new shell PID, which misses the cache immediately.
-const RESUME_CACHE_TTL: Duration = Duration::from_secs(30);
-
 /// Background thread that turns [`SaveRequest`]s into `session.json`
 /// writes, keeping proc/file scanning off the event-loop thread.
 ///
-/// Crash-staleness contract: the 3s tick cadence is unchanged and each
-/// request is processed in well under a tick, so a crash at any moment
-/// still restores sessions no staler than the previous ~3s bound. Only
-/// the *resume command* may lag up to [`RESUME_CACHE_TTL`] behind, by
-/// design (per-PID cache with lazy re-resolve).
+/// Resume commands are resolved for every request: a shell PID can stay
+/// unchanged while its AI CLI starts, exits, or switches conversations.
+/// The usual freshness is the 3s tick cadence plus worker processing time.
 pub struct SaveWorker {
     tx: SyncSender<SaveRequest>,
 }
@@ -220,13 +211,11 @@ impl SaveWorker {
         let (tx, rx) = std::sync::mpsc::sync_channel::<SaveRequest>(1);
         let _ = std::thread::Builder::new().name("alacritty-session-save".to_string()).spawn(
             move || {
-                // shell PID → (resolved-at, resume command or None).
-                let mut resume_cache: HashMap<i32, (Instant, Option<String>)> = HashMap::new();
                 // Last snapshot that hit disk; identical snapshots skip
                 // the serialize + write entirely.
                 let mut last_saved: Option<Session> = None;
                 while let Ok(request) = rx.recv() {
-                    process_save(request, &mut resume_cache, &mut last_saved);
+                    process_save(request, &mut last_saved);
                 }
             },
         );
@@ -234,8 +223,8 @@ impl SaveWorker {
     }
 
     /// Queue one save tick. If the worker is still busy with the previous
-    /// request the tick is dropped — the next 3s tick retries, so the
-    /// staleness bound stays one tick.
+    /// request the tick is dropped — the next 3s tick retries. A busy
+    /// worker can therefore delay persistence beyond the usual cadence.
     pub fn request(&self, request: SaveRequest) {
         match self.tx.try_send(request) {
             Ok(()) | Err(TrySendError::Full(_)) => (),
@@ -246,46 +235,38 @@ impl SaveWorker {
     }
 }
 
-fn process_save(
-    request: SaveRequest,
-    resume_cache: &mut HashMap<i32, (Instant, Option<String>)>,
-    last_saved: &mut Option<Session>,
-) {
-    // Drop cache entries for windows that no longer exist.
-    resume_cache.retain(|pid, _| request.windows.iter().any(|seed| seed.shell_pid == *pid));
-
-    // Reset the per-tick codex-UUID claim set so each window resolves
-    // codex's per-PID rollout against a fresh slate, then re-claim the
-    // UUIDs held by cache-fresh windows FIRST — otherwise a sibling
-    // window resolving fresh in this tick could grab a UUID a cached
-    // window still owns.
+fn process_save(request: SaveRequest, last_saved: &mut Option<Session>) {
+    // Every window resolves afresh, retaining the per-tick protection
+    // against sibling windows claiming the same codex rollout.
     crate::cli_resume::begin_save_tick();
-    for seed in &request.windows {
-        if let Some((resolved_at, Some(command))) = resume_cache.get(&seed.shell_pid) {
-            if resolved_at.elapsed() < RESUME_CACHE_TTL {
-                crate::cli_resume::claim_saved_resume_command(command);
-            }
-        }
+    let session = snapshot(&request, |shell_pid, config| {
+        let working_directory = crate::macos::proc::cwd(shell_pid).ok()?;
+        let resume_command =
+            crate::cli_resume::resume_command_for(shell_pid, &working_directory, config);
+        Some((working_directory, resume_command))
+    });
+    if last_saved.as_ref() == Some(&session) {
+        return;
     }
+    session.save();
+    // Empty snapshots are never written (see `Session::save`), so they
+    // must not update the last-written marker either.
+    if !session.windows.is_empty() {
+        *last_saved = Some(session);
+    }
+}
 
+fn snapshot(
+    request: &SaveRequest,
+    mut resolve: impl FnMut(i32, &AiResumeConfig) -> Option<(PathBuf, Option<String>)>,
+) -> Session {
     let mut windows = Vec::with_capacity(request.windows.len());
     for seed in &request.windows {
         // A window whose shell is gone is skipped, matching the previous
         // synchronous snapshot behavior.
-        let Ok(working_directory) = crate::macos::proc::cwd(seed.shell_pid) else { continue };
-        let resume_command = match resume_cache.get(&seed.shell_pid) {
-            Some((resolved_at, cached)) if resolved_at.elapsed() < RESUME_CACHE_TTL => {
-                cached.clone()
-            },
-            _ => {
-                let resolved = crate::cli_resume::resume_command_for(
-                    seed.shell_pid,
-                    &working_directory,
-                    &request.ai_resume,
-                );
-                resume_cache.insert(seed.shell_pid, (Instant::now(), resolved.clone()));
-                resolved
-            },
+        let Some((working_directory, resume_command)) = resolve(seed.shell_pid, &request.ai_resume)
+        else {
+            continue;
         };
         windows.push(WindowState {
             working_directory,
@@ -297,14 +278,37 @@ fn process_save(
         });
     }
 
-    let session = Session { version: CURRENT_VERSION, windows };
-    if last_saved.as_ref() == Some(&session) {
-        return;
-    }
-    session.save();
-    // Empty snapshots are never written (see `Session::save`), so they
-    // must not update the last-written marker either.
-    if !session.windows.is_empty() {
-        *last_saved = Some(session);
+    Session { version: CURRENT_VERSION, windows }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_refreshes_resume_under_unchanged_shell_pid_every_request() {
+        let request = SaveRequest {
+            windows: vec![WindowSeed {
+                shell_pid: 42,
+                tab_title: Some("work".into()),
+                size: Some((800, 600)),
+                position: Some((10, 20)),
+            }],
+            ai_resume: AiResumeConfig::default(),
+        };
+        // No sleeping: consecutive save requests must observe start,
+        // conversation switch, and exit immediately, including cached None.
+        for command in [None, Some("claude --resume first"), Some("codex resume second"), None] {
+            let session = snapshot(&request, |pid, _| {
+                assert_eq!(pid, 42);
+                Some((PathBuf::from("/fixture"), command.map(str::to_owned)))
+            });
+            let window = &session.windows[0];
+            assert_eq!(window.resume_command.as_deref(), command);
+            assert_eq!(window.tab_title.as_deref(), Some("work"));
+            assert_eq!(window.size, Some((800, 600)));
+            assert_eq!(window.position, Some((10, 20)));
+        }
+        assert!(snapshot(&request, |_, _| None).windows.is_empty());
     }
 }

@@ -55,7 +55,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::config::ai_resume::AiResumeConfig;
 
 /// Codex session UUIDs claimed by sibling windows during the current
-/// save-tick. Cleared by `begin_save_tick()` from the event loop before
+/// save-tick. Cleared by `begin_save_tick()` from the save worker before
 /// each iteration over windows. Ensures that two codex tabs whose PIDs
 /// started in the same second don't both resolve to the same earliest
 /// rollout — the first window to call grabs it, the second gets the
@@ -71,23 +71,6 @@ fn claimed_set() -> &'static Mutex<HashSet<String>> {
 pub fn begin_save_tick() {
     if let Ok(mut g) = claimed_set().lock() {
         g.clear();
-    }
-}
-
-/// Re-claim the codex session UUID embedded in an already-resolved resume
-/// command. The session-save worker caches resume commands per shell PID;
-/// at the start of a save tick it claims every cache-fresh codex UUID so
-/// a sibling window resolving fresh in the same tick can't take it.
-pub fn claim_saved_resume_command(command: &str) {
-    let args: Vec<&str> = command.split_whitespace().collect();
-    let Some(program) = args.first() else { return };
-    if !(program.ends_with("codex") || program.ends_with("codexpilot")) {
-        return;
-    }
-    if let Some(id) = codex_resume_id_from_args(&args) {
-        if let Ok(mut g) = claimed_set().lock() {
-            g.insert(id);
-        }
     }
 }
 
