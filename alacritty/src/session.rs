@@ -20,7 +20,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use log::{debug, warn};
@@ -126,17 +126,21 @@ impl Session {
     /// last good state with `windows: []` — that would make the next
     /// launch restore nothing. The Shift-at-launch opt-out clears
     /// explicitly when the user really wants a fresh start.
-    pub fn save(&self) {
-        if self.windows.is_empty() {
-            return;
-        }
+    pub fn save(&self) -> bool {
+        let Some(dir) = Self::path() else { return false };
+        self.save_to(&dir)
+    }
 
-        let Some(dir) = Self::path() else { return };
-        let Some(file) = Self::file() else { return };
+    /// Return true only after a nonempty snapshot reaches its final path.
+    fn save_to(&self, dir: &Path) -> bool {
+        if self.windows.is_empty() {
+            return false;
+        }
+        let file = dir.join("session.json");
 
         if let Err(err) = fs::create_dir_all(&dir) {
             debug!("Could not create saved-state dir {}: {err}", dir.display());
-            return;
+            return false;
         }
 
         let mut to_persist = self.clone();
@@ -146,7 +150,7 @@ impl Session {
             Ok(j) => j,
             Err(err) => {
                 debug!("Could not serialize session: {err}");
-                return;
+                return false;
             },
         };
 
@@ -155,12 +159,14 @@ impl Session {
         let tmp = file.with_extension("json.tmp");
         if let Err(err) = fs::write(&tmp, json) {
             debug!("Could not write {}: {err}", tmp.display());
-            return;
+            return false;
         }
         if let Err(err) = fs::rename(&tmp, &file) {
             debug!("Could not rename {} -> {}: {err}", tmp.display(), file.display());
             let _ = fs::remove_file(&tmp);
+            return false;
         }
+        true
     }
 
     /// Remove the saved state. Called at launch when the user holds Shift
@@ -245,13 +251,19 @@ fn process_save(request: SaveRequest, last_saved: &mut Option<Session>) {
             crate::cli_resume::resume_command_for(shell_pid, &working_directory, config);
         Some((working_directory, resume_command))
     });
-    if last_saved.as_ref() == Some(&session) {
+    persist_snapshot(session, last_saved, Session::save);
+}
+
+fn persist_snapshot(
+    session: Session,
+    last_saved: &mut Option<Session>,
+    persist: impl FnOnce(&Session) -> bool,
+) {
+    if session.windows.is_empty() || last_saved.as_ref() == Some(&session) {
         return;
     }
-    session.save();
-    // Empty snapshots are never written (see `Session::save`), so they
-    // must not update the last-written marker either.
-    if !session.windows.is_empty() {
+    // A failed write must remain eligible for retry on the next tick.
+    if persist(&session) {
         *last_saved = Some(session);
     }
 }
@@ -310,5 +322,71 @@ mod tests {
             assert_eq!(window.position, Some((10, 20)));
         }
         assert!(snapshot(&request, |_, _| None).windows.is_empty());
+    }
+
+    fn fixture_session() -> Session {
+        Session {
+            version: CURRENT_VERSION,
+            windows: vec![WindowState {
+                working_directory: PathBuf::from("/fixture"),
+                tab_title: None,
+                tabbing_id: String::new(),
+                size: None,
+                position: None,
+                resume_command: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn failed_persistence_retries_identical_snapshot_after_recovery() {
+        for failure in ["mkdir", "write", "rename"] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("saved");
+            match failure {
+                "mkdir" => fs::write(&destination, "blocked").unwrap(),
+                "write" => fs::create_dir_all(destination.join("session.json.tmp")).unwrap(),
+                _ => fs::create_dir_all(destination.join("session.json")).unwrap(),
+            }
+            let session = fixture_session();
+            let mut last_saved = None;
+            persist_snapshot(session.clone(), &mut last_saved, |s| s.save_to(&destination));
+            assert!(last_saved.is_none(), "{failure} must not mark snapshot saved");
+            match failure {
+                "mkdir" => fs::remove_file(&destination).unwrap(),
+                "write" => fs::remove_dir(destination.join("session.json.tmp")).unwrap(),
+                _ => fs::remove_dir(destination.join("session.json")).unwrap(),
+            }
+            persist_snapshot(session.clone(), &mut last_saved, |s| s.save_to(&destination));
+            assert_eq!(last_saved.as_ref(), Some(&session));
+            let persisted: Session =
+                serde_json::from_slice(&fs::read(destination.join("session.json")).unwrap())
+                    .unwrap();
+            assert_eq!(persisted, session);
+            persist_snapshot(session, &mut last_saved, |_| panic!("unchanged success must skip"));
+        }
+    }
+
+    #[test]
+    fn failure_and_empty_snapshot_preserve_last_successful_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = fixture_session();
+        assert!(old.save_to(dir.path()));
+        let original = fs::read(dir.path().join("session.json")).unwrap();
+        let mut last_saved = Some(old.clone());
+        let mut changed = old.clone();
+        changed.windows[0].tab_title = Some("changed".into());
+        fs::create_dir(dir.path().join("session.json.tmp")).unwrap();
+        persist_snapshot(changed.clone(), &mut last_saved, |s| s.save_to(dir.path()));
+        assert_eq!(last_saved.as_ref(), Some(&old));
+        assert_eq!(fs::read(dir.path().join("session.json")).unwrap(), original);
+        let empty = Session::default();
+        assert!(!empty.save_to(dir.path()));
+        persist_snapshot(empty, &mut last_saved, |_| panic!("empty must skip"));
+        assert_eq!(last_saved.as_ref(), Some(&old));
+        assert_eq!(fs::read(dir.path().join("session.json")).unwrap(), original);
+        fs::remove_dir(dir.path().join("session.json.tmp")).unwrap();
+        persist_snapshot(changed.clone(), &mut last_saved, |s| s.save_to(dir.path()));
+        assert_eq!(last_saved.as_ref(), Some(&changed));
     }
 }
