@@ -112,7 +112,8 @@ that marker doesn't match `git HEAD`). Manual fallback:
 cd ~/Projects/alacritty
 cargo build --release -p alacritty
 cp target/release/alacritty /Applications/Alacritty.app/Contents/MacOS/alacritty
-codesign --force --deep --sign - /Applications/Alacritty.app
+SIGNING_IDENTITY="${SPARKLES_LOCAL_CODESIGN_IDENTITY:-Brandon Lind Code 2}"
+codesign --force --deep --sign "$SIGNING_IDENTITY" /Applications/Alacritty.app
 echo "$(git rev-parse HEAD)" > /Applications/Alacritty.app/Contents/MacOS/.fork-sha
 ```
 
