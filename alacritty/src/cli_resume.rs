@@ -13,6 +13,7 @@
 //! | Tool                 | Identifier source                              | Resume command                        |
 //! |----------------------|------------------------------------------------|---------------------------------------|
 //! | claude               | `~/.claude/sessions/<pid>.json` → `sessionId`  | `claude <flags> --resume <id>`        |
+//! | cglm (Claude + GLM)   | Same marker, z.ai endpoint in argv settings    | `cglm [--flash] <flags> --resume <id>` |
 //! | copilot              | `~/.copilot/logs/process-<ts>-<pid>.log` last  | `copilot <flags> --resume=<id>`       |
 //! |                      | "Registering foreground session: <uuid>" entry |                                       |
 //! | codex / codexpilot   | argv `resume <uuid>`, else the rollout         | `<program> <flags> resume <id>`       |
@@ -156,11 +157,69 @@ fn claude_resume(pid: c_int, ai_resume: &AiResumeConfig) -> Option<String> {
     if session_id.is_empty() {
         return None;
     }
-    Some(claude_resume_command(session_id, ai_resume))
+    let args = crate::macos::proc::argv(pid)?;
+    claude_resume_from_args(session_id, &args, ai_resume)
 }
 
 fn claude_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
     build_command("claude", &ai_resume.claude.flags, ["--resume", session_id])
+}
+
+/// The cglm shell function execs the same Claude binary, but includes its
+/// provider endpoint in inline --settings. Preserve that launcher instead of
+/// silently resuming with subscription credentials. Never persist auth tokens.
+fn claude_resume_from_args(
+    session_id: &str,
+    args: &[String],
+    ai_resume: &AiResumeConfig,
+) -> Option<String> {
+    let mut endpoint = None;
+    let mut flash = false;
+    let mut args = args.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let settings = if arg == "--settings" {
+            args.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--settings=")
+        };
+        if let Some(settings) = settings {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(settings) {
+                if let Some(url) = value.get("env").and_then(|env| env.get("ANTHROPIC_BASE_URL")) {
+                    endpoint = Some(url.as_str()?.to_owned());
+                }
+            }
+            continue;
+        }
+        let model = if arg == "--model" {
+            args.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--model=")
+        };
+        if let Some(model) = model {
+            flash = model == "haiku";
+        }
+    }
+
+    match endpoint.as_deref().map(|url| url.trim_end_matches('/')) {
+        Some("https://api.z.ai/api/anthropic") => {
+            Some(cglm_resume_command(session_id, flash, ai_resume))
+        },
+        None | Some("") | Some("https://api.anthropic.com") => {
+            Some(claude_resume_command(session_id, ai_resume))
+        },
+        // An unrecognized provider must not fall back to paid Claude credits.
+        Some(_) => None,
+    }
+}
+
+fn cglm_resume_command(session_id: &str, flash: bool, ai_resume: &AiResumeConfig) -> String {
+    // cglm consumes --flash only at the start, before forwarding Claude flags.
+    let tail = flash
+        .then_some("--flash")
+        .into_iter()
+        .chain(ai_resume.claude.flags.iter().map(String::as_str))
+        .chain(["--resume", session_id]);
+    build_command("cglm", &[], tail)
 }
 
 // ---------- copilot ----------
@@ -330,6 +389,10 @@ fn codex_resume_arg_from(args: &[String]) -> Option<String> {
 pub fn normalize_saved_resume_command(command: &str, ai_resume: &AiResumeConfig) -> Option<String> {
     let args: Vec<&str> = command.split_whitespace().collect();
     let program = args.first()?;
+    if *program == "cglm" {
+        return claude_resume_id_from_args(&args)
+            .map(|id| cglm_resume_command(&id, args.get(1) == Some(&"--flash"), ai_resume));
+    }
     if program.ends_with("claude") {
         return claude_resume_id_from_args(&args).map(|id| claude_resume_command(&id, ai_resume));
     }
@@ -566,6 +629,75 @@ mod tests {
     }
 
     #[test]
+    fn cglm_resume_preserves_provider_and_flash_across_save_load() {
+        let config = test_ai_resume_config();
+        for (model, prefix) in [("sonnet", "cglm"), ("haiku", "cglm --flash")] {
+            // Match ~/.zshrc's cglm launch, including an unrelated setting.
+            let args = [
+                "claude",
+                "--model",
+                model,
+                "--effort",
+                "max",
+                "--settings",
+                r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ENABLE_TOOL_SEARCH":"0"}}"#,
+            ]
+            .map(String::from);
+            let command = claude_resume_from_args("glm-session", &args, &config).unwrap();
+            assert_eq!(command, format!("{prefix} --toml-claude-flag --resume glm-session"));
+            let serialized = serde_json::to_string(&command).unwrap();
+            let saved: String = serde_json::from_str(&serialized).unwrap();
+            let mut updated = config.clone();
+            updated.claude.flags = vec!["--new-policy".into()];
+            assert_eq!(
+                normalize_saved_resume_command(&saved, &updated),
+                Some(format!("{prefix} --new-policy --resume glm-session"))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_resume_keeps_subscription_without_glm_endpoint() {
+        let config = test_ai_resume_config();
+        for args in [
+            vec!["claude", "--model", "haiku"],
+            vec!["claude", "--settings", r#"{"env":{"ENABLE_TOOL_SEARCH":"0"}}"#],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(
+                claude_resume_from_args("subscription-session", &args, &config).as_deref(),
+                Some("claude --toml-claude-flag --resume subscription-session")
+            );
+        }
+    }
+
+    #[test]
+    fn cglm_resume_handles_equals_options_and_last_model_override() {
+        let args = [
+            "claude",
+            "--model=haiku",
+            "--settings={\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.z.ai/api/anthropic/\"}}",
+            "--model=sonnet",
+        ]
+        .map(String::from);
+        assert_eq!(
+            claude_resume_from_args("glm-session", &args, &AiResumeConfig::default()).as_deref(),
+            Some("cglm --resume glm-session")
+        );
+    }
+
+    #[test]
+    fn claude_resume_does_not_replace_unknown_provider_with_subscription() {
+        let args = [
+            "claude",
+            "--settings",
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://other.example/api/anthropic"}}"#,
+        ]
+        .map(String::from);
+        assert!(claude_resume_from_args("session", &args, &AiResumeConfig::default()).is_none());
+    }
+
+    #[test]
     fn resume_commands_use_configured_flags() {
         let mut config = test_ai_resume_config();
         config.codex.flags = vec!["--sandbox".into(), "workspace-write".into()];
@@ -634,14 +766,13 @@ mod tests {
     #[test]
     fn normalize_saved_resume_command_rejects_codex_last() {
         let config = test_ai_resume_config();
-        assert!(
-            normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
-                .is_none()
-        );
-        assert!(
-            normalize_saved_resume_command("codexpilot --existing-flag resume --last", &config,)
-                .is_none()
-        );
+        assert!(normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
+            .is_none());
+        assert!(normalize_saved_resume_command(
+            "codexpilot --existing-flag resume --last",
+            &config,
+        )
+        .is_none());
     }
 
     #[test]
