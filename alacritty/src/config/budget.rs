@@ -22,6 +22,7 @@
 //! weekly_extension_allowance_seconds = 21600
 //! ```
 
+use log::warn;
 use serde::Serialize;
 
 use alacritty_config_derive::ConfigDeserialize;
@@ -92,6 +93,33 @@ pub struct BudgetConfig {
     ///
     /// Default `21600` = six hours.
     pub weekly_extension_allowance_seconds: u64,
+}
+
+impl BudgetConfig {
+    /// `sleep_start_hour` clamped into the documented 0–23 range.
+    ///
+    /// The raw field is a bare `u8` straight out of `alacritty.toml` with
+    /// no deserialization validation, so a typo like `sleep_end_hour = 80`
+    /// would otherwise reach `NaiveTime::from_hms_opt` and panic the
+    /// event loop. Clamping upward (toward a later hour) never shortens
+    /// the sleep window.
+    pub fn sleep_start_hour_clamped(&self) -> u8 {
+        clamp_hour("sleep_start_hour", self.sleep_start_hour)
+    }
+
+    /// `sleep_end_hour` clamped into the documented 0–23 range.
+    pub fn sleep_end_hour_clamped(&self) -> u8 {
+        clamp_hour("sleep_end_hour", self.sleep_end_hour)
+    }
+}
+
+fn clamp_hour(key: &str, hour: u8) -> u8 {
+    if hour > 23 {
+        warn!("[budget] {key} = {hour} is outside 0-23; clamping to 23");
+        23
+    } else {
+        hour
+    }
 }
 
 impl Default for BudgetConfig {

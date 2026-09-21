@@ -173,7 +173,14 @@ around terminal-based AI tools.
 | Cap exhaustion | `active_seconds >= cap_seconds` (default 10 800 = 3 h) | Block engages: input filtered, lockout overlay rendered. |
 | Sleep window | Wall-clock time between `sleep_start_hour` (default 02:00) and `sleep_end_hour` (default 08:00) Chicago | Block engages regardless of remaining cap. |
 | Courtesy extension | User clicks the overlay button or presses `Cmd+Shift+Ctrl+E` | One-shot per day: adds `courtesy_seconds` to the budget window, lifts the budget-exhausted block. Enabled by default; can be disabled with `allow_courtesy = false`. |
-| Day boundary | Wall-clock crosses `sleep_end_hour` Chicago | `active_seconds = 0`, `courtesy_used = false`. New day. |
+| Weekly extension | User redeems from the overlay after the daily cap is spent | Adds `weekly_extension_seconds` (default 3600 = 1 h) of budget, drawn from a `weekly_extension_allowance_seconds` pool (default 21600 = 6 h/week). Enabled by default; disable with `allow_weekly_extensions = false`. Unavailable during the sleep window and while an extension is already active. |
+| Day boundary | Wall-clock crosses `sleep_end_hour` Chicago **forward** | `active_seconds = 0`, `courtesy_used = false`. New day. A day key that moves *backwards* (system clock set back) is refused: counters and the stored key are kept. |
+| Week boundary | ISO week key advances **forward** | Weekly extension allowance and `weekly_active_seconds` reset. Backwards moves are refused, same as the day boundary. |
+| Damaged state file | `usage.json` exists but does not parse | Fails closed with a `warn!`: legible counters are kept verbatim, anything unreadable is treated as already spent. Only a genuinely **absent** file starts at zero. |
+
+**Effective default ceiling: 3 h/day + a 15-min courtesy + up to 6 h/week of
+weekly extensions.** All three are on by default; set `allow_courtesy = false`
+and `allow_weekly_extensions = false` to get a hard 3 h/day.
 
 The overlay is a fullscreen opaque `NSView` over the GL surface — terminal
 content is invisible behind it. A one-shot courtesy button appears while
@@ -197,6 +204,9 @@ hide_when_inactive = true
 background_grace_seconds = 300  # 5 min grace before hide
 allow_courtesy = true            # one courtesy per day
 courtesy_seconds = 900           # 15 min courtesy duration
+allow_weekly_extensions = true   # weekly extension pool, ON by default
+weekly_extension_seconds = 3600  # 1 h per redemption
+weekly_extension_allowance_seconds = 21600  # 6 h of extension per ISO week
 ```
 
 All fields have sensible defaults; the section is optional. Set
@@ -253,12 +263,42 @@ clears immediately. Config values in the payload track TOML live-reloads.
 - `409 Conflict` `{"error":"already_used"}` if already spent today
 - `403 Forbidden` `{"error":"courtesy_disabled"}` when not explicitly enabled
 - `403 Forbidden` `{"error":"sleep_window"}` during the sleep window (extension is meaningless then — block lifts at `sleep_end_hour` regardless)
+- `403 Forbidden` `{"error":"missing_grant_header"}` when the `X-Alacritty-Budget: 1` header is absent
+
+**`POST /weekly-extension`** → only meaningful when
+`allow_weekly_extensions = true`
+- `200 OK` + updated JSON on success
+- `403 Forbidden` `{"error":"weekly_extension_disabled"}` / `{"error":"sleep_window"}`
+- `409 Conflict` `{"error":"weekly_extension_active"}` / `{"error":"weekly_extension_spent"}`
 
 **`OPTIONS *`** → 204 (CORS preflight).
 
-CORS headers permit any localhost origin + `https://aisparkles.com` so
-the pomodoro BudgetCard component can read the daemon directly from the
-browser.
+#### Origin allowlist (the daemon is a mutating endpoint on loopback)
+
+CORS headers are emitted **only** for an allowlisted `Origin`, and the
+matched origin is echoed verbatim — never `*`. Allowlisted =
+`https://aisparkles.com` / `https://www.aisparkles.com`, or any loopback
+origin (`http(s)://localhost | 127.0.0.1 | [::1]`, optional numeric port)
+for the Tauri shell and local dev servers.
+`Access-Control-Allow-Private-Network: true` rides along with those
+headers only, so Chromium's
+private-network preflight can never be satisfied by an arbitrary public
+page.
+
+Both `POST` routes additionally require the non-simple request header
+`X-Alacritty-Budget: 1`. A browser cannot send it without a successful
+preflight, and the preflight is unanswered for non-allowlisted origins —
+so a website open in another app while the terminal is locked cannot
+spend the courtesy or the weekly-extension allowance. CLI callers add the
+header explicitly:
+
+```sh
+curl -X POST -H 'X-Alacritty-Budget: 1' http://127.0.0.1:38121/courtesy
+```
+
+A request with no `Origin` at all (curl, native Tauri side) gets no CORS
+headers, which it does not need, but still must carry the grant header on
+the POST routes.
 
 ### Consumers
 

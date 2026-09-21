@@ -14,8 +14,21 @@
 //!                      409 if active/already spent for the week,
 //!                      403 if disabled or during the sleep window.
 //!
-//! Both responses include CORS headers permitting the aisparkles origin
-//! AND any localhost origin (for the Tauri shell + curl).
+//! Responses include CORS headers ONLY when the request carries an
+//! `Origin` that matches the explicit allowlist (`ALLOWED_ORIGINS` plus
+//! any loopback origin, for the Tauri shell + local dev servers). The
+//! matched origin is echoed back verbatim — never `*` — and
+//! `Access-Control-Allow-Private-Network` is emitted only for an
+//! allowlisted origin, so Chromium's private-network preflight cannot be
+//! satisfied by an arbitrary public page.
+//!
+//! The two mutating POST routes additionally require the non-simple
+//! request header `X-Alacritty-Budget: 1`. A browser cannot send that
+//! header without first passing a preflight, and the preflight is
+//! rejected for non-allowlisted origins — so a random website visited
+//! while the terminal is locked cannot spend the courtesy or the weekly
+//! extension allowance. Local CLI callers just add
+//! `-H 'X-Alacritty-Budget: 1'`.
 //!
 //! ### Threading model
 //!
@@ -35,7 +48,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, warn};
 use serde::Serialize;
 use winit::event_loop::EventLoopProxy;
 
@@ -46,6 +59,62 @@ use crate::event::{Event, EventType};
 /// Default port — chosen to be high, unlikely to collide, easy to recall.
 /// Used by the pomodoro card to poll `127.0.0.1:38121/usage`.
 pub const DEFAULT_PORT: u16 = 38121;
+
+/// Non-loopback origins allowed to talk to the daemon from a browser.
+/// Everything else must come from a loopback origin (see
+/// [`is_allowed_origin`]) or carry no `Origin` at all (curl / native).
+const ALLOWED_ORIGINS: &[&str] = &["https://aisparkles.com", "https://www.aisparkles.com"];
+
+/// Non-simple header required on every mutating route. Its presence
+/// forces a CORS preflight for browser callers, and that preflight is
+/// answered without CORS headers unless the origin is allowlisted.
+const GRANT_HEADER: &str = "x-alacritty-budget";
+
+/// True when `origin` is explicitly allowlisted or is a loopback origin
+/// (`http(s)://localhost|127.0.0.1|[::1]` with an optional numeric port).
+///
+/// Deliberately strict: an `Origin` is scheme + host + optional port and
+/// nothing else, so anything containing a path, userinfo, or a
+/// non-numeric port is rejected rather than prefix-matched.
+fn is_allowed_origin(origin: &str) -> bool {
+    if ALLOWED_ORIGINS.contains(&origin) {
+        return true;
+    }
+
+    let rest = match origin.split_once("://") {
+        Some(("http", rest)) | Some(("https", rest)) => rest,
+        _ => return false,
+    };
+    if rest.contains('/') || rest.contains('@') || rest.is_empty() {
+        return false;
+    }
+
+    let host = if let Some(bracketed) = rest.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((host, "")) => host,
+            Some((host, port)) if port.starts_with(':') && is_numeric_port(&port[1..]) => host,
+            _ => return false,
+        }
+    } else {
+        match rest.split_once(':') {
+            Some((host, port)) if is_numeric_port(port) => host,
+            Some(_) => return false,
+            None => rest,
+        }
+    };
+
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn is_numeric_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The origin to echo in the CORS headers, or `None` when the request had
+/// no `Origin` or one that failed the allowlist. `None` means "emit no
+/// CORS headers at all" — never `*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CorsOrigin<'a>(Option<&'a str>);
 
 /// Wire payload for `GET /usage`. Mirrors `Budget` but enriches with the
 /// computed block status and time-until-unlock so clients don't have to
@@ -110,8 +179,12 @@ fn lock_budget(budget: &Mutex<Budget>) -> MutexGuard<'_, Budget> {
 /// config-reload changes are reflected in the wire payload. `budget` is
 /// the live state shared with the event loop's ticker; `proxy` lets the
 /// POST handlers nudge the UI (overlay/tab titles) right after a grant.
-pub fn spawn<F>(port: u16, config_provider: F, budget: Arc<Mutex<Budget>>, proxy: EventLoopProxy<Event>)
-where
+pub fn spawn<F>(
+    port: u16,
+    config_provider: F,
+    budget: Arc<Mutex<Budget>>,
+    proxy: EventLoopProxy<Event>,
+) where
     F: Fn() -> BudgetConfig + Send + Sync + 'static,
 {
     thread::Builder::new()
@@ -121,7 +194,11 @@ where
             let listener = match TcpListener::bind(&addr) {
                 Ok(l) => l,
                 Err(err) => {
-                    debug!("budget daemon: bind {addr} failed: {err}");
+                    // A second instance (or stale socket holder) means this
+                    // process runs daemonless while companions report the
+                    // daemon offline/stale. Warn so it is diagnosable;
+                    // debug-level here hid silent /usage loss entirely.
+                    warn!("budget daemon: bind {addr} failed (pid {}): {err}", std::process::id());
                     return;
                 },
             };
@@ -155,7 +232,10 @@ fn handle(
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
-    // Drain headers — we don't actually need any of them.
+    // Read the headers we actually gate on: `Origin` (CORS allowlist) and
+    // the non-simple grant header required by the mutating routes.
+    let mut origin: Option<String> = None;
+    let mut grant_header = false;
     let mut buf = String::new();
     loop {
         buf.clear();
@@ -163,19 +243,52 @@ fn handle(
         if n == 0 || buf == "\r\n" || buf == "\n" {
             break;
         }
+        if let Some((name, value)) = buf.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            match name.as_str() {
+                "origin" => origin = Some(value.to_string()),
+                // Preflight asks permission for the grant header; treat
+                // the actual request header as the gate.
+                n if n == GRANT_HEADER => grant_header = value == "1",
+                _ => {},
+            }
+        }
     }
+
+    // `None` origin = a non-browser caller (curl, the Tauri shell's native
+    // side). Those get no CORS headers, which they don't need. A present
+    // but non-allowlisted origin also gets none, so the browser refuses to
+    // surface the response and the preflight for the mutating routes fails.
+    let cors_origin = origin.as_deref().filter(|o| is_allowed_origin(o));
+    if let Some(requested) = origin.as_deref() {
+        if cors_origin.is_none() {
+            warn!("budget daemon: rejecting CORS for origin {requested:?}");
+        }
+    }
+    let cors = CorsOrigin(cors_origin);
 
     let request_line = request_line.trim_end();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
 
+    // Gate the mutating routes on the non-simple header. A browser can
+    // only send it after a preflight, and the preflight above is answered
+    // without CORS headers for any non-allowlisted origin.
+    if method == "POST" && !grant_header {
+        warn!("budget daemon: rejecting {path} without {GRANT_HEADER} header");
+        let body = r#"{"error":"missing_grant_header"}"#;
+        write_response(&mut stream, cors, 403, "Forbidden", "application/json", body)?;
+        return Ok(());
+    }
+
     match (method, path) {
-        ("OPTIONS", _) => write_response(&mut stream, 204, "No Content", "", "")?,
+        ("OPTIONS", _) => write_response(&mut stream, cors, 204, "No Content", "", "")?,
         ("GET", "/usage") => {
             let body =
                 serde_json::to_string(&snapshot(cfg, budget)).unwrap_or_else(|_| "{}".into());
-            write_response(&mut stream, 200, "OK", "application/json", &body)?;
+            write_response(&mut stream, cors, 200, "OK", "application/json", &body)?;
         },
         ("POST", "/courtesy") => {
             let (granted, was_used) = {
@@ -195,16 +308,16 @@ fn handle(
                 let _ = proxy.send_event(Event::new(EventType::GrantCourtesy, None));
                 let body =
                     serde_json::to_string(&snapshot(cfg, budget)).unwrap_or_else(|_| "{}".into());
-                write_response(&mut stream, 200, "OK", "application/json", &body)?;
+                write_response(&mut stream, cors, 200, "OK", "application/json", &body)?;
             } else if !cfg.allow_courtesy {
                 let body = r#"{"error":"courtesy_disabled"}"#;
-                write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+                write_response(&mut stream, cors, 403, "Forbidden", "application/json", body)?;
             } else if was_used {
                 let body = r#"{"error":"already_used"}"#;
-                write_response(&mut stream, 409, "Conflict", "application/json", body)?;
+                write_response(&mut stream, cors, 409, "Conflict", "application/json", body)?;
             } else {
                 let body = r#"{"error":"sleep_window"}"#;
-                write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+                write_response(&mut stream, cors, 403, "Forbidden", "application/json", body)?;
             }
         },
         ("POST", "/weekly-extension") => {
@@ -221,28 +334,28 @@ fn handle(
                     let _ = proxy.send_event(Event::new(EventType::GrantWeeklyExtension, None));
                     let body = serde_json::to_string(&snapshot(cfg, budget))
                         .unwrap_or_else(|_| "{}".into());
-                    write_response(&mut stream, 200, "OK", "application/json", &body)?;
+                    write_response(&mut stream, cors, 200, "OK", "application/json", &body)?;
                 },
                 Err(WeeklyExtensionError::Disabled) => {
                     let body = r#"{"error":"weekly_extension_disabled"}"#;
-                    write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+                    write_response(&mut stream, cors, 403, "Forbidden", "application/json", body)?;
                 },
                 Err(WeeklyExtensionError::SleepWindow) => {
                     let body = r#"{"error":"sleep_window"}"#;
-                    write_response(&mut stream, 403, "Forbidden", "application/json", body)?;
+                    write_response(&mut stream, cors, 403, "Forbidden", "application/json", body)?;
                 },
                 Err(WeeklyExtensionError::AlreadyActive) => {
                     let body = r#"{"error":"weekly_extension_active"}"#;
-                    write_response(&mut stream, 409, "Conflict", "application/json", body)?;
+                    write_response(&mut stream, cors, 409, "Conflict", "application/json", body)?;
                 },
                 Err(WeeklyExtensionError::AllowanceSpent) => {
                     let body = r#"{"error":"weekly_extension_spent"}"#;
-                    write_response(&mut stream, 409, "Conflict", "application/json", body)?;
+                    write_response(&mut stream, cors, 409, "Conflict", "application/json", body)?;
                 },
             }
         },
         _ => {
-            write_response(&mut stream, 404, "Not Found", "application/json", "{}")?;
+            write_response(&mut stream, cors, 404, "Not Found", "application/json", "{}")?;
         },
     }
     Ok(())
@@ -282,17 +395,20 @@ fn snapshot(cfg: &BudgetConfig, budget: &Mutex<Budget>) -> UsagePayload {
     }
 }
 
-/// Minimal HTTP/1.1 writer. CORS headers allow the aisparkles app + any
-/// localhost origin to fetch directly from the browser. The private-network
-/// header is required by Chromium when a public HTTPS origin calls loopback.
+/// Minimal HTTP/1.1 writer. CORS headers are emitted only for an
+/// allowlisted origin (see [`is_allowed_origin`]), echoing that exact
+/// origin. The private-network header — which is what lets Chromium hand
+/// a public HTTPS page access to loopback — rides along with it, so it is
+/// never offered to an unknown site.
 fn write_response(
     stream: &mut TcpStream,
+    cors: CorsOrigin<'_>,
     status: u16,
     reason: &str,
     content_type: &str,
     body: &str,
 ) -> std::io::Result<()> {
-    let bytes = build_response_bytes(status, reason, content_type, body);
+    let bytes = build_response_bytes(cors, status, reason, content_type, body);
     stream.write_all(&bytes)?;
     Ok(())
 }
@@ -300,13 +416,23 @@ fn write_response(
 /// Pure helper: assemble the full HTTP/1.1 response byte string from its
 /// logical parts. Extracted so the CORS header contract can be unit-tested
 /// without a live TCP socket.
-fn build_response_bytes(status: u16, reason: &str, content_type: &str, body: &str) -> Vec<u8> {
+fn build_response_bytes(
+    cors: CorsOrigin<'_>,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) -> Vec<u8> {
     let mut headers = String::new();
     headers.push_str(&format!("HTTP/1.1 {} {}\r\n", status, reason));
-    headers.push_str("Access-Control-Allow-Origin: *\r\n");
-    headers.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-    headers.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
-    headers.push_str("Access-Control-Allow-Private-Network: true\r\n");
+    // Always vary: the same URL yields different CORS headers per origin.
+    headers.push_str("Vary: Origin\r\n");
+    if let CorsOrigin(Some(origin)) = cors {
+        headers.push_str(&format!("Access-Control-Allow-Origin: {}\r\n", origin));
+        headers.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        headers.push_str("Access-Control-Allow-Headers: Content-Type, X-Alacritty-Budget\r\n");
+        headers.push_str("Access-Control-Allow-Private-Network: true\r\n");
+    }
     headers.push_str("Cache-Control: no-store\r\n");
     if !content_type.is_empty() {
         headers.push_str(&format!("Content-Type: {}\r\n", content_type));
@@ -339,45 +465,104 @@ fn route_static(method: &str, path: &str) -> (u16, &'static str) {
 mod tests {
     use super::*;
 
+    /// Stand-in for an allowlisted browser caller.
+    const ALLOWED: CorsOrigin<'static> = CorsOrigin(Some("https://aisparkles.com"));
+    /// Stand-in for a rejected / absent origin.
+    const DENIED: CorsOrigin<'static> = CorsOrigin(None);
+
     // ── build_response_bytes ──────────────────────────────────────────────
 
     #[test]
     fn response_status_line_correct() {
-        let raw = build_response_bytes(200, "OK", "application/json", "{}");
+        let raw = build_response_bytes(ALLOWED, 200, "OK", "application/json", "{}");
         let text = String::from_utf8(raw).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "bad status line: {text:?}");
     }
 
     #[test]
     fn response_cors_headers_present() {
-        let raw = build_response_bytes(200, "OK", "application/json", r#"{"x":1}"#);
+        let raw = build_response_bytes(ALLOWED, 200, "OK", "application/json", r#"{"x":1}"#);
         let text = String::from_utf8(raw).unwrap();
-        assert!(text.contains("Access-Control-Allow-Origin: *\r\n"), "ACAO header missing");
+        assert!(
+            text.contains("Access-Control-Allow-Origin: https://aisparkles.com\r\n"),
+            "ACAO must echo the matched origin, never `*`: {text:?}"
+        );
+        assert!(!text.contains("Access-Control-Allow-Origin: *"), "wildcard ACAO must be gone");
         assert!(
             text.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"),
             "ACAM header missing"
         );
         assert!(
-            text.contains("Access-Control-Allow-Headers: Content-Type\r\n"),
+            text.contains("Access-Control-Allow-Headers: Content-Type, X-Alacritty-Budget\r\n"),
             "ACAH header missing"
         );
         assert!(
             text.contains("Access-Control-Allow-Private-Network: true\r\n"),
             "ACAPN header missing"
         );
+        assert!(text.contains("Vary: Origin\r\n"), "Vary: Origin missing");
         assert!(text.contains("Cache-Control: no-store\r\n"), "Cache-Control header missing");
     }
 
     #[test]
+    fn response_has_no_cors_headers_for_denied_origin() {
+        let raw = build_response_bytes(DENIED, 200, "OK", "application/json", r#"{"x":1}"#);
+        let text = String::from_utf8(raw).unwrap();
+        assert!(!text.contains("Access-Control-Allow-Origin"), "ACAO leaked to denied origin");
+        assert!(
+            !text.contains("Access-Control-Allow-Private-Network"),
+            "private-network opt-in leaked to denied origin — this is the PNA hole"
+        );
+        assert!(text.contains("Vary: Origin\r\n"), "Vary: Origin missing");
+    }
+
+    // ── is_allowed_origin ────────────────────────────────────────────────
+
+    #[test]
+    fn allowlisted_and_loopback_origins_accepted() {
+        for origin in [
+            "https://aisparkles.com",
+            "https://www.aisparkles.com",
+            "http://localhost",
+            "http://localhost:5173",
+            "https://localhost:8443",
+            "http://127.0.0.1:38121",
+            "http://[::1]:1420",
+            "http://[::1]",
+        ] {
+            assert!(is_allowed_origin(origin), "should be allowed: {origin}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_public_origins_rejected() {
+        for origin in [
+            "https://evil.example",
+            "https://aisparkles.com.evil.example",
+            "https://evil.example/aisparkles.com",
+            "http://localhost.evil.example",
+            "http://localhost@evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost:evil",
+            "null",
+            "",
+            "file://",
+            "http://aisparkles.com",
+        ] {
+            assert!(!is_allowed_origin(origin), "should be rejected: {origin}");
+        }
+    }
+
+    #[test]
     fn response_content_type_included_when_nonempty() {
-        let raw = build_response_bytes(200, "OK", "application/json", "{}");
+        let raw = build_response_bytes(ALLOWED, 200, "OK", "application/json", "{}");
         let text = String::from_utf8(raw).unwrap();
         assert!(text.contains("Content-Type: application/json\r\n"), "Content-Type header missing");
     }
 
     #[test]
     fn response_content_type_omitted_when_empty() {
-        let raw = build_response_bytes(204, "No Content", "", "");
+        let raw = build_response_bytes(ALLOWED, 204, "No Content", "", "");
         let text = String::from_utf8(raw).unwrap();
         assert!(!text.contains("Content-Type:"), "Content-Type should be absent for 204");
     }
@@ -385,7 +570,7 @@ mod tests {
     #[test]
     fn response_content_length_matches_body() {
         let body = r#"{"hello":"world"}"#;
-        let raw = build_response_bytes(200, "OK", "application/json", body);
+        let raw = build_response_bytes(ALLOWED, 200, "OK", "application/json", body);
         let text = String::from_utf8(raw).unwrap();
         let expected = format!("Content-Length: {}\r\n", body.len());
         assert!(text.contains(&expected), "Content-Length mismatch: {text:?}");
@@ -394,7 +579,7 @@ mod tests {
     #[test]
     fn response_body_follows_blank_line() {
         let body = r#"{"blocked":false}"#;
-        let raw = build_response_bytes(200, "OK", "application/json", body);
+        let raw = build_response_bytes(ALLOWED, 200, "OK", "application/json", body);
         let text = String::from_utf8(raw).unwrap();
         // Headers end with \r\n\r\n; body immediately follows.
         let sep = "\r\n\r\n";
@@ -404,7 +589,7 @@ mod tests {
 
     #[test]
     fn response_connection_close() {
-        let raw = build_response_bytes(200, "OK", "", "");
+        let raw = build_response_bytes(ALLOWED, 200, "OK", "", "");
         let text = String::from_utf8(raw).unwrap();
         assert!(text.contains("Connection: close\r\n"), "Connection: close missing");
     }
