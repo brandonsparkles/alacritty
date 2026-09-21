@@ -276,10 +276,17 @@ clears immediately. Config values in the payload track TOML live-reloads.
 #### Origin allowlist (the daemon is a mutating endpoint on loopback)
 
 CORS headers are emitted **only** for an allowlisted `Origin`, and the
-matched origin is echoed verbatim — never `*`. Allowlisted =
-`https://aisparkles.com` / `https://www.aisparkles.com`, or any loopback
-origin (`http(s)://localhost | 127.0.0.1 | [::1]`, optional numeric port)
-for the Tauri shell and local dev servers.
+matched origin is echoed verbatim — never `*`. Allowlisted = exactly
+`https://aisparkles.com` and `https://www.aisparkles.com`, matched
+byte-for-byte (`ALLOWED_ORIGINS` in `budget_daemon.rs`). **No loopback
+origin is allowlisted** — a blanket loopback arm would make every dev
+server the user has open (`http://localhost:3000`, a Vite port, …) a
+fully trusted caller that can spend the courtesy and the weekly
+extension. The Tauri shell does not need one: its WebView navigates to
+`https://www.aisparkles.com`, and its native side calls the daemon with
+`ureq`, which sends no `Origin`. Adding an origin means adding the exact
+`scheme://host:port` string to that constant — never a wildcard, suffix
+match, or host class.
 `Access-Control-Allow-Private-Network: true` rides along with those
 headers only, so Chromium's
 private-network preflight can never be satisfied by an arbitrary public

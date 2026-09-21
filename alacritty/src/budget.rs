@@ -162,6 +162,16 @@ impl Budget {
     /// damaged. Any counter still legible in `raw` is kept verbatim;
     /// anything unreadable is assumed spent (cap reached, courtesy used,
     /// weekly allowance exhausted) so corruption can never buy time.
+    ///
+    /// The salvaged day/week keys are shape-checked before being trusted.
+    /// `load_or_default` runs `refresh_day_boundary` immediately after
+    /// this, and that rolls over — zeroing `active_seconds` and clearing
+    /// `courtesy_used` — whenever today's key sorts *above* the stored
+    /// one. A damaged file carrying a non-date string (`"date_chicago":
+    /// "0"`, `"!!"`, a truncated fragment) sorts below every real key, so
+    /// trusting it verbatim would convert this fail-closed path into a
+    /// full refund. An unparseable key therefore falls back to the current
+    /// key, which cannot trigger a rollover.
     fn fail_closed(cfg: &BudgetConfig, raw: &str) -> Self {
         let salvaged: Option<serde_json::Value> = serde_json::from_str(raw).ok();
         let field = |key: &str| salvaged.as_ref().and_then(|v| v.get(key).cloned());
@@ -171,13 +181,18 @@ impl Budget {
         };
 
         Self {
-            date_chicago: str_field("date_chicago").unwrap_or_else(|| current_day_key(cfg)),
+            date_chicago: str_field("date_chicago")
+                .filter(|s| is_day_key(s))
+                .unwrap_or_else(|| current_day_key(cfg)),
             active_seconds: u64_field("active_seconds").unwrap_or(cfg.cap_seconds),
+            // Reporting-only counter (never gates `block_status`), so an
+            // unreadable value starts at zero rather than a fake total.
             weekly_active_seconds: u64_field("weekly_active_seconds").unwrap_or(0),
             courtesy_used: field("courtesy_used").and_then(|v| v.as_bool()).unwrap_or(true),
             // An extension we cannot verify is treated as not active.
             courtesy_expires_at: None,
             weekly_extension_week: str_field("weekly_extension_week")
+                .filter(|s| is_week_key(s))
                 .unwrap_or_else(|| current_week_key(cfg)),
             weekly_extension_used_seconds: u64_field("weekly_extension_used_seconds")
                 .unwrap_or(cfg.weekly_extension_allowance_seconds),
@@ -416,21 +431,71 @@ fn now_in(cfg: &BudgetConfig) -> chrono::DateTime<Tz> {
 /// `sleep_end_hour`. Local time before the reset hour still maps to
 /// *yesterday's* date.
 fn current_day_key(cfg: &BudgetConfig) -> String {
-    let shifted = now_in(cfg) - Duration::hours(cfg.sleep_end_hour_clamped() as i64);
+    day_key_of(now_in(cfg) - Duration::hours(cfg.sleep_end_hour_clamped() as i64))
+}
+
+/// Day key for an already-shifted local timestamp. Split out from
+/// [`current_day_key`] so the lexicographic-monotonicity contract that
+/// `refresh_day_boundary`'s strict `>` relies on is testable at arbitrary
+/// dates instead of only "now".
+fn day_key_of(shifted: chrono::DateTime<Tz>) -> String {
     shifted.format("%Y-%m-%d").to_string()
 }
 
 fn current_week_key(cfg: &BudgetConfig) -> String {
-    let shifted = now_in(cfg) - Duration::hours(cfg.sleep_end_hour_clamped() as i64);
+    week_key_of(now_in(cfg) - Duration::hours(cfg.sleep_end_hour_clamped() as i64))
+}
+
+/// Week key for an already-shifted local timestamp.
+///
+/// Uses the **ISO week-numbering year** (`IsoWeek::year()`), never the
+/// calendar year: 2027-01-01 belongs to 2026-W53, and labelling it
+/// `2027-W53` would make the following key (`2027-W01`) sort *backwards*.
+/// `refresh_week_boundary` would then read a real week rollover as a clock
+/// rollback and never refresh the allowance. Zero-padding the week keeps
+/// `-W09` < `-W10`.
+fn week_key_of(shifted: chrono::DateTime<Tz>) -> String {
     let week = shifted.iso_week();
     format!("{}-W{:02}", week.year(), week.week())
+}
+
+/// True when `key` has the exact `%Y-%m-%d` shape [`day_key_of`] emits.
+/// Used to refuse a salvaged-but-nonsensical key during fail-closed load.
+fn is_day_key(key: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(key, "%Y-%m-%d").is_ok()
+}
+
+/// True when `key` has the exact `<year>-W<2 digits>` shape
+/// [`week_key_of`] emits, with a plausible ISO week number.
+fn is_week_key(key: &str) -> bool {
+    let Some((year, week)) = key.split_once("-W") else { return false };
+    if year.len() < 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    week.len() == 2
+        && week.bytes().all(|b| b.is_ascii_digit())
+        && matches!(week.parse::<u8>(), Ok(1..=53))
 }
 
 fn in_sleep_window(cfg: &BudgetConfig) -> bool {
     let hour = now_in(cfg).hour() as u8;
     // Handle wraparound (start>end means "spans midnight") even though we
     // don't use that today — keeps the function honest.
-    let (start, end) = (cfg.sleep_start_hour_clamped(), cfg.sleep_end_hour_clamped());
+    //
+    // The raw configured hours are used here on purpose. Clamping to 0-23
+    // exists to stop `NaiveTime::from_hms_opt` panicking, and this
+    // comparison cannot panic — but clamping *can* shrink the window for
+    // an out-of-range value. `sleep_end_hour = 250` clamps to 23 and drops
+    // the 23:00 hour out of the block; `sleep_start_hour = 99` with
+    // `sleep_end_hour = 23` clamps to `23..23`, an empty window, where the
+    // raw comparison blocks 00:00-23:00. A typo must never buy unblocked
+    // time, so enforcement reads the config as written.
+    hour_in_window(cfg.sleep_start_hour, cfg.sleep_end_hour, hour)
+}
+
+/// Pure half of [`in_sleep_window`], split out so every hour of the day
+/// can be tested without mocking the wall clock.
+fn hour_in_window(start: u8, end: u8, hour: u8) -> bool {
     if start <= end { hour >= start && hour < end } else { hour >= start || hour < end }
 }
 
@@ -543,6 +608,113 @@ mod tests {
         assert_eq!(budget.date_chicago, "2026-05-22");
         assert_eq!(budget.active_seconds, 1_234, "legible counter must be kept verbatim");
         assert!(budget.courtesy_used, "absent courtesy flag still fails closed");
+    }
+
+    /// A damaged file whose day key is legible JSON but not a date used to
+    /// be trusted verbatim. Because `load_or_default` calls
+    /// `refresh_day_boundary` right after `fail_closed`, and every real
+    /// `%Y-%m-%d` key sorts above strings like `"0"` or `"!!"`, that
+    /// turned the fail-closed path into a full day refund.
+    #[test]
+    fn fail_closed_rejects_a_day_key_that_is_not_a_date() {
+        let cfg = BudgetConfig::default();
+        for bogus in ["0", "!!", "corrupt", "2026-13-99", ""] {
+            let raw = format!(r#"{{"date_chicago":{bogus:?},"courtesy_used":false}}"#);
+            let mut budget = Budget::fail_closed(&cfg, &raw);
+            assert_eq!(
+                budget.date_chicago,
+                current_day_key(&cfg),
+                "bogus day key {bogus:?} must fall back to today, not be trusted"
+            );
+
+            // The rollover that follows in `load_or_default` must not fire.
+            budget.refresh_day_boundary(&cfg);
+            assert_eq!(
+                budget.active_seconds, cfg.cap_seconds,
+                "corruption must not refund the day via a bogus key: {bogus:?}"
+            );
+        }
+    }
+
+    /// Same hole on the weekly allowance.
+    #[test]
+    fn fail_closed_rejects_a_week_key_that_is_not_a_week() {
+        let cfg = BudgetConfig::default();
+        for bogus in ["0", "2026-W", "2026-W0", "2026-W99", "2026-WXX", "wat"] {
+            let raw = format!(r#"{{"weekly_extension_week":{bogus:?}}}"#);
+            let mut budget = Budget::fail_closed(&cfg, &raw);
+            assert_eq!(budget.weekly_extension_week, current_week_key(&cfg), "bogus: {bogus:?}");
+
+            budget.refresh_week_boundary(&cfg);
+            assert_eq!(
+                budget.weekly_extension_used_seconds, cfg.weekly_extension_allowance_seconds,
+                "corruption must not refund the weekly allowance: {bogus:?}"
+            );
+        }
+    }
+
+    /// A legible, genuinely-shaped past key is still honoured — a damaged
+    /// file written yesterday must still roll over normally.
+    #[test]
+    fn fail_closed_still_honours_a_well_formed_past_day_key() {
+        let cfg = BudgetConfig::default();
+        let raw = r#"{"date_chicago":"2000-01-02"}"#;
+        let mut budget = Budget::fail_closed(&cfg, raw);
+        assert_eq!(budget.date_chicago, "2000-01-02");
+
+        budget.refresh_day_boundary(&cfg);
+        assert_eq!(budget.date_chicago, current_day_key(&cfg), "a real past day must roll over");
+        assert_eq!(budget.active_seconds, 0);
+    }
+
+    /// The strict `>` in `refresh_{day,week}_boundary` is only a
+    /// "time moved forward" test while both key formats sort
+    /// lexicographically. Walk several year boundaries and assert neither
+    /// key ever goes backwards — in particular that the week key uses the
+    /// ISO week-numbering year, so 2026-12-31 → `2026-W53`,
+    /// 2027-01-01 → `2026-W53`, 2027-01-04 → `2027-W01`.
+    #[test]
+    fn day_and_week_keys_are_lexicographically_monotonic_across_year_boundaries() {
+        let tz = resolve_tz("America/Chicago");
+        let mut date = chrono::NaiveDate::from_ymd_opt(2024, 12, 1).unwrap();
+        let last = chrono::NaiveDate::from_ymd_opt(2031, 2, 1).unwrap();
+        let (mut prev_day, mut prev_week) = (String::new(), String::new());
+
+        while date <= last {
+            let at = tz.from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap()).unwrap();
+            let (day, week) = (day_key_of(at), week_key_of(at));
+            assert!(day > prev_day, "day key went backwards: {prev_day} -> {day}");
+            assert!(week >= prev_week, "week key went backwards: {prev_week} -> {week}");
+            (prev_day, prev_week) = (day, week);
+            date = date.succ_opt().unwrap();
+        }
+
+        let key_at = |y, m, d| {
+            let naive = chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(12, 0, 0);
+            week_key_of(tz.from_local_datetime(&naive.unwrap()).unwrap())
+        };
+        assert_eq!(key_at(2026, 12, 31), "2026-W53");
+        assert_eq!(key_at(2027, 1, 1), "2026-W53", "ISO week-year, not calendar year");
+        assert_eq!(key_at(2027, 1, 4), "2027-W01");
+        assert!(key_at(2026, 12, 31) < key_at(2027, 1, 4));
+    }
+
+    /// Clamping an out-of-range hour exists to stop `NaiveTime` panicking;
+    /// it must never shrink the block. Both cases below lost enforcement
+    /// time when `in_sleep_window` compared clamped hours.
+    #[test]
+    fn out_of_range_sleep_hours_never_shrink_the_window() {
+        let window =
+            |start: u8, end: u8| (0u8..24).filter(|h| hour_in_window(start, end, *h)).count();
+
+        // `sleep_end_hour = 250` clamped to 23 used to drop the 23:00 hour.
+        assert_eq!(window(2, 250), 22, "02:00-24:00 must stay 22 hours");
+        // `sleep_start_hour = 99` + `sleep_end_hour = 23` clamped to a
+        // start==end pair, i.e. an empty window where 23 hours were blocked.
+        assert_eq!(window(99, 23), 23, "00:00-23:00 must stay 23 hours");
+        // Valid configs are untouched.
+        assert_eq!(window(2, 8), 6);
+        assert_eq!(window(22, 6), 8);
     }
 
     #[test]

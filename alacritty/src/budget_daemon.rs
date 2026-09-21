@@ -15,12 +15,19 @@
 //!                      403 if disabled or during the sleep window.
 //!
 //! Responses include CORS headers ONLY when the request carries an
-//! `Origin` that matches the explicit allowlist (`ALLOWED_ORIGINS` plus
-//! any loopback origin, for the Tauri shell + local dev servers). The
-//! matched origin is echoed back verbatim — never `*` — and
+//! `Origin` that exactly matches one of `ALLOWED_ORIGINS`. The matched
+//! origin is echoed back verbatim — never `*` — and
 //! `Access-Control-Allow-Private-Network` is emitted only for an
 //! allowlisted origin, so Chromium's private-network preflight cannot be
 //! satisfied by an arbitrary public page.
+//!
+//! There is deliberately no blanket "any loopback origin" arm: every dev
+//! server the user happens to have open (`http://localhost:3000`, a Vite
+//! port, a random `python -m http.server`) would otherwise be a fully
+//! trusted caller able to spend the courtesy and the weekly extension.
+//! The Tauri shell does not need one either — its WebView navigates to
+//! `https://www.aisparkles.com` (already allowlisted) and its native side
+//! calls the daemon over `ureq`, which sends no `Origin` at all.
 //!
 //! The two mutating POST routes additionally require the non-simple
 //! request header `X-Alacritty-Budget: 1`. A browser cannot send that
@@ -60,9 +67,12 @@ use crate::event::{Event, EventType};
 /// Used by the pomodoro card to poll `127.0.0.1:38121/usage`.
 pub const DEFAULT_PORT: u16 = 38121;
 
-/// Non-loopback origins allowed to talk to the daemon from a browser.
-/// Everything else must come from a loopback origin (see
-/// [`is_allowed_origin`]) or carry no `Origin` at all (curl / native).
+/// The complete set of browser origins allowed to talk to the daemon.
+/// Everything else must carry no `Origin` at all (curl / the Tauri shell's
+/// native `ureq` side). Adding an entry here hands that origin the ability
+/// to spend the courtesy and the weekly extension, so it must be an exact
+/// `scheme://host[:port]` string for a surface that genuinely needs it —
+/// never a wildcard, a suffix match, or "all of loopback".
 const ALLOWED_ORIGINS: &[&str] = &["https://aisparkles.com", "https://www.aisparkles.com"];
 
 /// Non-simple header required on every mutating route. Its presence
@@ -70,44 +80,18 @@ const ALLOWED_ORIGINS: &[&str] = &["https://aisparkles.com", "https://www.aispar
 /// answered without CORS headers unless the origin is allowlisted.
 const GRANT_HEADER: &str = "x-alacritty-budget";
 
-/// True when `origin` is explicitly allowlisted or is a loopback origin
-/// (`http(s)://localhost|127.0.0.1|[::1]` with an optional numeric port).
+/// True only when `origin` is byte-for-byte one of [`ALLOWED_ORIGINS`].
 ///
-/// Deliberately strict: an `Origin` is scheme + host + optional port and
-/// nothing else, so anything containing a path, userinfo, or a
-/// non-numeric port is rejected rather than prefix-matched.
+/// Exact equality by design: no scheme/host parsing, no prefix or suffix
+/// matching, and no loopback arm. A parsed allowlist invites near-miss
+/// bypasses (`https://aisparkles.com.evil.example`) and a loopback arm
+/// would trust every local dev server the user has running.
+///
+/// Callers with no `Origin` header at all (curl, the Tauri native side)
+/// are unaffected — they simply get no CORS headers, which they do not
+/// need. They still have to carry the grant header on the POST routes.
 fn is_allowed_origin(origin: &str) -> bool {
-    if ALLOWED_ORIGINS.contains(&origin) {
-        return true;
-    }
-
-    let rest = match origin.split_once("://") {
-        Some(("http", rest)) | Some(("https", rest)) => rest,
-        _ => return false,
-    };
-    if rest.contains('/') || rest.contains('@') || rest.is_empty() {
-        return false;
-    }
-
-    let host = if let Some(bracketed) = rest.strip_prefix('[') {
-        match bracketed.split_once(']') {
-            Some((host, "")) => host,
-            Some((host, port)) if port.starts_with(':') && is_numeric_port(&port[1..]) => host,
-            _ => return false,
-        }
-    } else {
-        match rest.split_once(':') {
-            Some((host, port)) if is_numeric_port(port) => host,
-            Some(_) => return false,
-            None => rest,
-        }
-    };
-
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
-}
-
-fn is_numeric_port(port: &str) -> bool {
-    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+    ALLOWED_ORIGINS.contains(&origin)
 }
 
 /// The origin to echo in the CORS headers, or `None` when the request had
@@ -519,19 +503,20 @@ mod tests {
     // ── is_allowed_origin ────────────────────────────────────────────────
 
     #[test]
-    fn allowlisted_and_loopback_origins_accepted() {
-        for origin in [
-            "https://aisparkles.com",
-            "https://www.aisparkles.com",
-            "http://localhost",
-            "http://localhost:5173",
-            "https://localhost:8443",
-            "http://127.0.0.1:38121",
-            "http://[::1]:1420",
-            "http://[::1]",
-        ] {
+    fn allowlisted_origins_accepted() {
+        for origin in ["https://aisparkles.com", "https://www.aisparkles.com"] {
             assert!(is_allowed_origin(origin), "should be allowed: {origin}");
         }
+    }
+
+    /// The allowlist is exactly [`ALLOWED_ORIGINS`] and nothing else.
+    #[test]
+    fn allowlist_is_exactly_the_constant() {
+        assert_eq!(
+            ALLOWED_ORIGINS,
+            &["https://aisparkles.com", "https://www.aisparkles.com"],
+            "widening this constant hands a new origin the ability to spend courtesy"
+        );
     }
 
     #[test]
@@ -548,9 +533,47 @@ mod tests {
             "",
             "file://",
             "http://aisparkles.com",
+            // Trailing-slash / case variants must not sneak past equality.
+            "https://aisparkles.com/",
+            "https://AISPARKLES.com",
         ] {
             assert!(!is_allowed_origin(origin), "should be rejected: {origin}");
         }
+    }
+
+    /// Regression: a blanket loopback arm made every dev server the user
+    /// happens to have open a fully trusted caller — it got CORS headers,
+    /// passed the `X-Alacritty-Budget` preflight, and could POST
+    /// `/courtesy` and `/weekly-extension`. No loopback origin is
+    /// allowlisted; the Tauri shell uses `https://www.aisparkles.com` in
+    /// its WebView and sends no `Origin` from its native side.
+    #[test]
+    fn loopback_origins_rejected() {
+        for origin in [
+            "http://localhost:3000",
+            "http://localhost",
+            "http://localhost:5173",
+            "https://localhost:8443",
+            "http://127.0.0.1",
+            "http://127.0.0.1:38121",
+            "https://127.0.0.1:3000",
+            "http://[::1]",
+            "http://[::1]:1420",
+        ] {
+            assert!(!is_allowed_origin(origin), "loopback origin must be rejected: {origin}");
+        }
+    }
+
+    /// A request with no `Origin` (curl, Tauri native `ureq`) still gets a
+    /// normal response body — it just carries no CORS headers.
+    #[test]
+    fn absent_origin_still_served_without_cors() {
+        let raw =
+            build_response_bytes(DENIED, 200, "OK", "application/json", r#"{"blocked":false}"#);
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "non-browser GET must still succeed");
+        assert!(text.ends_with(r#"{"blocked":false}"#), "body must still be served");
+        assert!(!text.contains("Access-Control-Allow-Origin"), "no CORS for originless caller");
     }
 
     #[test]
