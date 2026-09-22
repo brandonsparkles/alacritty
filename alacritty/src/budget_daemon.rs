@@ -37,6 +37,17 @@
 //! extension allowance. Local CLI callers just add
 //! `-H 'X-Alacritty-Budget: 1'`.
 //!
+//! Every request is additionally gated on its `Host` header (see
+//! [`is_allowed_host`]). The CORS allowlist alone does not stop DNS
+//! rebinding: an attacker page on `http://evil.example` whose DNS is
+//! re-pointed at `127.0.0.1` becomes *same-origin* with the daemon in
+//! Safari and Firefox, so the browser sends no `Origin` at all (or one
+//! the page controls) and both the allowlist and the grant header are
+//! trivially satisfiable from that page. The rebound request still
+//! carries `Host: evil.example:38121`, which is what we reject. A
+//! request with no `Host` at all is not a browser (HTTP/1.1 requires it)
+//! and is treated like the originless CLI/`ureq` callers.
+//!
 //! ### Threading model
 //!
 //! The daemon runs as a single background thread spawned at process
@@ -92,6 +103,48 @@ const GRANT_HEADER: &str = "x-alacritty-budget";
 /// need. They still have to carry the grant header on the POST routes.
 fn is_allowed_origin(origin: &str) -> bool {
     ALLOWED_ORIGINS.contains(&origin)
+}
+
+/// Host names a browser may legitimately use to reach the daemon. The
+/// daemon binds `127.0.0.1` only, so anything else in a `Host` header
+/// means the request was aimed at some other name that happens to
+/// currently resolve to loopback — i.e. DNS rebinding.
+///
+/// `localhost` and the two literal loopback addresses cannot be rebound
+/// (they are not attacker-controlled names), so this is a safe, complete
+/// set rather than a convenience list.
+const ALLOWED_HOST_NAMES: &[&str] = &["127.0.0.1", "localhost", "[::1]", "::1"];
+
+/// True when `host` (a raw `Host` header value) names loopback on the
+/// port this daemon is actually listening on.
+///
+/// Matching is on the *whole* value after lowercasing: the host part must
+/// equal one of [`ALLOWED_HOST_NAMES`] exactly and the port, when present,
+/// must equal `port`. No suffix matching — `127.0.0.1.evil.example` and
+/// `evil.example:38121` both fail. An absent port is accepted because a
+/// caller reaching the daemon on its own port may omit it only when it is
+/// the scheme default, which loopback callers never do in practice; the
+/// host check alone already closes rebinding.
+fn is_allowed_host(host: &str, port: u16) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    // Split off the port, taking care not to cut inside an IPv6 literal.
+    let (name, port_part) = match host.rfind(':') {
+        // `[::1]:38121` — the colon after the closing bracket is the port.
+        Some(idx) if host.starts_with('[') && host[..idx].ends_with(']') => {
+            (&host[..idx], Some(&host[idx + 1..]))
+        },
+        // A bare `::1` has several colons and no port; treat it whole.
+        Some(_) if host.starts_with('[') || host.matches(':').count() > 1 => (&host[..], None),
+        Some(idx) => (&host[..idx], Some(&host[idx + 1..])),
+        None => (&host[..], None),
+    };
+    if !ALLOWED_HOST_NAMES.contains(&name) {
+        return false;
+    }
+    match port_part {
+        None => true,
+        Some(p) => p.parse::<u16>() == Ok(port),
+    }
 }
 
 /// The origin to echo in the CORS headers, or `None` when the request had
@@ -196,7 +249,7 @@ pub fn spawn<F>(
                     },
                 };
                 let cfg = config_provider();
-                if let Err(err) = handle(stream, &cfg, &budget, &proxy) {
+                if let Err(err) = handle(stream, port, &cfg, &budget, &proxy) {
                     debug!("budget daemon: handler error: {err}");
                 }
             }
@@ -206,6 +259,7 @@ pub fn spawn<F>(
 
 fn handle(
     mut stream: TcpStream,
+    port: u16,
     cfg: &BudgetConfig,
     budget: &Mutex<Budget>,
     proxy: &EventLoopProxy<Event>,
@@ -216,9 +270,11 @@ fn handle(
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
-    // Read the headers we actually gate on: `Origin` (CORS allowlist) and
-    // the non-simple grant header required by the mutating routes.
+    // Read the headers we actually gate on: `Host` (DNS-rebinding guard),
+    // `Origin` (CORS allowlist) and the non-simple grant header required by
+    // the mutating routes.
     let mut origin: Option<String> = None;
+    let mut host: Option<String> = None;
     let mut grant_header = false;
     let mut buf = String::new();
     loop {
@@ -232,6 +288,7 @@ fn handle(
             let value = value.trim();
             match name.as_str() {
                 "origin" => origin = Some(value.to_string()),
+                "host" => host = Some(value.to_string()),
                 // Preflight asks permission for the grant header; treat
                 // the actual request header as the gate.
                 n if n == GRANT_HEADER => grant_header = value == "1",
@@ -256,6 +313,30 @@ fn handle(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+
+    // DNS-rebinding guard, ahead of every route including `OPTIONS`: a
+    // rebound attacker page is same-origin, so it sails past the CORS
+    // allowlist, but it cannot forge `Host`. Denied responses carry no
+    // CORS headers (`CorsOrigin(None)`) so the page learns nothing.
+    if let Some(requested) = host.as_deref() {
+        if !is_allowed_host(requested, port) {
+            warn!("budget daemon: rejecting {path} for host {requested:?}");
+            let body = r#"{"error":"bad_host"}"#;
+            let deny = CorsOrigin(None);
+            write_response(&mut stream, deny, 403, "Forbidden", "application/json", body)?;
+            return Ok(());
+        }
+    }
+
+    // A browser that reached a mutating route from a non-allowlisted
+    // origin has already failed the preflight, so its response would be
+    // unreadable — but the grant would still have happened. Refuse before
+    // touching state rather than relying on the browser to discard it.
+    if method == "POST" && origin.is_some() && cors_origin.is_none() {
+        let body = r#"{"error":"origin_not_allowed"}"#;
+        write_response(&mut stream, cors, 403, "Forbidden", "application/json", body)?;
+        return Ok(());
+    }
 
     // Gate the mutating routes on the non-simple header. A browser can
     // only send it after a preflight, and the preflight above is answered
@@ -574,6 +655,43 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "non-browser GET must still succeed");
         assert!(text.ends_with(r#"{"blocked":false}"#), "body must still be served");
         assert!(!text.contains("Access-Control-Allow-Origin"), "no CORS for originless caller");
+    }
+
+    // ── is_allowed_host — DNS-rebinding guard ───────────────────────────
+
+    #[test]
+    fn loopback_hosts_accepted_on_the_bound_port() {
+        for host in
+            ["127.0.0.1:38121", "localhost:38121", "[::1]:38121", "LocalHost:38121", " 127.0.0.1 "]
+        {
+            assert!(is_allowed_host(host, 38121), "loopback host must be accepted: {host}");
+        }
+        // Port-less forms are fine too; the name alone closes rebinding.
+        assert!(is_allowed_host("127.0.0.1", 38121));
+        assert!(is_allowed_host("[::1]", 38121));
+        assert!(is_allowed_host("::1", 38121));
+    }
+
+    #[test]
+    fn rebound_attacker_hosts_rejected() {
+        for host in [
+            "evil.example:38121",
+            "evil.example",
+            "127.0.0.1.evil.example:38121",
+            "aisparkles.com:38121",
+            "localhost.evil.example:38121",
+            "",
+        ] {
+            assert!(!is_allowed_host(host, 38121), "rebound host must be rejected: {host}");
+        }
+    }
+
+    #[test]
+    fn host_port_must_match_the_bound_port() {
+        assert!(!is_allowed_host("127.0.0.1:38122", 38121), "wrong port must be rejected");
+        assert!(!is_allowed_host("127.0.0.1:notaport", 38121), "junk port must be rejected");
+        // The same host on a daemon bound elsewhere is accepted there.
+        assert!(is_allowed_host("127.0.0.1:38122", 38122));
     }
 
     #[test]

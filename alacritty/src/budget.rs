@@ -499,10 +499,36 @@ fn hour_in_window(start: u8, end: u8, hour: u8) -> bool {
     if start <= end { hour >= start && hour < end } else { hour >= start || hour < end }
 }
 
+/// Seconds until the sleep window actually releases.
+///
+/// Derived from the SAME raw-hour predicate [`in_sleep_window`] enforces,
+/// not from `sleep_end_hour_clamped()`. With a misconfigured
+/// `sleep_end_hour = 250` the raw window blocks 02:00–23:59 while the
+/// clamped countdown promised release at 23:00 — an hour of "unlocked"
+/// UI that enforcement did not honour. The countdown now names the first
+/// hour that is genuinely outside the window, so it can only ever report
+/// the real release or a later one.
 fn seconds_until_sleep_end(cfg: &BudgetConfig) -> u64 {
     let tz = resolve_tz(&cfg.timezone);
     let now = chrono::Utc::now().with_timezone(&tz);
-    seconds_until_hour(now, tz, cfg.sleep_end_hour_clamped())
+    let hour = now.hour() as u8;
+    match next_hour_outside_window(cfg.sleep_start_hour, cfg.sleep_end_hour, hour) {
+        Some(release) => seconds_until_hour(now, tz, release),
+        // A config that blocks all 24 hours has no release. Report the
+        // same hour tomorrow rather than inventing an earlier unlock.
+        None => seconds_until_hour(now, tz, hour.min(23)),
+    }
+}
+
+/// First hour strictly after `hour` that [`hour_in_window`] leaves
+/// unblocked, or `None` when the configured window covers all 24 hours.
+///
+/// Only called while the sleep window is active, so `hour` itself is in
+/// the window and the search legitimately starts one hour out.
+fn next_hour_outside_window(start: u8, end: u8, hour: u8) -> Option<u8> {
+    (1..24)
+        .map(|offset| ((u16::from(hour) + offset) % 24) as u8)
+        .find(|candidate| !hour_in_window(start, end, *candidate))
 }
 
 fn seconds_until_next_day(cfg: &BudgetConfig) -> u64 {
@@ -715,6 +741,28 @@ mod tests {
         // Valid configs are untouched.
         assert_eq!(window(2, 8), 6);
         assert_eq!(window(22, 6), 8);
+    }
+
+    /// The countdown must be derived from the same raw-hour window
+    /// enforcement uses, or a misconfigured `sleep_end_hour` shows an
+    /// unlock time the lockout does not honour.
+    #[test]
+    fn countdown_release_hour_matches_the_enforced_window() {
+        // `sleep_end_hour = 250`: raw window is 02:00-24:00, so the real
+        // release is midnight — not the clamped 23:00 the old countdown
+        // promised.
+        assert_eq!(next_hour_outside_window(2, 250, 5), Some(0));
+        assert_eq!(next_hour_outside_window(2, 250, 23), Some(0));
+        // `sleep_start_hour = 99` + `sleep_end_hour = 23`: blocked
+        // 00:00-23:00, released at 23:00.
+        assert_eq!(next_hour_outside_window(99, 23, 5), Some(23));
+        // Valid configs are unchanged.
+        assert_eq!(next_hour_outside_window(2, 8, 3), Some(8));
+        // Wraparound window 22:00-06:00.
+        assert_eq!(next_hour_outside_window(22, 6, 23), Some(6));
+        assert_eq!(next_hour_outside_window(22, 6, 2), Some(6));
+        // A window covering every hour has no release.
+        assert_eq!(next_hour_outside_window(0, 24, 5), None);
     }
 
     #[test]
