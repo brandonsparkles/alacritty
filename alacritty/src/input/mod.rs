@@ -1191,8 +1191,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         if button == MouseButton::Left {
+            // A modifier-forced local selection (Cmd-drag on macOS, Shift-drag
+            // anywhere) outranks the scrollbar strip, per the FORK.md Cmd-drag
+            // guarantee. Plain presses still scroll. The mouse_mode() conjunct
+            // matters: without terminal mouse mode every press is trivially a
+            // local selection, and the scrollbar must keep working there.
+            let local_selection_override = self.ctx.mouse_mode()
+                && uses_local_selection(self.ctx.mouse_mode(), self.ctx.modifiers().state());
             match state {
-                ElementState::Pressed if self.over_scrollbar() => {
+                ElementState::Pressed if self.over_scrollbar() && !local_selection_override => {
                     self.ctx.mouse_mut().click_state = ClickState::None;
                     self.ctx.mouse_mut().block_hint_launcher = true;
                     self.ctx.mouse_mut().scrollbar_dragging = true;

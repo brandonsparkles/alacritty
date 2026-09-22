@@ -257,10 +257,14 @@ fn copilot_resume(pid: c_int, ai_resume: &AiResumeConfig) -> Option<String> {
 /// Incremental scan state for one copilot per-process log: byte offset of
 /// the first unread line plus the last session UUID seen so far. Keyed by
 /// PID; bounded by the number of distinct copilot processes seen during
-/// this alacritty run.
+/// this alacritty run. `dev`/`ino` identify the log file the offset was
+/// measured against, so a recycled PID pointing at a different log is
+/// detected and rescanned from the start (spk-961c23c40386).
 struct CopilotScanState {
     offset: u64,
     last_uuid: Option<String>,
+    dev: u64,
+    ino: u64,
 }
 
 static COPILOT_SCAN_STATES: OnceLock<Mutex<HashMap<c_int, CopilotScanState>>> = OnceLock::new();
@@ -272,13 +276,27 @@ static COPILOT_SCAN_STATES: OnceLock<Mutex<HashMap<c_int, CopilotScanState>>> = 
 /// trailing partial line is left unconsumed for the next pass.
 fn copilot_scan_uuid(pid: c_int, log: &Path) -> Option<String> {
     const MARKER: &str = "Registering foreground session: ";
-
     let states = COPILOT_SCAN_STATES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut states = states.lock().ok()?;
-    let state = states.entry(pid).or_insert(CopilotScanState { offset: 0, last_uuid: None });
 
     let mut f = File::open(log).ok()?;
-    let len = f.metadata().ok()?.len();
+    let meta = f.metadata().ok()?;
+    let len = meta.len();
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    };
+    let state =
+        states.entry(pid).or_insert(CopilotScanState { offset: 0, last_uuid: None, dev, ino });
+    if state.dev != dev || state.ino != ino {
+        // The PID was recycled (or the log replaced): the stored offset
+        // belongs to a different file. Rescan from the start rather than
+        // tailing mid-file past the session marker.
+        state.offset = 0;
+        state.last_uuid = None;
+        state.dev = dev;
+        state.ino = ino;
+    }
     if len < state.offset {
         state.offset = 0;
         state.last_uuid = None;
@@ -766,13 +784,42 @@ mod tests {
     #[test]
     fn normalize_saved_resume_command_rejects_codex_last() {
         let config = test_ai_resume_config();
-        assert!(normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
-            .is_none());
-        assert!(normalize_saved_resume_command(
-            "codexpilot --existing-flag resume --last",
-            &config,
+        assert!(
+            normalize_saved_resume_command("codex --existing-flag resume --last", &config,)
+                .is_none()
+        );
+        assert!(
+            normalize_saved_resume_command("codexpilot --existing-flag resume --last", &config,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn copilot_scan_resets_on_pid_reuse_with_new_log() {
+        // spk-961c23c40386: the PID-keyed scan cache must not carry a byte
+        // offset across to a different log file. macOS reuses PIDs; the new
+        // copilot's log has a different inode, and if it happens to be at
+        // least as long as the stale offset the incremental scan would start
+        // mid-file and miss the session marker.
+        let dir = std::env::temp_dir().join(format!("copilot-scan-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A PID no real copilot can hold, so parallel tests sharing the
+        // process-lifetime cache cannot collide with this entry.
+        let pid: c_int = 2_000_000_007;
+        let log_a = dir.join("process-aaa-2000000007.log");
+        let log_b = dir.join("process-bbb-2000000007.log");
+        std::fs::write(&log_a, "boot\nRegistering foreground session: uuid-aaa\nmore\n").unwrap();
+        assert_eq!(copilot_scan_uuid(pid, &log_a).as_deref(), Some("uuid-aaa"));
+        // Replacement log under the recycled PID: longer than the 52-byte
+        // offset stored above, with its only marker before that offset.
+        std::fs::write(
+            &log_b,
+            "Registering foreground session: uuid-bbb\nfiller-line-0123456789\n",
         )
-        .is_none());
+        .unwrap();
+        assert!(std::fs::metadata(&log_b).unwrap().len() >= 52);
+        assert_eq!(copilot_scan_uuid(pid, &log_b).as_deref(), Some("uuid-bbb"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

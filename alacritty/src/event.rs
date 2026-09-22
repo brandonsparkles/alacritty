@@ -701,8 +701,7 @@ impl ApplicationHandler<Event> for Processor {
                         *self
                             .budget_config_shared
                             .write()
-                            .unwrap_or_else(PoisonError::into_inner) =
-                            self.config.budget.clone();
+                            .unwrap_or_else(PoisonError::into_inner) = self.config.budget.clone();
                     }
 
                     // Restart config monitor if imports changed.
@@ -749,9 +748,9 @@ impl ApplicationHandler<Event> for Processor {
                     let reason = budget.block_status(&self.config.budget);
                     let unlock = budget.seconds_until_unlock(&self.config.budget);
                     let still_blocked = reason.is_some();
-                    let weekly_extension_available =
-                        budget.weekly_extension_available(&self.config.budget)
-                            && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_available = budget
+                        .weekly_extension_available(&self.config.budget)
+                        && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     let weekly_extension_remaining_seconds =
                         budget.weekly_extension_remaining_seconds(&self.config.budget);
                     let weekly_extension_visible =
@@ -796,9 +795,9 @@ impl ApplicationHandler<Event> for Processor {
                         && self.config.budget.courtesy_seconds > 0
                         && !budget.courtesy_used
                         && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
-                    let weekly_extension_available =
-                        budget.weekly_extension_available(&self.config.budget)
-                            && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
+                    let weekly_extension_available = budget
+                        .weekly_extension_available(&self.config.budget)
+                        && matches!(reason, Some(crate::budget::BlockReason::BudgetExhausted));
                     let weekly_extension_remaining_seconds =
                         budget.weekly_extension_remaining_seconds(&self.config.budget);
                     let weekly_extension_visible =
@@ -1005,6 +1004,16 @@ impl ApplicationHandler<Event> for Processor {
 
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
+
+                // Drop any lockout overlay registry entry for the closed
+                // window. Without this the entry leaks, and if AppKit
+                // recycles the NSWindow address for a new window,
+                // install_or_update would take the update-in-place branch
+                // for a dead view hierarchy (no overlay, input still
+                // filtered). The removed context still owns its winit
+                // window here, so the handle resolves the same key.
+                #[cfg(target_os = "macos")]
+                window_context.display.window.hide_lockout_overlay();
 
                 // If the closed window was hosting the session-save timer,
                 // re-host on any remaining window so saves continue.
