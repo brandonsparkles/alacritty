@@ -6,3 +6,10 @@ target
 
 # Personal Alacritty config (moved here from ~/.config, symlinked back)
 /alacritty.toml
+
+# Local incremental-review state
+/.claude/review-baseline.sha
+
+# Per-checkout agent-audit runs and triage runtime; the versioned copy of the
+# triage index lives in project-control-plane/triage/alacritty/.
+/var/
