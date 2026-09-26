@@ -113,8 +113,9 @@ cd ~/Projects/alacritty
 cargo build --release -p alacritty
 cp target/release/alacritty /Applications/Alacritty.app/Contents/MacOS/alacritty
 SIGNING_IDENTITY="${SPARKLES_LOCAL_CODESIGN_IDENTITY:-Brandon Lind Code 2}"
-codesign --force --deep --sign "$SIGNING_IDENTITY" /Applications/Alacritty.app
 echo "$(git rev-parse HEAD)" > /Applications/Alacritty.app/Contents/MacOS/.fork-sha
+codesign --force --deep --sign "$SIGNING_IDENTITY" /Applications/Alacritty.app
+codesign --verify --deep --strict /Applications/Alacritty.app
 ```
 
 **Activity indicator never appears.** Check that `proc_listpids` sees the
