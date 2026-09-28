@@ -576,7 +576,7 @@ pub(crate) mod tests {
         // (e.g. /private/var/... for a /var/... TempDir on macOS).
         let want = path.canonicalize().unwrap();
         assert!(
-            paths.iter().any(|p| *p == want),
+            paths.contains(&want),
             "expected {} among {} open paths",
             want.display(),
             paths.len()

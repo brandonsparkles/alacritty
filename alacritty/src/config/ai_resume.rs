@@ -21,48 +21,24 @@ use serde::Serialize;
 
 use alacritty_config_derive::ConfigDeserialize;
 
-#[derive(ConfigDeserialize, Serialize, Clone, PartialEq, Debug)]
+#[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Debug)]
 pub struct AiResumeConfig {
     pub claude: ClaudeResumeConfig,
     pub codex: CodexResumeConfig,
     pub copilot: CopilotResumeConfig,
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, PartialEq, Eq, Debug)]
+#[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct ClaudeResumeConfig {
     pub flags: Vec<String>,
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, PartialEq, Eq, Debug)]
+#[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct CodexResumeConfig {
     pub flags: Vec<String>,
 }
 
-#[derive(ConfigDeserialize, Serialize, Clone, PartialEq, Eq, Debug)]
+#[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct CopilotResumeConfig {
     pub flags: Vec<String>,
-}
-
-impl Default for ClaudeResumeConfig {
-    fn default() -> Self {
-        Self { flags: Vec::new() }
-    }
-}
-
-impl Default for CodexResumeConfig {
-    fn default() -> Self {
-        Self { flags: Vec::new() }
-    }
-}
-
-impl Default for CopilotResumeConfig {
-    fn default() -> Self {
-        Self { flags: Vec::new() }
-    }
-}
-
-impl Default for AiResumeConfig {
-    fn default() -> Self {
-        Self { claude: Default::default(), codex: Default::default(), copilot: Default::default() }
-    }
 }

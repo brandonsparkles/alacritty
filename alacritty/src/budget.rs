@@ -767,9 +767,7 @@ mod tests {
 
     #[test]
     fn out_of_range_sleep_hour_does_not_panic() {
-        let mut cfg = BudgetConfig::default();
-        cfg.sleep_end_hour = 250;
-        cfg.sleep_start_hour = 99;
+        let cfg = BudgetConfig { sleep_end_hour: 250, sleep_start_hour: 99, ..Default::default() };
         assert_eq!(cfg.sleep_end_hour_clamped(), 23);
         assert_eq!(cfg.sleep_start_hour_clamped(), 23);
         // Both of these used to panic the event loop via `expect`.
@@ -809,15 +807,19 @@ mod tests {
 
     #[test]
     fn courtesy_can_be_disabled_explicitly() {
-        let mut cfg = BudgetConfig::default();
-        cfg.allow_courtesy = false;
-        cfg.sleep_start_hour = 0;
-        cfg.sleep_end_hour = 0;
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
-        b.active_seconds = cfg.cap_seconds;
-        b.courtesy_used = false;
-        b.courtesy_expires_at = Some(unix_now() + cfg.courtesy_seconds);
+        let cfg = BudgetConfig {
+            allow_courtesy: false,
+            sleep_start_hour: 0,
+            sleep_end_hour: 0,
+            ..Default::default()
+        };
+        let mut b = Budget {
+            date_chicago: current_day_key(&cfg),
+            active_seconds: cfg.cap_seconds,
+            courtesy_used: false,
+            courtesy_expires_at: Some(unix_now() + cfg.courtesy_seconds),
+            ..Default::default()
+        };
 
         assert!(!b.courtesy_active(&cfg));
         assert_eq!(b.block_status(&cfg), Some(BlockReason::BudgetExhausted));
@@ -826,12 +828,12 @@ mod tests {
 
     #[test]
     fn courtesy_is_enabled_by_default() {
-        let mut cfg = BudgetConfig::default();
-        cfg.sleep_start_hour = 0;
-        cfg.sleep_end_hour = 0;
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
-        b.active_seconds = cfg.cap_seconds;
+        let cfg = BudgetConfig { sleep_start_hour: 0, sleep_end_hour: 0, ..Default::default() };
+        let mut b = Budget {
+            date_chicago: current_day_key(&cfg),
+            active_seconds: cfg.cap_seconds,
+            ..Default::default()
+        };
 
         assert!(b.grant_courtesy(&cfg));
         assert!(b.courtesy_active(&cfg));
@@ -840,13 +842,17 @@ mod tests {
 
     #[test]
     fn courtesy_uses_configured_duration() {
-        let mut cfg = BudgetConfig::default();
-        cfg.courtesy_seconds = 42;
-        cfg.sleep_start_hour = 0;
-        cfg.sleep_end_hour = 0;
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
-        b.active_seconds = cfg.cap_seconds;
+        let cfg = BudgetConfig {
+            courtesy_seconds: 42,
+            sleep_start_hour: 0,
+            sleep_end_hour: 0,
+            ..Default::default()
+        };
+        let mut b = Budget {
+            date_chicago: current_day_key(&cfg),
+            active_seconds: cfg.cap_seconds,
+            ..Default::default()
+        };
 
         let before = unix_now();
         assert!(b.grant_courtesy(&cfg));
@@ -858,8 +864,7 @@ mod tests {
     #[test]
     fn tick_advances_counter() {
         let cfg = BudgetConfig::default();
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
+        let mut b = Budget { date_chicago: current_day_key(&cfg), ..Default::default() };
         b.tick(&cfg, 60);
         assert_eq!(b.active_seconds, 60);
     }
@@ -867,13 +872,15 @@ mod tests {
     #[test]
     fn day_rollover_resets_counter() {
         let cfg = BudgetConfig::default();
-        let mut b = Budget::default();
-        b.date_chicago = "1970-01-01".into();
-        b.active_seconds = 5_000;
-        b.courtesy_used = true;
-        b.weekly_extension_week = "1970-W01".into();
-        b.weekly_extension_used_seconds = 6 * 60 * 60;
-        b.weekly_extension_expires_at = Some(unix_now() + 60);
+        let mut b = Budget {
+            date_chicago: "1970-01-01".into(),
+            active_seconds: 5_000,
+            courtesy_used: true,
+            weekly_extension_week: "1970-W01".into(),
+            weekly_extension_used_seconds: 6 * 60 * 60,
+            weekly_extension_expires_at: Some(unix_now() + 60),
+            ..Default::default()
+        };
         b.refresh_day_boundary(&cfg);
         assert_eq!(b.active_seconds, 0);
         assert!(!b.courtesy_used);
@@ -883,13 +890,13 @@ mod tests {
 
     #[test]
     fn weekly_extension_grants_one_hour_and_tracks_allowance() {
-        let mut cfg = BudgetConfig::default();
-        cfg.sleep_start_hour = 0;
-        cfg.sleep_end_hour = 0;
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
-        b.weekly_extension_week = current_week_key(&cfg);
-        b.active_seconds = cfg.cap_seconds;
+        let cfg = BudgetConfig { sleep_start_hour: 0, sleep_end_hour: 0, ..Default::default() };
+        let mut b = Budget {
+            date_chicago: current_day_key(&cfg),
+            weekly_extension_week: current_week_key(&cfg),
+            active_seconds: cfg.cap_seconds,
+            ..Default::default()
+        };
 
         assert_eq!(b.weekly_extension_remaining_seconds(&cfg), 6 * 60 * 60);
         assert_eq!(b.grant_weekly_extension(&cfg), Ok(()));
@@ -901,31 +908,31 @@ mod tests {
 
     #[test]
     fn weekly_extension_stops_after_six_hours() {
-        let mut cfg = BudgetConfig::default();
-        cfg.sleep_start_hour = 0;
-        cfg.sleep_end_hour = 0;
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
-        b.weekly_extension_week = current_week_key(&cfg);
-        b.weekly_extension_used_seconds = cfg.weekly_extension_allowance_seconds;
+        let cfg = BudgetConfig { sleep_start_hour: 0, sleep_end_hour: 0, ..Default::default() };
+        let mut b = Budget {
+            date_chicago: current_day_key(&cfg),
+            weekly_extension_week: current_week_key(&cfg),
+            weekly_extension_used_seconds: cfg.weekly_extension_allowance_seconds,
+            ..Default::default()
+        };
 
         assert_eq!(b.grant_weekly_extension(&cfg), Err(WeeklyExtensionError::AllowanceSpent));
     }
 
     #[test]
     fn disabled_config_never_blocks() {
-        let mut cfg = BudgetConfig::default();
-        cfg.enabled = false;
-        let mut b = Budget::default();
-        b.date_chicago = current_day_key(&cfg);
-        b.active_seconds = 100_000; // way past cap
+        let cfg = BudgetConfig { enabled: false, ..Default::default() };
+        let b = Budget {
+            date_chicago: current_day_key(&cfg),
+            active_seconds: 100_000, // way past cap
+            ..Default::default()
+        };
         assert_eq!(b.block_status(&cfg), None);
     }
 
     #[test]
     fn invalid_timezone_falls_back_to_chicago() {
-        let mut cfg = BudgetConfig::default();
-        cfg.timezone = "Not/A_Real_Zone".to_string();
+        let cfg = BudgetConfig { timezone: "Not/A_Real_Zone".to_string(), ..Default::default() };
         // Should not panic; current_day_key produces *something*.
         let _ = current_day_key(&cfg);
     }

@@ -825,6 +825,8 @@ impl ApplicationHandler<Event> for Processor {
             // machine, advances the counter while active or in grace, and
             // triggers NSApp.hide() when the background grace expires.
             #[cfg(target_os = "macos")]
+            // Focus-budget block is user-locked; keep its branch order untouched.
+            #[allow(clippy::if_not_else)]
             (EventType::BudgetTick, _) => {
                 let cfg = self.config.budget.clone();
                 if !cfg.enabled {

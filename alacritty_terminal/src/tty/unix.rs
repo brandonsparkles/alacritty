@@ -126,6 +126,8 @@ struct ShellUser {
 impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking into `passwd`.
+    // Clippy false positive: `pw?` would move `pw`, which the later fallbacks reuse.
+    #[allow(clippy::question_mark)]
     fn from_env() -> Result<Self> {
         let mut buf = [0; 1024];
         let pw = get_pw_entry(&mut buf);

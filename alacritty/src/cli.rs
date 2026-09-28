@@ -231,6 +231,8 @@ impl WindowIdentity {
 }
 
 /// Available CLI subcommands.
+// Upstream code; boxing the variant would ripple through the clap derive.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Subcommands {
     #[cfg(unix)]

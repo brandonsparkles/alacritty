@@ -138,7 +138,7 @@ impl Session {
         }
         let file = dir.join("session.json");
 
-        if let Err(err) = fs::create_dir_all(&dir) {
+        if let Err(err) = fs::create_dir_all(dir) {
             debug!("Could not create saved-state dir {}: {err}", dir.display());
             return false;
         }

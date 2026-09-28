@@ -744,6 +744,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         self.ctx.write_to_pty(msg.into_bytes());
     }
 
+    // Keep upstream's mouse-mode-first branch order to minimize fork diff.
+    #[allow(clippy::if_not_else)]
     fn on_mouse_press(&mut self, button: MouseButton) {
         // Handle mouse mode.
         if !uses_local_selection(self.ctx.mouse_mode(), self.ctx.modifiers().state()) {
