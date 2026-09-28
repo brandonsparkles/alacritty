@@ -12,6 +12,9 @@ alacritty|alacritty terminal emulator,
           ;%p1%d%;m,
     setb@, setf@,
 
+alacritty-sixel|alacritty with Sixel graphics,
+    use=alacritty,
+
 alacritty-direct|alacritty with direct color indexing,
     use=alacritty+common,
     RGB,

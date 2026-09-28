@@ -1,13 +1,12 @@
-# Alacritty Fork — macOS Feature Additions
+# Alacritty Fork — macOS Features and Sixel Graphics
 
 This branch (`feature/named-tabs-and-swipe`) is a fork of [upstream
 Alacritty v0.17.0](https://github.com/alacritty/alacritty) with macOS-specific
 quality-of-life additions, layered on top of the existing native NSWindow
-tab support.
+tab support, plus Sixel graphics from ayosec's Alacritty fork.
 
-All features are gated on `target_os = "macos"`; the non-macOS build is
-byte-for-byte the same as upstream apart from a few enum variants that
-non-macOS code never reaches.
+The tab, session, and budget features are gated on `target_os = "macos"`.
+Sixel parsing and rendering are cross-platform.
 
 ## Added features
 
@@ -26,6 +25,32 @@ non-macOS code never reaches.
 | **Cmd-drag local selection** | In terminal mouse-reporting apps (Claude/Codex/Copilot chats, TUIs, etc.), holding `Cmd` while dragging now forces local text selection on macOS, matching the existing `Shift` bypass but with a native-feeling modifier. Use `Cmd+C` to copy; selection alone does not copy unless `selection.save_to_clipboard = true` in your config. |
 | **Budget enforcement** | Daily focused-time cap + 02:00–08:00 Chicago sleep window. When exhausted, a fullscreen opaque NSView overlay covers the terminal, keystrokes are filtered, and the tab title shows `🔒 Xh Ym` countdown until the next 08:00 Central reset. One TOML-configured courtesy extension per day is enabled by default. See [Budget enforcement](#budget-enforcement) below. |
 | **Window-title activity prefix** | The square spinner / `🔵` / `🔒` prefixes are written to BOTH the NSWindowTab label AND the NSWindow title bar, so they're visible whether or not the user has 2+ tabs grouped (the native tab strip only renders with multi-tab groups). |
+| **Inline Sixel images** | Merged from [ayosec/alacritty graphics](https://github.com/ayosec/alacritty/tree/graphics) at `3d658d2e`. Parses Sixel in the terminal core and renders images in the OpenGL grid. Kitty graphics protocol is not included. |
+
+## Inline Sixel images
+
+The graphics merge keeps the macOS tab, session, and budget code on this branch.
+It uses `vte-graphics` for DCS parsing. Verify the decoder and renderer build
+with `cargo test -p alacritty_terminal sixel` and
+`cargo build --release -p alacritty`; verify the budget path with
+`cargo test -p alacritty budget`. A real Sixel payload can be shown with
+`cat alacritty_terminal/tests/sixel/testimage_libsixel.sixel` in a newly
+launched build.
+
+Codex `/pets` chooses its image protocol from terminal identity. It sees
+`ALACRITTY_SOCKET` before `TERM`, so the Sixel renderer alone does not make
+pets appear. The `codex()` function in the tracked
+`project-control-plane/home-zsh/zshrc` scopes `TERM=alacritty-sixel` and
+removes `ALACRITTY_SOCKET` only for interactive Codex, after the matching
+terminfo entry exists. Normal shells keep `TERM=xterm-256color`, avoiding an
+unknown terminal name on SSH hosts. Install the local entry with:
+
+```bash
+tic -x -e alacritty-sixel -o "$HOME/.terminfo" extra/alacritty.info
+```
+
+Relaunch Alacritty after replacing the app binary; an already-running process
+still uses its old renderer.
 
 ## Keybindings reference
 
@@ -111,6 +136,7 @@ that marker doesn't match `git HEAD`). Manual fallback:
 ```bash
 cd ~/Projects/alacritty
 cargo build --release -p alacritty
+tic -x -e alacritty-sixel -o "$HOME/.terminfo" extra/alacritty.info
 cp target/release/alacritty /Applications/Alacritty.app/Contents/MacOS/alacritty
 SIGNING_IDENTITY="${SPARKLES_LOCAL_CODESIGN_IDENTITY:-Brandon Lind Code 2}"
 echo "$(git rev-parse HEAD)" > /Applications/Alacritty.app/Contents/MacOS/.fork-sha

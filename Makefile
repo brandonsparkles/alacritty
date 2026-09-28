@@ -51,7 +51,7 @@ $(APP_NAME)-%: $(TARGET)-%
 	@scdoc < $(MANPAGE-MSG) | gzip -c > $(APP_EXTRAS_DIR)/alacritty-msg.1.gz
 	@scdoc < $(MANPAGE-CONFIG) | gzip -c > $(APP_EXTRAS_DIR)/alacritty.5.gz
 	@scdoc < $(MANPAGE-CONFIG-BINDINGS) | gzip -c > $(APP_EXTRAS_DIR)/alacritty-bindings.5.gz
-	@tic -xe alacritty,alacritty-direct -o $(APP_EXTRAS_DIR) $(TERMINFO)
+	@tic -xe alacritty,alacritty-direct,alacritty-sixel -o $(APP_EXTRAS_DIR) $(TERMINFO)
 	@cp -fRp $(APP_TEMPLATE) $(APP_DIR)
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
 	@cp -fp $(COMPLETIONS) $(APP_COMPLETIONS_DIR)
