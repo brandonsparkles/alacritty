@@ -19,6 +19,7 @@ APP_BINARY = $(RELEASE_DIR)/$(TARGET)
 APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
 APP_EXTRAS_DIR = $(APP_DIR)/$(APP_NAME)/Contents/Resources
 APP_COMPLETIONS_DIR = $(APP_EXTRAS_DIR)/completions
+SIGNING_IDENTITY = $(or $(SPARKLES_LOCAL_CODESIGN_IDENTITY),Brandon Lind Code 2)
 
 DMG_NAME = Alacritty.dmg
 DMG_DIR = $(RELEASE_DIR)/osx
@@ -59,7 +60,7 @@ $(APP_NAME)-%: $(TARGET)-%
 	@xattr -cr "$(APP_DIR)/$(APP_NAME)"
 	@codesign --remove-signature "$(APP_DIR)/$(APP_NAME)"
 	@xattr -cr "$(APP_DIR)/$(APP_NAME)"
-	@codesign --force --deep --sign - "$(APP_DIR)/$(APP_NAME)"
+	@codesign --force --deep --sign "$(SIGNING_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 
 dmg: $(DMG_NAME)-native ## Create an Alacritty.dmg
