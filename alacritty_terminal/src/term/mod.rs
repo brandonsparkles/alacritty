@@ -2344,7 +2344,8 @@ impl<T: EventListener> Handler for Term<T> {
     fn dcs_hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         match (action, intermediates) {
             ('q', []) => {
-                self.graphics.start_sixel_graphic(params);
+                let private_palette = self.mode.contains(TermMode::SIXEL_PRIV_PALETTE);
+                self.graphics.start_sixel_graphic(params, private_palette);
             },
             _ => debug!(
                 "[unhandled hook] params={params:?}, ints: {intermediates:?}, ignore: {ignore:?}, \
