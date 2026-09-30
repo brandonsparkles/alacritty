@@ -830,8 +830,8 @@ mod tests {
         let red = Rgb { r: 255, g: 0, b: 0 };
 
         for (private, expect_red) in [(true, false), (false, true)] {
-            let mut graphics = Graphics::default();
-            graphics.sixel_shared_palette = Some(vec![red; 16]);
+            let mut graphics =
+                Graphics { sixel_shared_palette: Some(vec![red; 16]), ..Graphics::default() };
 
             graphics.start_sixel_graphic(&Params::default(), private);
 
