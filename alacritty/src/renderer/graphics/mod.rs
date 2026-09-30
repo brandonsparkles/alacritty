@@ -97,9 +97,20 @@ impl GraphicsRenderer {
         update_queues: UpdateQueues,
         size_info: &SizeInfo,
     ) -> UpdateResult {
-        self.remove_graphics(update_queues.remove_queue)
-            | self.upload_pending_graphics(update_queues.pending, size_info)
-            | self.clear_subregions(update_queues.clear_subregions)
+        let UpdateQueues { pending, remove_queue, clear_subregions } = update_queues;
+
+        // A graphic dropped before its first draw appears in both queues. Removal
+        // only acts on textures that already exist, so it would be a no-op for the
+        // id and the upload below would create a texture nothing can reach (ids are
+        // monotonic and never reused). Skip uploading graphics that are already
+        // scheduled for removal.
+        let removed: HashSet<GraphicId> = remove_queue.iter().copied().collect();
+        let pending: Vec<GraphicData> =
+            pending.into_iter().filter(|graphic| !removed.contains(&graphic.id)).collect();
+
+        self.remove_graphics(remove_queue)
+            | self.upload_pending_graphics(pending, size_info)
+            | self.clear_subregions(clear_subregions)
     }
 
     /// Release resources used by removed graphics.

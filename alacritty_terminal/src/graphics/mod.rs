@@ -27,6 +27,14 @@ pub const MAX_GRAPHIC_DIMENSIONS: [usize; 2] = [4096, 4096];
 /// Max. number of graphics stored in a single cell.
 const MAX_GRAPHICS_PER_CELL: usize = 20;
 
+/// Max. total size, in bytes, of the pixel data waiting in the pending queue.
+///
+/// The queue is drained only when the display draws a frame, so output that
+/// never draws (occluded window) or floods Sixel images would otherwise grow
+/// it without limit. A single maximum-size graphic is 64 MiB of RGBA pixels,
+/// so this allows a handful of them between frames.
+const MAX_PENDING_GRAPHICS_BYTES: usize = 256 * 1024 * 1024;
+
 /// Unique identifier for every graphic added to a grid.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Eq, PartialEq, Clone, Debug, Copy, Hash, PartialOrd, Ord)]
@@ -229,7 +237,7 @@ impl GraphicData {
     pub fn is_filled(&self, x: usize, y: usize, width: usize, height: usize) -> bool {
         // If there are pixels outside the picture we assume that the region is
         // not filled.
-        if x + width >= self.width || y + height >= self.height {
+        if x + width > self.width || y + height > self.height {
             return false;
         }
 
@@ -242,7 +250,7 @@ impl GraphicData {
         debug_assert!(self.color_type == ColorType::Rgba);
 
         for offset_y in y..y + height {
-            let offset = offset_y * self.width * 4;
+            let offset = (offset_y * self.width + x) * 4;
             let row = &self.pixels[offset..offset + width * 4];
 
             if row.chunks_exact(4).any(|pixel| pixel.last() != Some(&255)) {
@@ -451,8 +459,19 @@ impl Graphics {
         event_proxy.send_event(Event::PtyWrite(generate_response(pi, ps, pv)));
     }
 
-    pub fn start_sixel_graphic(&mut self, params: &Params) {
-        let palette = self.sixel_shared_palette.take();
+    /// Start parsing a Sixel graphic.
+    ///
+    /// `private_palette` is `true` when `TermMode::SIXEL_PRIV_PALETTE` is set.
+    /// In that mode every graphic starts from the default color registers, so
+    /// any stale shared palette (kept from before the switch to private mode)
+    /// is neither used nor retained.
+    pub fn start_sixel_graphic(&mut self, params: &Params, private_palette: bool) {
+        let palette = if private_palette {
+            self.sixel_shared_palette = None;
+            None
+        } else {
+            self.sixel_shared_palette.take()
+        };
         self.sixel_parser = Some(Box::new(sixel::Parser::new(params, palette)));
     }
 }
@@ -479,7 +498,21 @@ pub fn insert_graphic<L: EventListener>(
         }
     }
 
+    // Cell dimensions come from the embedder, and `Dimensions` defaults them to
+    // zero. Stepping through the graphic by zero-sized cells would panic.
+    if cell_width == 0 || cell_height == 0 {
+        log::warn!("Ignoring graphic: cell dimensions are {cell_width}x{cell_height} pixels");
+        return;
+    }
+
     if graphic.width > MAX_GRAPHIC_DIMENSIONS[0] || graphic.height > MAX_GRAPHIC_DIMENSIONS[1] {
+        return;
+    }
+
+    // Drop the graphic if the display is not consuming the pending queue.
+    let pending_bytes: usize = term.graphics.pending.iter().map(|g| g.pixels.len()).sum();
+    if pending_bytes.saturating_add(graphic.pixels.len()) > MAX_PENDING_GRAPHICS_BYTES {
+        log::warn!("Ignoring graphic: pending graphics exceed {MAX_PENDING_GRAPHICS_BYTES} bytes");
         return;
     }
 
@@ -544,6 +577,10 @@ pub fn insert_graphic<L: EventListener>(
     // cells are not overwritten, allowing any text behind
     // transparent portions of the image to be visible.
 
+    // Transparent graphics keep the text under them. Opaque ones hide it, so
+    // their cells are reset from the cursor template.
+    let keep_cell_content = graphic.maybe_transparent();
+
     let texture = Arc::new(TextureRef {
         id: graphic_id,
         width,
@@ -575,7 +612,7 @@ pub fn insert_graphic<L: EventListener>(
             let graphic_cell =
                 GraphicCell { texture: texture.clone(), offset_x, offset_y, texture_operations };
 
-            let mut cell = term.grid().cursor.template.clone();
+            let template = (!keep_cell_content).then(|| term.grid().cursor.template.clone());
             let cell_ref = &mut term.grid_mut()[line][Column(left)];
 
             // If the cell contains any graphics, and the region of the cell
@@ -605,8 +642,13 @@ pub fn insert_graphic<L: EventListener>(
                 _ => smallvec::smallvec![graphic_cell],
             };
 
-            cell.set_graphics(graphics);
-            *cell_ref = cell;
+            match template {
+                Some(mut cell) => {
+                    cell.set_graphics(graphics);
+                    *cell_ref = cell;
+                },
+                None => cell_ref.set_graphics(graphics),
+            }
         }
 
         term.mark_line_damaged(line);
@@ -663,4 +705,144 @@ fn check_opaque_region() {
 
     assert!(graphic.is_filled(0, 0, 3, 3));
     assert!(!graphic.is_filled(1, 1, 4, 4));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::event::VoidListener;
+    use crate::term::Config;
+
+    struct Size {
+        cell_width: f32,
+        cell_height: f32,
+    }
+
+    impl Dimensions for Size {
+        fn total_lines(&self) -> usize {
+            self.screen_lines()
+        }
+
+        fn screen_lines(&self) -> usize {
+            24
+        }
+
+        fn columns(&self) -> usize {
+            80
+        }
+
+        fn cell_width(&self) -> f32 {
+            self.cell_width
+        }
+
+        fn cell_height(&self) -> f32 {
+            self.cell_height
+        }
+    }
+
+    fn new_term(cell_width: f32, cell_height: f32) -> Term<VoidListener> {
+        Term::new(Config::default(), &Size { cell_width, cell_height }, VoidListener)
+    }
+
+    fn rgba_graphic(width: usize, height: usize, alpha: u8) -> GraphicData {
+        GraphicData {
+            id: GraphicId(0),
+            width,
+            height,
+            color_type: ColorType::Rgba,
+            pixels: vec![alpha; width * height * 4],
+            is_opaque: alpha == 255,
+        }
+    }
+
+    #[test]
+    fn opaque_check_honors_horizontal_offset_and_exact_edges() {
+        // Transparent box in the first three columns of a 10x10 picture.
+        let mut pixels = vec![255; 10 * 10 * 4];
+        for y in 0..10 {
+            let offset = y * 10 * 4;
+            pixels[offset..offset + 3 * 4].fill(0);
+        }
+
+        let graphic = GraphicData {
+            id: GraphicId(0),
+            pixels,
+            width: 10,
+            height: 10,
+            color_type: ColorType::Rgba,
+            is_opaque: false,
+        };
+
+        // Regions right of the transparent columns are filled, including the
+        // one ending exactly at the right/bottom edge.
+        assert!(graphic.is_filled(3, 0, 3, 3));
+        assert!(graphic.is_filled(7, 7, 3, 3));
+
+        // A region overlapping the transparent columns is not filled.
+        assert!(!graphic.is_filled(2, 0, 3, 3));
+        assert!(!graphic.is_filled(0, 0, 3, 3));
+
+        // Beyond the edge is never filled.
+        assert!(!graphic.is_filled(8, 0, 3, 3));
+        assert!(!graphic.is_filled(0, 8, 3, 3));
+    }
+
+    #[test]
+    fn zero_cell_dimensions_do_not_panic() {
+        let mut term = new_term(0.0, 0.0);
+
+        insert_graphic(&mut term, rgba_graphic(20, 20, 255), None);
+
+        assert!(term.graphics.pending.is_empty());
+    }
+
+    #[test]
+    fn pending_queue_is_bounded() {
+        let mut term = new_term(10.0, 10.0);
+
+        for _ in 0..8 {
+            insert_graphic(&mut term, rgba_graphic(4096, 4096, 255), None);
+        }
+
+        let bytes: usize = term.graphics.pending.iter().map(|g| g.pixels.len()).sum();
+        assert!(bytes <= MAX_PENDING_GRAPHICS_BYTES);
+        assert_eq!(term.graphics.pending.len(), MAX_PENDING_GRAPHICS_BYTES / (4096 * 4096 * 4));
+    }
+
+    #[test]
+    fn transparent_graphic_keeps_text_and_opaque_graphic_replaces_it() {
+        let mut term = new_term(10.0, 10.0);
+        term.grid_mut()[Line(0)][Column(0)].c = 'x';
+        insert_graphic(&mut term, rgba_graphic(10, 10, 0), None);
+        assert_eq!(term.grid()[Line(0)][Column(0)].c, 'x');
+        assert!(term.grid()[Line(0)][Column(0)].graphics().is_some());
+
+        let mut term = new_term(10.0, 10.0);
+        term.grid_mut()[Line(0)][Column(0)].c = 'x';
+        insert_graphic(&mut term, rgba_graphic(10, 10, 255), None);
+        assert_eq!(term.grid()[Line(0)][Column(0)].c, ' ');
+        assert!(term.grid()[Line(0)][Column(0)].graphics().is_some());
+    }
+
+    #[test]
+    fn private_palette_mode_ignores_stale_shared_palette() {
+        let red = Rgb { r: 255, g: 0, b: 0 };
+
+        for (private, expect_red) in [(true, false), (false, true)] {
+            let mut graphics = Graphics::default();
+            graphics.sixel_shared_palette = Some(vec![red; 16]);
+
+            graphics.start_sixel_graphic(&Params::default(), private);
+
+            let mut parser = graphics.sixel_parser.take().unwrap();
+            for byte in b"#1~" {
+                parser.put(*byte).unwrap();
+            }
+            let (_, palette) = parser.finish().unwrap();
+
+            assert_eq!(palette[1] == red, expect_red, "private = {private}");
+            assert!(graphics.sixel_shared_palette.is_none());
+        }
+    }
 }

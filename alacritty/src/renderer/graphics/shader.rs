@@ -171,19 +171,51 @@ fn define_vertex_attributes(shader_version: ShaderVersion) -> (GLuint, GLuint) {
             };
         }
 
+        // GLES2 `glVertexAttribPointer` rejects `GL_UNSIGNED_INT` (its type table is
+        // BYTE/UNSIGNED_BYTE/SHORT/UNSIGNED_SHORT/FIXED/FLOAT), so the GLSL ES 1.00
+        // path reads only the low 16 bits of each `GLuint` field as `UNSIGNED_SHORT`.
+        // This is lossless here: `texture_id` is a slot index below
+        // `TEXTURES_ARRAY_SIZE` (it is rewritten before upload), and `column`/`line`
+        // are grid coordinates far below 65536.
+        //
+        // The low half of a `u32` sits at the field offset on little-endian targets
+        // and at `offset + 2` on big-endian ones.
+        const _: () = assert!(mem::size_of::<GLuint>() == 4);
+
+        macro_rules! low_u16_attr {
+            ($field:ident) => {
+                let low_half_offset = if cfg!(target_endian = "little") { 0 } else { 2 };
+
+                gl::VertexAttribPointer(
+                    attr_index,
+                    1,
+                    gl::UNSIGNED_SHORT,
+                    gl::FALSE,
+                    mem::size_of::<Vertex>() as i32,
+                    (mem::offset_of!(Vertex, $field) + low_half_offset) as *const _,
+                );
+
+                attr_index += 1;
+            };
+        }
+
         match shader_version {
             ShaderVersion::Glsl3 => {
                 int_attr!(UNSIGNED_INT, texture_id);
                 int_attr!(UNSIGNED_BYTE, sides);
+
+                float_attr!(UNSIGNED_INT, column);
+                float_attr!(UNSIGNED_INT, line);
             },
             ShaderVersion::Gles2 => {
-                float_attr!(UNSIGNED_INT, texture_id);
+                low_u16_attr!(texture_id);
                 float_attr!(UNSIGNED_BYTE, sides);
+
+                low_u16_attr!(column);
+                low_u16_attr!(line);
             },
         }
 
-        float_attr!(UNSIGNED_INT, column);
-        float_attr!(UNSIGNED_INT, line);
         float_attr!(UNSIGNED_SHORT, height);
         float_attr!(UNSIGNED_SHORT, width);
         float_attr!(UNSIGNED_SHORT, offset_x);

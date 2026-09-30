@@ -114,10 +114,15 @@ impl RenderList {
             if render_item.show_hint {
                 let scale = size_info.cell_height() / graphic_texture.cell_height;
 
+                // `draw_rects` runs in the full-window viewport (unlike the graphic quad,
+                // which draws in the padded one), so the border rects need the window
+                // padding added, as every other rect producer does.
                 let x = render_item.column.0 as f32 * size_info.cell_width()
-                    - render_item.offset_x as f32 * scale;
+                    - render_item.offset_x as f32 * scale
+                    + size_info.padding_x();
                 let y = render_item.line as f32 * size_info.cell_height()
-                    - render_item.offset_y as f32 * scale;
+                    - render_item.offset_y as f32 * scale
+                    + size_info.padding_y();
 
                 let tex_width = graphic_texture.width as f32 * scale;
                 let tex_height = graphic_texture.height as f32 * scale;
