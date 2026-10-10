@@ -17,7 +17,10 @@
 //! | copilot              | `~/.copilot/logs/process-<ts>-<pid>.log` last  | `copilot <flags> --resume=<id>`       |
 //! |                      | "Registering foreground session: <uuid>" entry |                                       |
 //! | codex / codexpilot   | argv `resume <uuid>`, else the rollout         | `<program> <flags> resume <id>`       |
-//! |                      | `.jsonl` the process holds OPEN                |                                       |
+//! |                      | `.jsonl` the process (or its managed daemon)   |                                       |
+//! |                      | holds OPEN                                     |                                       |
+//! | opencode             | argv `--session <id>`, else the newest         | `ooc <flags> --session <id>`          |
+//! |                      | unclaimed top-level `session_v2` row           |                                       |
 //!
 //! Tools are matched by their resolved binary path (via `proc_pidpath`),
 //! falling back to the kernel's saved launch path after an upgrade unlinks the
@@ -124,6 +127,10 @@ pub fn resume_command_for(
                     if let Some(cmd) = codex_resume(child, _shell_cwd, ai_resume, program) {
                         return Some(cmd);
                     }
+                } else if is_opencode_binary(path_str) {
+                    if let Some(cmd) = opencode_resume(child, _shell_cwd, ai_resume) {
+                        return Some(cmd);
+                    }
                 }
                 // Not an AI binary at this level — keep traversing in case
                 // it's a node/python wrapper that spawned one.
@@ -173,25 +180,39 @@ fn claude_resume_from_args(
     args: &[String],
     ai_resume: &AiResumeConfig,
 ) -> Option<String> {
+    let (endpoint, flash) = claude_route_from_args(args);
+    claude_command_for(session_id, endpoint.as_deref(), flash, ai_resume)
+}
+
+/// Extract the provider endpoint and flash-model flag from claude argv.
+fn claude_route_from_args<S: AsRef<str>>(args: &[S]) -> (Option<String>, bool) {
     let mut endpoint = None;
     let mut flash = false;
     let mut args = args.iter().skip(1);
     while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
         let settings = if arg == "--settings" {
-            args.next().map(String::as_str)
+            args.next().map(|value| value.as_ref())
         } else {
             arg.strip_prefix("--settings=")
         };
         if let Some(settings) = settings {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(settings) {
-                if let Some(url) = value.get("env").and_then(|env| env.get("ANTHROPIC_BASE_URL")) {
-                    endpoint = Some(url.as_str()?.to_owned());
+            // Persisted commands re-parse shell-quoted tokens; live argv is
+            // raw. Unquoting is a no-op on the latter.
+            let settings = unshell_quote(settings);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&settings) {
+                if let Some(url) = value
+                    .get("env")
+                    .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+                    .and_then(|url| url.as_str())
+                {
+                    endpoint = Some(url.to_owned());
                 }
             }
             continue;
         }
         let model = if arg == "--model" {
-            args.next().map(String::as_str)
+            args.next().map(|value| value.as_ref())
         } else {
             arg.strip_prefix("--model=")
         };
@@ -199,17 +220,55 @@ fn claude_resume_from_args(
             flash = model == "haiku";
         }
     }
+    (endpoint, flash)
+}
 
-    match endpoint.as_deref().map(|url| url.trim_end_matches('/')) {
+/// Strip one layer of `shell_quote` quoting. Identity for raw argv tokens.
+fn unshell_quote(arg: &str) -> String {
+    if arg.len() >= 2 && arg.starts_with('\'') && arg.ends_with('\'') {
+        return arg[1..arg.len() - 1].replace("'\\''", "'");
+    }
+    arg.to_string()
+}
+
+/// Rebuild the resume command for a claude session given its provider route.
+fn claude_command_for(
+    session_id: &str,
+    endpoint: Option<&str>,
+    flash: bool,
+    ai_resume: &AiResumeConfig,
+) -> Option<String> {
+    match endpoint.map(|url| url.trim_end_matches('/')) {
         Some("https://api.z.ai/api/anthropic") => {
             Some(cglm_resume_command(session_id, flash, ai_resume))
         },
         None | Some("") | Some("https://api.anthropic.com") => {
             Some(claude_resume_command(session_id, ai_resume))
         },
-        // An unrecognized provider must not fall back to paid Claude credits.
+        // A custom provider must never fall back to paid Claude credits.
+        // Persist the endpoint URL alone — the rest of --settings can carry
+        // auth tokens or tuning env that must not leak into session.json.
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+            Some(claude_resume_command_with_endpoint(session_id, url, ai_resume))
+        },
         Some(_) => None,
     }
+}
+
+fn claude_resume_command_with_endpoint(
+    session_id: &str,
+    endpoint: &str,
+    ai_resume: &AiResumeConfig,
+) -> String {
+    // URL-only settings rebuild: anything else the live process carried
+    // (tokens, tool-search toggles, concurrency caps) is deliberately dropped.
+    let settings =
+        serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": endpoint } }).to_string();
+    build_command(
+        "claude",
+        &ai_resume.claude.flags,
+        ["--settings", &settings, "--resume", session_id],
+    )
 }
 
 fn cglm_resume_command(session_id: &str, flash: bool, ai_resume: &AiResumeConfig) -> String {
@@ -412,7 +471,11 @@ pub fn normalize_saved_resume_command(command: &str, ai_resume: &AiResumeConfig)
             .map(|id| cglm_resume_command(&id, args.get(1) == Some(&"--flash"), ai_resume));
     }
     if program.ends_with("claude") {
-        return claude_resume_id_from_args(&args).map(|id| claude_resume_command(&id, ai_resume));
+        // Keep the provider endpoint across save/load: a custom-router session
+        // must not be normalized back onto subscription credentials.
+        let id = claude_resume_id_from_args(&args)?;
+        let (endpoint, flash) = claude_route_from_args(&args);
+        return claude_command_for(&id, endpoint.as_deref(), flash, ai_resume);
     }
     if program.ends_with("copilot") {
         return copilot_resume_id_from_args(&args).map(|id| copilot_resume_command(&id, ai_resume));
@@ -424,6 +487,10 @@ pub fn normalize_saved_resume_command(command: &str, ai_resume: &AiResumeConfig)
     if program.ends_with("codex") {
         return codex_resume_id_from_args(&args)
             .map(|id| codex_resume_command("codex", &id, ai_resume));
+    }
+    if *program == "ooc" || program.ends_with("opencode") {
+        return opencode_session_id_from_args(&args)
+            .map(|id| opencode_resume_command(&id, ai_resume));
     }
     None
 }
@@ -490,7 +557,15 @@ fn codex_resume_id_from_args(args: &[&str]) -> Option<String> {
 }
 
 fn codex_session_for_pid(pid: c_int, cwd: &Path) -> Option<String> {
-    let open_paths = crate::macos::proc::open_file_paths(pid);
+    // codex 0.162+ moves rollout fds onto its managed app-server daemon
+    // (`codex app-server --managed-daemon`) — the matched TUI binary holds
+    // none. Merge the fd tables of near descendants (the daemon is a direct
+    // child of the matched binary) before ranking, so both the pre-0.162
+    // layout (fds on the binary) and the daemon layout resolve.
+    let mut open_paths = crate::macos::proc::open_file_paths(pid);
+    for child in crate::macos::proc::list_descendants(pid, 2) {
+        open_paths.extend(crate::macos::proc::open_file_paths(child));
+    }
     codex_session_from_open_paths(&open_paths, cwd.to_str().unwrap_or(""))
 }
 
@@ -592,6 +667,122 @@ fn rollout_session_meta(path: &Path) -> Option<RolloutMeta> {
     })
 }
 
+// ---------- opencode ----------
+
+fn is_opencode_binary(p: &str) -> bool {
+    p.contains("/@opencode/cli/") || p.contains("/opencode/cli/bin/opencode")
+}
+
+/// opencode resume: explicit `--session <id>` in argv is authoritative; a bare
+/// TUI started through `ooc` carries no id (2.0.26 stopped logging
+/// `session.id=`), so fall back to ranking the newest top-level rows of the
+/// local session DB. `opencode run …` (one-shot prompt) and `opencode serve …`
+/// (the stdio child that holds session state) are not conversation owners and
+/// must not claim a session: any argv[1] that is a subcommand rather than a
+/// flag means this process is not the tab's interactive TUI.
+///
+/// The fallback ranks `(directory == cwd, time_updated)` and shares the
+/// per-tick claim set with codex so sibling tabs never persist the same id.
+/// Without an argv id the mapping between tabs and sessions is a best-effort
+/// guess — once replayed through `ooc --session <id>`, later saves are exact.
+fn opencode_resume(pid: c_int, cwd: &Path, ai_resume: &AiResumeConfig) -> Option<String> {
+    let args = crate::macos::proc::argv(pid)?;
+    if opencode_is_subcommand(&args) {
+        return None;
+    }
+    if let Some(id) = opencode_session_id_from_args(&args) {
+        return Some(opencode_resume_command(&id, ai_resume));
+    }
+    let rows = opencode_session_rows()?;
+    let id = opencode_session_from_rows(&rows, cwd.to_str().unwrap_or(""))?;
+    Some(opencode_resume_command(&id, ai_resume))
+}
+
+fn opencode_is_subcommand(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| !arg.starts_with('-'))
+}
+
+fn opencode_session_id_from_args<S: AsRef<str>>(args: &[S]) -> Option<String> {
+    for (idx, arg) in args.iter().enumerate() {
+        let arg = arg.as_ref();
+        if arg == "--session" || arg == "-s" {
+            return args
+                .get(idx + 1)
+                .map(AsRef::as_ref)
+                .filter(|id| !id.is_empty() && !id.starts_with('-'))
+                .map(ToString::to_string);
+        }
+        if let Some(id) = arg.strip_prefix("--session=") {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn opencode_resume_command(session_id: &str, ai_resume: &AiResumeConfig) -> String {
+    // Resume through the `ooc` wrapper so the tab reopens with the same
+    // switchboard/provider policy as the original launch. Never `--continue`:
+    // with multiple tabs it would collapse every one onto the newest session.
+    build_command("ooc", &ai_resume.opencode.flags, ["--session", session_id])
+}
+
+/// Top-level opencode sessions, newest first: `(id, directory, time_updated)`.
+///
+/// opencode keeps no PID-keyed session pointer; the sqlite store is the only
+/// record. Read it out-of-process via `/usr/bin/sqlite3 -readonly` so the
+/// terminal never links sqlite or writes to the user's session DB.
+fn opencode_session_rows() -> Option<Vec<(String, String, i64)>> {
+    let mut db = home::home_dir()?;
+    db.push(".local/share/opencode/opencode.db");
+    let output = std::process::Command::new("/usr/bin/sqlite3")
+        .args([
+            "-readonly",
+            db.to_str()?,
+            "SELECT id, directory, time_updated FROM session_v2 WHERE parent_id IS NULL \
+             ORDER BY time_updated DESC LIMIT 32",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut cols = line.splitn(3, '|');
+        let id = cols.next()?.to_string();
+        let directory = cols.next().unwrap_or("").to_string();
+        let time_updated = cols.next().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0);
+        if !id.is_empty() {
+            rows.push((id, directory, time_updated));
+        }
+    }
+    Some(rows)
+}
+
+/// Testable inner ranking over `(id, directory, time_updated)` rows.
+/// Rank is `(directory == cwd, time_updated)`, highest wins; already-claimed
+/// ids are skipped so sibling tabs land on distinct sessions.
+fn opencode_session_from_rows(rows: &[(String, String, i64)], cwd: &str) -> Option<String> {
+    let claimed: HashSet<String> = claimed_set().lock().map(|g| g.clone()).unwrap_or_default();
+    let mut best: Option<((bool, i64), String)> = None;
+    for (id, directory, time_updated) in rows {
+        if claimed.contains(id) {
+            continue;
+        }
+        let rank = (directory == cwd, *time_updated);
+        if best.as_ref().is_none_or(|(best_rank, _)| *best_rank < rank) {
+            best = Some((rank, id.clone()));
+        }
+    }
+    let id = best.map(|(_, id)| id)?;
+    if let Ok(mut g) = claimed_set().lock() {
+        g.insert(id.clone());
+    }
+    Some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +834,10 @@ mod tests {
         assert_eq!(
             codex_resume_command("codexpilot", "codex-session", &config),
             "codexpilot --toml-codex-flag resume codex-session"
+        );
+        assert_eq!(
+            opencode_resume_command("ses_abc", &config),
+            "ooc --toml-opencode-flag --session ses_abc"
         );
     }
 
@@ -705,14 +900,39 @@ mod tests {
     }
 
     #[test]
-    fn claude_resume_does_not_replace_unknown_provider_with_subscription() {
+    fn claude_resume_keeps_unknown_provider_without_subscription_fallback() {
         let args = [
             "claude",
             "--settings",
-            r#"{"env":{"ANTHROPIC_BASE_URL":"https://other.example/api/anthropic"}}"#,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://other.example/api/anthropic","SECRET_TOKEN":"never-persist"}}"#,
         ]
         .map(String::from);
-        assert!(claude_resume_from_args("session", &args, &AiResumeConfig::default()).is_none());
+        let command = claude_resume_from_args("session", &args, &AiResumeConfig::default()).unwrap();
+        // The endpoint survives; the bare subscription launcher must not
+        // replace it (that would burn paid credits on a foreign-router chat)…
+        assert_eq!(
+            command,
+            "claude --settings '{\"env\":{\"ANTHROPIC_BASE_URL\":\"https://other.example/api/anthropic\"}}' --resume session"
+        );
+        // …and no other env from the live --settings (tokens, tuning) leaks.
+        assert!(!command.contains("SECRET_TOKEN"));
+        // Round-trips through save/load normalization unchanged.
+        assert_eq!(
+            normalize_saved_resume_command(&command, &AiResumeConfig::default()).as_deref(),
+            Some(command.as_str())
+        );
+    }
+
+    #[test]
+    fn claude_resume_rejects_non_http_provider_urls() {
+        for url in ["ftp://other.example/api", "not-a-url", "file:///tmp/x"] {
+            let settings = format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{url}"}}}}"#);
+            let args = ["claude", "--settings", &settings].map(String::from);
+            assert!(
+                claude_resume_from_args("session", &args, &AiResumeConfig::default()).is_none(),
+                "url {url} must not produce a resume command"
+            );
+        }
     }
 
     #[test]
@@ -753,6 +973,89 @@ mod tests {
     fn codex_resume_arg_rejects_last_fallback() {
         let args = vec!["codex".to_string(), "resume".to_string(), "--last".to_string()];
         assert!(codex_resume_arg_from(&args).is_none());
+    }
+
+    #[test]
+    fn matches_opencode_binary() {
+        assert!(is_opencode_binary("/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe"));
+        assert!(is_opencode_binary("/x/@opencode/cli/bin/opencode"));
+        assert!(!is_opencode_binary("/usr/bin/zsh"));
+        assert!(!is_opencode_binary("/opt/homebrew/bin/opencode"));
+    }
+
+    #[test]
+    fn opencode_resume_arg_extracts_explicit_session() {
+        for args in [
+            vec!["opencode", "--session", "ses_abc"],
+            vec!["opencode", "--standalone", "--auto", "--session=ses_abc"],
+            vec!["opencode", "-s", "ses_abc"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(opencode_session_id_from_args(&args).as_deref(), Some("ses_abc"));
+        }
+    }
+
+    #[test]
+    fn opencode_resume_arg_rejects_missing_or_flag_values() {
+        for args in [
+            vec!["opencode", "--session"],
+            vec!["opencode", "--session", "--auto"],
+            vec!["opencode", "--standalone", "--auto"],
+            vec!["opencode", "--session="],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(opencode_session_id_from_args(&args).is_none(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn opencode_subcommands_are_not_resume_targets() {
+        let tui = ["opencode", "--standalone", "--auto"].map(String::from);
+        assert!(!opencode_is_subcommand(&tui));
+        for args in [
+            vec!["opencode", "run", "--standalone", "--auto", "prompt"],
+            vec!["opencode", "serve", "--stdio", "--port", "0"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(opencode_is_subcommand(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn opencode_session_ranking_prefers_cwd_then_recency() {
+        let rows = vec![
+            ("ses_old_cwd".to_string(), "/work".to_string(), 100),
+            ("ses_newer_elsewhere".to_string(), "/other".to_string(), 300),
+            ("ses_newest_cwd".to_string(), "/work".to_string(), 200),
+        ];
+        assert_eq!(opencode_session_from_rows(&rows, "/work").as_deref(), Some("ses_newest_cwd"));
+    }
+
+    #[test]
+    fn opencode_claimed_sessions_not_returned_twice() {
+        begin_save_tick();
+        let rows = vec![
+            ("ses_first".to_string(), "/work".to_string(), 300),
+            ("ses_second".to_string(), "/work".to_string(), 200),
+        ];
+        assert_eq!(opencode_session_from_rows(&rows, "/work").as_deref(), Some("ses_first"));
+        assert_eq!(opencode_session_from_rows(&rows, "/work").as_deref(), Some("ses_second"));
+        assert_eq!(opencode_session_from_rows(&rows, "/work").as_deref(), None);
+    }
+
+    #[test]
+    fn opencode_resume_round_trips_session_flag() {
+        let config = test_ai_resume_config();
+        assert_eq!(
+            opencode_resume_command("ses_abc", &config),
+            "ooc --toml-opencode-flag --session ses_abc"
+        );
+        assert_eq!(
+            normalize_saved_resume_command("ooc --session ses_abc", &config),
+            Some("ooc --toml-opencode-flag --session ses_abc".to_string())
+        );
+        // `--continue` is multi-tab collapse fuel, same as `codex resume --last`.
+        assert_eq!(normalize_saved_resume_command("ooc --continue", &config), None);
     }
 
     #[test]
@@ -858,6 +1161,7 @@ mod tests {
         config.claude.flags = vec!["--toml-claude-flag".into()];
         config.codex.flags = vec!["--toml-codex-flag".into()];
         config.copilot.flags = vec!["--toml-copilot-flag".into()];
+        config.opencode.flags = vec!["--toml-opencode-flag".into()];
         config
     }
 

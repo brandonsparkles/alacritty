@@ -15,6 +15,9 @@
 //!
 //! [ai_resume.copilot]
 //! flags = ["--your-copilot-flag"]
+//!
+//! [ai_resume.opencode]
+//! flags = ["--your-opencode-flag"]
 //! ```
 
 use serde::Serialize;
@@ -26,6 +29,7 @@ pub struct AiResumeConfig {
     pub claude: ClaudeResumeConfig,
     pub codex: CodexResumeConfig,
     pub copilot: CopilotResumeConfig,
+    pub opencode: OpencodeResumeConfig,
 }
 
 #[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Eq, Debug)]
@@ -40,5 +44,10 @@ pub struct CodexResumeConfig {
 
 #[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct CopilotResumeConfig {
+    pub flags: Vec<String>,
+}
+
+#[derive(ConfigDeserialize, Serialize, Default, Clone, PartialEq, Eq, Debug)]
+pub struct OpencodeResumeConfig {
     pub flags: Vec<String>,
 }
