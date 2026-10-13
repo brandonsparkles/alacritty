@@ -498,14 +498,28 @@ impl Processor {
         #[cfg(target_os = "macos")]
         let restored_from_session = options.restored_from_session;
 
-        let window_context = WindowContext::additional(
+        let window_context = match WindowContext::additional(
             gl_config,
             event_loop,
             self.proxy.clone(),
             config,
             options,
             config_overrides,
-        )?;
+        ) {
+            Ok(window_context) => window_context,
+            Err(err) => {
+                // A restored window that never opens still owes its window
+                // step, plus its resume step if one was counted.
+                #[cfg(target_os = "macos")]
+                if restored_from_session {
+                    self.finish_restore_step();
+                    if resume_command.is_some() {
+                        self.finish_restore_step();
+                    }
+                }
+                return Err(err);
+            },
+        };
 
         #[cfg(target_os = "macos")]
         {
@@ -1003,6 +1017,17 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+
+                // A restored window closed inside the resume delay drops its
+                // ResumeCommand timer below; complete that restore step here
+                // or saves stay disabled for the rest of the app's lifetime.
+                #[cfg(target_os = "macos")]
+                if self
+                    .scheduler
+                    .scheduled(TimerId::new(Topic::ResumeCommand, window_context.id()))
+                {
+                    self.finish_restore_step();
+                }
 
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
