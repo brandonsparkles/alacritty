@@ -109,6 +109,15 @@ pub struct Processor {
     /// overwrite the complete saved session.
     #[cfg(target_os = "macos")]
     session_restore_pending: usize,
+    /// When `save_session` first skipped for the current stretch of
+    /// `session_restore_pending > 0`; cleared by the next save that goes
+    /// through. Drives the one-shot "saves suppressed" warning
+    /// (spk-e2cc50347b54). `Cell` because `save_session` takes `&self`.
+    #[cfg(target_os = "macos")]
+    session_save_skip_since: std::cell::Cell<Option<Instant>>,
+    /// The suppressed-save warning was already logged for this stretch.
+    #[cfg(target_os = "macos")]
+    session_save_skip_warned: std::cell::Cell<bool>,
     /// Daily usage budget — enforces the 3-hour cap and 02:00–08:00 sleep
     /// window. Ticked once per second while any window is focused; persisted
     /// to `~/Library/Application Support/org.alacritty/usage.json`. Shared
@@ -191,6 +200,21 @@ fn next_focus_state(
     }
 }
 
+/// How long `save_session` may stay suppressed by a pending restore before the
+/// suppression is logged (spk-e2cc50347b54). A real restore replay finishes in
+/// seconds, so a skip that outlives this bound means the pending counter is
+/// stuck. macOS only.
+#[cfg(target_os = "macos")]
+const SESSION_SAVE_SKIP_WARN_AFTER: Duration = Duration::from_secs(30);
+
+/// Pure decision for the one-shot suppressed-save warning: true once the saves
+/// have been skipped since `since` for at least `SESSION_SAVE_SKIP_WARN_AFTER`
+/// and the warning for this stretch has not been logged yet.
+#[cfg(target_os = "macos")]
+fn session_skip_warning_due(since: Instant, now: Instant, already_warned: bool) -> bool {
+    !already_warned && now.saturating_duration_since(since) >= SESSION_SAVE_SKIP_WARN_AFTER
+}
+
 impl Processor {
     /// Create a new event processor.
     pub fn new(
@@ -245,6 +269,10 @@ impl Processor {
             session_save_host: None,
             #[cfg(target_os = "macos")]
             session_restore_pending: 0,
+            #[cfg(target_os = "macos")]
+            session_save_skip_since: std::cell::Cell::new(None),
+            #[cfg(target_os = "macos")]
+            session_save_skip_warned: std::cell::Cell::new(false),
             #[cfg(target_os = "macos")]
             budget,
             #[cfg(target_os = "macos")]
@@ -392,8 +420,25 @@ impl Processor {
     #[cfg(target_os = "macos")]
     fn save_session(&self) {
         if self.session_restore_pending > 0 {
+            // spk-e2cc50347b54: a counter that never reaches zero silently
+            // froze session.json for the app lifetime (spk-71339950e02a), so
+            // a suppression that outlives the restore replay is logged once.
+            let now = Instant::now();
+            let since = self.session_save_skip_since.get().unwrap_or(now);
+            self.session_save_skip_since.set(Some(since));
+            if session_skip_warning_due(since, now, self.session_save_skip_warned.get()) {
+                self.session_save_skip_warned.set(true);
+                warn!(
+                    "session saves suppressed for {}s: {} restore step(s) still pending, \
+                     session.json is not being updated",
+                    now.saturating_duration_since(since).as_secs(),
+                    self.session_restore_pending,
+                );
+            }
             return;
         }
+        self.session_save_skip_since.set(None);
+        self.session_save_skip_warned.set(false);
         let windows: Vec<_> = self.windows.values().map(|wc| wc.session_seed()).collect();
         self.session_save_worker.request(crate::session::SaveRequest {
             windows,
@@ -3207,11 +3252,25 @@ fn hide_app() {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{AppFocusState, next_focus_state};
+    use super::{AppFocusState, next_focus_state, session_skip_warning_due};
 
     // Helper: an Instant some seconds in the past.
     fn past(secs: u64) -> Instant {
         Instant::now() - Duration::from_secs(secs)
+    }
+
+    // ── Suppressed session-save warning (spk-e2cc50347b54) ────────────────
+
+    #[test]
+    fn session_skip_warning_waits_for_the_bound() {
+        assert!(!session_skip_warning_due(past(5), Instant::now(), false));
+        assert!(!session_skip_warning_due(past(29), Instant::now(), false));
+    }
+
+    #[test]
+    fn session_skip_warning_fires_once_after_the_bound() {
+        assert!(session_skip_warning_due(past(31), Instant::now(), false));
+        assert!(!session_skip_warning_due(past(31), Instant::now(), true));
     }
 
     // ── Active state transitions ──────────────────────────────────────────
