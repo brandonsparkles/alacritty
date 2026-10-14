@@ -231,9 +231,10 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
 
     // Spawn the budget daemon (macOS only). Listens on 127.0.0.1:38121
     // for GET /usage + POST /courtesy. Survives until process exit.
-    // Exposes counting state even when [budget].enabled = false; enforcement
-    // still stays disabled through Budget::block_status. Serves the live
-    // shared state; the config handle tracks TOML live-reloads.
+    // Exposes counting state even when [budget].enabled = false (counting
+    // follows track_usage); enforcement still stays disabled through
+    // Budget::block_status. Serves the live shared state; the config handle
+    // tracks TOML live-reloads.
     #[cfg(target_os = "macos")]
     {
         let config_handle = budget_config.clone();

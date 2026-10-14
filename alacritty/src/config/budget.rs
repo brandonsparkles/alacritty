@@ -10,6 +10,7 @@
 //! ```toml
 //! [budget]
 //! enabled = true
+//! track_usage = true            # count focused time + hide even when enabled = false
 //! cap_seconds = 10800           # 3 hours of focused time per day
 //! sleep_start_hour = 2          # 02:00 local — hard cutoff
 //! sleep_end_hour = 8            # 08:00 local — unlock + daily reset
@@ -32,9 +33,15 @@ pub const DEFAULT_CAP_SECONDS: u64 = 3 * 60 * 60;
 
 #[derive(ConfigDeserialize, Serialize, Clone, PartialEq, Debug)]
 pub struct BudgetConfig {
-    /// Master switch. When false, no counter ticks and no lockout fires —
-    /// the budget machinery is entirely passive.
+    /// Enforcement switch. When false, no lockout fires (cap, sleep
+    /// window, overlay). Tracking still runs while `track_usage` is true.
     pub enabled: bool,
+
+    /// Tracking switch. When true, the focused-time counter ticks, state
+    /// persists, and `hide_when_inactive` applies even with `enabled =
+    /// false`. Enforcement implies tracking: with `enabled = true` the
+    /// counter always ticks regardless of this flag.
+    pub track_usage: bool,
 
     /// Daily active-time cap, in seconds. Defaults to 10800 (3 hours).
     pub cap_seconds: u64,
@@ -96,6 +103,11 @@ pub struct BudgetConfig {
 }
 
 impl BudgetConfig {
+    /// True when the focus state machine and usage counter should run.
+    pub fn tracking_active(&self) -> bool {
+        self.enabled || self.track_usage
+    }
+
     /// `sleep_start_hour` clamped into the documented 0–23 range.
     ///
     /// The raw field is a bare `u8` straight out of `alacritty.toml` with
@@ -126,6 +138,7 @@ impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            track_usage: true,
             cap_seconds: DEFAULT_CAP_SECONDS,
             sleep_start_hour: 2,
             sleep_end_hour: 8,
@@ -138,5 +151,21 @@ impl Default for BudgetConfig {
             weekly_extension_seconds: 60 * 60,
             weekly_extension_allowance_seconds: 6 * 60 * 60,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracking_active_is_enforcement_or_track_usage() {
+        let cfg =
+            |enabled, track_usage| BudgetConfig { enabled, track_usage, ..Default::default() };
+        assert!(cfg(true, true).tracking_active());
+        // Enforcement implies tracking — track_usage = false can't stop the counter.
+        assert!(cfg(true, false).tracking_active());
+        assert!(cfg(false, true).tracking_active());
+        assert!(!cfg(false, false).tracking_active());
     }
 }

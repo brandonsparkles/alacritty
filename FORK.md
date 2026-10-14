@@ -225,7 +225,8 @@ block — usage state persists to disk.
 
 ```toml
 [budget]
-enabled = true                  # master switch
+enabled = true                  # enforcement: cap, sleep window, lockout overlay
+track_usage = true              # tracking: counter + hide_when_inactive, even with enabled = false
 cap_seconds = 10800             # 3 h
 sleep_start_hour = 2            # 02:00 Chicago
 sleep_end_hour = 8              # 08:00 Chicago; daily reset
@@ -239,9 +240,11 @@ weekly_extension_seconds = 3600  # 1 h per redemption
 weekly_extension_allowance_seconds = 21600  # 6 h of extension per ISO week
 ```
 
-All fields have sensible defaults; the section is optional. Set
-`enabled = false` to disable the entire system (no ticking, no overlay,
-no daemon).
+All fields have sensible defaults; the section is optional. Tracking and
+enforcement are separate: `enabled = false` disables the lockout (no cap,
+no sleep window, no overlay) while `track_usage = true` keeps counting
+focused time, hiding after the grace period, and serving `/usage`. With
+`enabled = true` tracking always runs regardless of `track_usage`.
 
 ### Persistent state — `~/Library/Application Support/org.alacritty/usage.json`
 

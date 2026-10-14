@@ -200,6 +200,9 @@ struct UsagePayload {
     seconds_until_unlock: u64,
     /// Configured timezone — handy for UI display.
     timezone: String,
+    /// `true` when the counter is live (`enabled || track_usage`). When
+    /// false the counters above are frozen at their last tracked value.
+    tracking: bool,
 }
 
 /// Lock the shared budget, surviving poisoning: enforcement must keep
@@ -457,6 +460,7 @@ fn snapshot(cfg: &BudgetConfig, budget: &Mutex<Budget>) -> UsagePayload {
         reason,
         seconds_until_unlock: budget.seconds_until_unlock(cfg),
         timezone: cfg.timezone.clone(),
+        tracking: cfg.tracking_active(),
     }
 }
 
@@ -799,6 +803,7 @@ mod tests {
             reason: None,
             seconds_until_unlock: 0,
             timezone: "America/Chicago".to_string(),
+            tracking: true,
         };
         let json = serde_json::to_value(&payload).unwrap();
         let obj = json.as_object().unwrap();
@@ -848,6 +853,7 @@ mod tests {
             reason: None,
             seconds_until_unlock: 0,
             timezone: "America/Chicago".to_string(),
+            tracking: true,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
@@ -884,6 +890,7 @@ mod tests {
             reason: None,
             seconds_until_unlock: 0,
             timezone: "America/Chicago".to_string(),
+            tracking: true,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();

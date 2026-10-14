@@ -460,6 +460,61 @@ impl Processor {
         self.windows.values().any(|wc| wc.is_focused())
     }
 
+    /// Usage-tracking half of `BudgetTick`: drives the focus state machine,
+    /// hides the app when the background grace expires, advances the
+    /// counter while active or in grace, and persists the state. Runs
+    /// whenever `BudgetConfig::tracking_active`, independent of lockout.
+    #[cfg(target_os = "macos")]
+    fn budget_track_tick(&mut self, cfg: &crate::config::budget::BudgetConfig) {
+        // The daemon shares this state (Arc<Mutex>), so its
+        // courtesy/extension grants are already visible here —
+        // no per-tick disk re-read is needed.
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let any_focused = self.any_window_focused();
+        let now = std::time::Instant::now();
+        // State machine — Active ↔ InGrace ↔ Hidden.
+        let (next_state, hit_grace_expiry) = next_focus_state(
+            self.app_focus_state,
+            any_focused,
+            now,
+            cfg.hide_when_inactive,
+            cfg.background_grace_seconds,
+        );
+        self.app_focus_state = next_state;
+
+        if hit_grace_expiry {
+            hide_app();
+        }
+
+        // Tick the counter while we're visible AND useful —
+        // i.e. Active or InGrace. Hidden state does NOT count
+        // (alacritty is not in front of the user).
+        let counts =
+            matches!(self.app_focus_state, AppFocusState::Active | AppFocusState::InGrace(_));
+        let before = budget.clone();
+        if counts {
+            budget.tick(cfg, 1);
+        } else {
+            budget.refresh_day_boundary(cfg);
+        }
+        // The state is re-validated every second even when no
+        // counter moved; stamp it so the daemon's /usage
+        // payload keeps a fresh updated_at.
+        budget.touch();
+        // Persist every tick that changed a counted field —
+        // the crash loss bound while time is being counted
+        // stays ≤1s. Idle ticks (Hidden, nothing accrued)
+        // skip the write except a ~60s updated_at heartbeat.
+        let changed = !budget.same_persistent_state(&before);
+        let heartbeat_due =
+            self.budget_last_save.is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+        if changed || heartbeat_due {
+            budget.save();
+            self.budget_last_save = Some(Instant::now());
+        }
+    }
+
     /// Schedule a one-shot delayed dispatch of a resume command into a
     /// restored window's PTY. The 500 ms delay gives the shell time to print
     /// its first prompt before we synthesise input — without it, the command
@@ -843,8 +898,17 @@ impl ApplicationHandler<Event> for Processor {
             #[allow(clippy::if_not_else)]
             (EventType::BudgetTick, _) => {
                 let cfg = self.config.budget.clone();
+                // Tracking (focus state, hide-after-grace, counter) runs
+                // independently of enforcement; `enabled` implies it.
+                if cfg.tracking_active() {
+                    self.budget_track_tick(&cfg);
+                } else {
+                    // Restart the state machine fresh if tracking resumes,
+                    // so a stale InGrace instant can't hide the app at once.
+                    self.app_focus_state = AppFocusState::Active;
+                }
                 if !cfg.enabled {
-                    // Master switch off: clear any active lockout state.
+                    // Enforcement off: clear any active lockout state.
                     for wc in self.windows.values_mut() {
                         let was_blocked = wc.display.budget_blocked;
                         wc.display.budget_blocked = false;
@@ -858,53 +922,7 @@ impl ApplicationHandler<Event> for Processor {
                     // The daemon shares this state (Arc<Mutex>), so its
                     // courtesy/extension grants are already visible here —
                     // no per-tick disk re-read is needed.
-                    let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
-
-                    let any_focused = self.any_window_focused();
-                    let now = std::time::Instant::now();
-                    // State machine — Active ↔ InGrace ↔ Hidden.
-                    let (next_state, hit_grace_expiry) = next_focus_state(
-                        self.app_focus_state,
-                        any_focused,
-                        now,
-                        cfg.hide_when_inactive,
-                        cfg.background_grace_seconds,
-                    );
-                    self.app_focus_state = next_state;
-
-                    if hit_grace_expiry {
-                        hide_app();
-                    }
-
-                    // Tick the counter while we're visible AND useful —
-                    // i.e. Active or InGrace. Hidden state does NOT count
-                    // (alacritty is not in front of the user).
-                    let counts = matches!(
-                        self.app_focus_state,
-                        AppFocusState::Active | AppFocusState::InGrace(_)
-                    );
-                    let before = budget.clone();
-                    if counts {
-                        budget.tick(&cfg, 1);
-                    } else {
-                        budget.refresh_day_boundary(&cfg);
-                    }
-                    // The state is re-validated every second even when no
-                    // counter moved; stamp it so the daemon's /usage
-                    // payload keeps a fresh updated_at.
-                    budget.touch();
-                    // Persist every tick that changed a counted field —
-                    // the crash loss bound while time is being counted
-                    // stays ≤1s. Idle ticks (Hidden, nothing accrued)
-                    // skip the write except a ~60s updated_at heartbeat.
-                    let changed = !budget.same_persistent_state(&before);
-                    let heartbeat_due = self
-                        .budget_last_save
-                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
-                    if changed || heartbeat_due {
-                        budget.save();
-                        self.budget_last_save = Some(Instant::now());
-                    }
+                    let budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
 
                     // Push current block state to every window so the
                     // input handler can filter keystrokes + the tab-title
