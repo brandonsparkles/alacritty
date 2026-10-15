@@ -676,6 +676,12 @@ impl<T> Term<T> {
 
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
+        // Update size information for graphics. This must run even when the
+        // grid dimensions are unchanged: a DPI/scale factor or font change
+        // alters the cell size in pixels while cols/lines stay the same, and
+        // insert_graphic places Sixel data from this cached cell size.
+        self.graphics.resize(&size);
+
         let old_cols = self.columns();
         let old_lines = self.screen_lines();
 
@@ -725,9 +731,6 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
-
-        // Update size information for graphics.
-        self.graphics.resize(&size);
     }
 
     /// Active terminal modes.

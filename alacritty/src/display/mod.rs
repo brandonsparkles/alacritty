@@ -881,15 +881,25 @@ impl Display {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
+        // Resize terminal when its dimensions or cell size have changed. A
+        // DPI/scale or font change can alter the cell size while cols/lines
+        // stay the same, and Term::resize must still receive the new cell size
+        // (graphics placement reads it).
+        if self.size_info.screen_lines() != new_size.screen_lines
+            || self.size_info.columns() != new_size.columns()
+            || self.size_info.cell_width() != new_size.cell_width()
+            || self.size_info.cell_height() != new_size.cell_height()
+        {
+            // Resize terminal.
+            terminal.resize(new_size);
+        }
+
         // Resize when terminal when its dimensions have changed.
         if self.size_info.screen_lines() != new_size.screen_lines
             || self.size_info.columns() != new_size.columns()
         {
             // Resize PTY.
             pty_resize_handle.on_resize(new_size.into());
-
-            // Resize terminal.
-            terminal.resize(new_size);
 
             // Resize damage tracking.
             self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());

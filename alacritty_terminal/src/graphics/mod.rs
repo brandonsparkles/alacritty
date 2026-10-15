@@ -798,6 +798,21 @@ mod tests {
     }
 
     #[test]
+    fn resize_refreshes_graphics_cell_size_when_grid_is_unchanged() {
+        let mut term = new_term(10.0, 20.0);
+        assert_eq!(term.graphics.cell_width, 10.0);
+        assert_eq!(term.graphics.cell_height, 20.0);
+
+        // Same 80x24 grid, new cell size (DPI/scale or font change): the
+        // graphics cell size must still be refreshed, or insert_graphic places
+        // Sixel data with the stale pixel dimensions (spk-8ed39bd5c7c3).
+        term.resize(Size { cell_width: 25.0, cell_height: 50.0 });
+
+        assert_eq!(term.graphics.cell_width, 25.0);
+        assert_eq!(term.graphics.cell_height, 50.0);
+    }
+
+    #[test]
     fn pending_queue_is_bounded() {
         let mut term = new_term(10.0, 10.0);
 
