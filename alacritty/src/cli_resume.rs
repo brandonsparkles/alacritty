@@ -150,8 +150,16 @@ pub fn resume_command_for(
 
 // ---------- claude ----------
 
+/// Claude's auto-updater prunes old `versions/<x.y.z>` binaries while
+/// long-idle sessions still run them. `pid_path` then falls back to the
+/// launch path saved in `KERN_PROCARGS2`, which is the unresolved
+/// `~/.local/bin/claude` symlink, so a bare `claude` file name also counts.
+/// A false positive costs nothing: `claude_resume` still requires the
+/// per-PID `sessions/<pid>.json` marker.
 fn is_claude_binary(p: &str) -> bool {
-    p.contains("/.claude/versions/") || p.contains("/claude/versions/")
+    p.contains("/.claude/versions/")
+        || p.contains("/claude/versions/")
+        || Path::new(p).file_name().is_some_and(|name| name == "claude")
 }
 
 /// claude maintains `sessions/<pid>.json` with `sessionId` while the process
@@ -1061,7 +1069,33 @@ mod tests {
     fn matches_claude_binary() {
         assert!(is_claude_binary("/Users/x/.local/share/claude/versions/2.1.144"));
         assert!(is_claude_binary("/opt/claude/versions/2.0.0"));
+        assert!(is_claude_binary("/Users/x/.local/bin/claude"));
         assert!(!is_claude_binary("/usr/bin/zsh"));
+        assert!(!is_claude_binary("/Users/x/bin/claude-wrapper"));
+    }
+
+    #[test]
+    fn claude_survives_version_prune() {
+        // Long-idle claude tabs run a version binary the auto-updater later
+        // deletes; their saved launch path is the `bin/claude` symlink.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let versions = tmp.path().join("share/claude/versions");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&versions).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let version = versions.join("2.1.302");
+        let launcher = bin.join("claude");
+        std::os::unix::fs::symlink(&version, &launcher).unwrap();
+        let mut child =
+            crate::macos::proc::tests::spawn_test_executable_at(&version, &launcher, None);
+        std::fs::remove_file(&version).unwrap();
+
+        let path = crate::macos::proc::pid_path(child.id() as c_int);
+        // Always reap our fixture before asserting, including the regression case.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let path = path.expect("pruned binary keeps its saved launch path");
+        assert!(is_claude_binary(path.to_str().unwrap()), "unrecognized: {}", path.display());
     }
 
     #[test]

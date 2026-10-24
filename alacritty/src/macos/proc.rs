@@ -501,10 +501,29 @@ pub(crate) mod tests {
     use std::{env, process};
 
     pub(crate) fn spawn_test_executable(path: &Path, rollout: Option<&Path>) -> process::Child {
+        copy_test_executable(path);
+        spawn_copied_executable(&path.canonicalize().unwrap(), rollout)
+    }
+
+    /// Copy the test binary to `binary` and exec it through `launch` (e.g. a
+    /// symlink, which the kernel saves unresolved in `KERN_PROCARGS2`).
+    pub(crate) fn spawn_test_executable_at(
+        binary: &Path,
+        launch: &Path,
+        rollout: Option<&Path>,
+    ) -> process::Child {
+        copy_test_executable(binary);
+        spawn_copied_executable(launch, rollout)
+    }
+
+    fn copy_test_executable(path: &Path) {
         // Copy our ad-hoc-signed test binary. Relocating Apple platform binaries
         // such as /bin/sleep can make AMFI kill them before they reach main.
         std::fs::copy(env::current_exe().unwrap(), path).unwrap();
-        let mut command = process::Command::new(path.canonicalize().unwrap());
+    }
+
+    fn spawn_copied_executable(launch: &Path, rollout: Option<&Path>) -> process::Child {
+        let mut command = process::Command::new(launch);
         command
             .args([
                 "--exact",
