@@ -7,6 +7,7 @@ use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{env, fs};
 
 use log::{error, warn};
@@ -19,6 +20,9 @@ use crate::event::{Event, EventType};
 
 /// Environment variable name for the IPC socket path.
 const ALACRITTY_SOCKET_ENV: &str = "ALACRITTY_SOCKET";
+
+/// Maximum time to wait for a connected client to send its message.
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// IPC socket listener.
 pub struct IpcListener {
@@ -51,11 +55,22 @@ impl IpcListener {
     pub fn process_message(&mut self) -> Result<(), IoError> {
         let (stream, _) = self.socket.accept()?;
 
+        // The poller wakes on connect, before the client has written its message, so the read
+        // below must wait for it instead of failing with `WouldBlock`.
+        if let Err(err) = prepare_stream(&stream) {
+            warn!("Failed to configure IPC stream: {err}");
+            return Ok(());
+        }
+
         self.data.clear();
         let mut reader = BufReader::new(&stream);
 
         match reader.read_line(&mut self.data) {
-            Ok(0) | Err(_) => return Ok(()),
+            Ok(0) => return Ok(()),
+            Err(err) => {
+                warn!("Failed to read IPC message: {err}");
+                return Ok(());
+            },
             Ok(_) => (),
         };
 
@@ -89,6 +104,20 @@ impl IpcListener {
 
         Ok(())
     }
+}
+
+/// Put an accepted IPC stream into blocking mode with a bounded read.
+///
+/// On macOS/BSD an accepted socket inherits `O_NONBLOCK` from the nonblocking listener, so
+/// `read_line` would return `WouldBlock` for a client that has connected but not yet written,
+/// silently dropping its message. Linux does not inherit the flag, so this is a no-op there.
+///
+/// Messages are processed on the shared `io event listener` thread, which also drains the signal
+/// pipe. The read timeout keeps a client that connects and never writes from stalling IPC and
+/// signal handling.
+fn prepare_stream(stream: &UnixStream) -> IoResult<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))
 }
 
 /// Send a message to the active Alacritty socket.
@@ -235,4 +264,84 @@ pub fn socket_prefix() -> String {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SocketReply {
     GetConfig(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Bind a nonblocking listener, like `IpcListener::new`, on a unique temporary path.
+    fn bind_listener(name: &str) -> (UnixListener, PathBuf) {
+        let path =
+            env::temp_dir().join(format!("alacritty-ipc-test-{}-{name}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (listener, path)
+    }
+
+    /// Accept the pending connection, like the poller wake-up in `process_message`.
+    fn accept(listener: &UnixListener) -> UnixStream {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5))
+                },
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_stream_waits_for_late_client_write() {
+        let (listener, path) = bind_listener("late");
+
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let mut socket = UnixStream::connect(client_path).unwrap();
+            // Connect before writing, as the poller wakes on connect.
+            thread::sleep(Duration::from_millis(100));
+            socket.write_all(b"{\"CreateWindow\":null}").unwrap();
+            socket.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let stream = accept(&listener);
+        prepare_stream(&stream).unwrap();
+
+        let mut data = String::new();
+        let read = BufReader::new(&stream).read_line(&mut data).unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(data, "{\"CreateWindow\":null}");
+
+        client.join().unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prepared_stream_times_out_for_silent_client() {
+        let (listener, path) = bind_listener("silent");
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let _socket = UnixStream::connect(client_path).unwrap();
+            // Hold the connection open without writing until the server gave up.
+            let _ = release_rx.recv();
+        });
+
+        let stream = accept(&listener);
+        prepare_stream(&stream).unwrap();
+
+        let mut data = String::new();
+        let err = BufReader::new(&stream).read_line(&mut data).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{err:?}");
+
+        release_tx.send(()).unwrap();
+        client.join().unwrap();
+        let _ = fs::remove_file(&path);
+    }
 }
