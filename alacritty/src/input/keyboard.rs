@@ -128,7 +128,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             // double-tap-to-clear. Threshold sized to feel like an intentional
             // double-tap but not catch deliberate two-step Escapes (e.g.
             // Vim mode exit + extra Esc to clear partial command).
-            if is_escape_key {
+            //
+            // The terminal cannot observe a hosted app's mode (`TermMode::VI` is Alacritty's own
+            // selection mode), so the only suppression is the opt-out
+            // `keyboard.double_escape_clear = false`; FORK.md documents the Vim interaction.
+            // SPK-SHORTCUT: user opt-out instead of process-name detection; a foreground-process
+            // heuristic (vim/nvim) can stack on top of this key later without changing the config.
+            if is_escape_key && self.ctx.config().double_escape_clear() {
                 use std::time::{Duration, Instant};
                 const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(400);
                 let now = Instant::now();

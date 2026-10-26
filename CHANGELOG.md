@@ -21,6 +21,7 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Ability to bind `WheelUp` and `WheelDown` in `mouse.bindings`
 - Support TOML 1.1 syntax
 - `window.resize_increments` support on Wayland
+- macOS fork: `keyboard.double_escape_clear` (default `true`) to turn off the double-Escape `Ctrl-A` + `Ctrl-K` clear-line sequence, for example when Escape is a Vim mode key
 
 ### Changed
 

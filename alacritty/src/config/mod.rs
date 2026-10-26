@@ -433,6 +433,14 @@ flags = ["--sandbox", "workspace-write"]
         assert!(config.ai_resume.copilot.flags.is_empty());
     }
 
+    #[test]
+    fn double_escape_clear_defaults_on_and_opts_out() {
+        assert!(toml::from_str::<UiConfig>("").unwrap().double_escape_clear());
+
+        let config = toml::from_str::<UiConfig>("[keyboard]\ndouble_escape_clear = false").unwrap();
+        assert!(!config.double_escape_clear());
+    }
+
     fn yaml_to_toml(contents: &str) -> String {
         let mut value: serde_yaml::Value = serde_yaml::from_str(contents).unwrap();
         prune_yaml_nulls(&mut value, false);

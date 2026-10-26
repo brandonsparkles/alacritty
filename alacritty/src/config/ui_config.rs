@@ -162,6 +162,11 @@ impl UiConfig {
     }
 
     #[inline]
+    pub fn double_escape_clear(&self) -> bool {
+        self.keyboard.double_escape_clear
+    }
+
+    #[inline]
     pub fn mouse_bindings(&self) -> &[MouseBinding] {
         &self.mouse.bindings.0
     }
@@ -179,11 +184,23 @@ impl UiConfig {
 }
 
 /// Keyboard configuration.
-#[derive(ConfigDeserialize, Serialize, Default, Clone, Debug, PartialEq)]
+#[derive(ConfigDeserialize, Serialize, Clone, Debug, PartialEq)]
 struct Keyboard {
     /// Keybindings.
     #[serde(skip_serializing)]
     bindings: KeyBindings,
+
+    /// Emit `Ctrl-A` + `Ctrl-K` after a second `Escape` within 400 ms (macOS fork).
+    ///
+    /// Set to `false` when a hosted application, such as Vim in normal mode, treats the
+    /// double-tap as two mode keys; the terminal cannot observe the hosted app's mode.
+    double_escape_clear: bool,
+}
+
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self { bindings: Default::default(), double_escape_clear: true }
+    }
 }
 
 #[derive(SerdeReplace, Clone, Debug, PartialEq, Eq)]

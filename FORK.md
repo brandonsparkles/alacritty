@@ -18,7 +18,7 @@ Sixel parsing and rendering are cross-platform.
 | **Activity indicator** | A square spinner prefix (`◰`/`◳`/`◲`/`◱`) is added to the tab label whenever the PTY root is a non-shell command or the shell has any active descendant process (vim, codex, claude, copilot, sleep, etc.). Detection: a bounded `proc_listpids(PROC_PPID_ONLY, pid)` tree walk plus root-process classification every 500 ms — works regardless of wrappers, restored direct commands, or how the subprocess manages its process group. |
 | **Needs-attention indicator** | A `🔵` prefix is added when the terminal bell rings while the tab is unfocused. Cleared on focus. |
 | **Close confirmation** | `Cmd+W`, `Cmd+Q`, and red-button close raise a native `NSAlert` ("Close" / "Cancel") when a foreground subprocess is running. "Close" is the default (gets the Return key); "Cancel" gets Escape. |
-| **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. |
+| **Double-Escape clears input line** | Pressing Escape twice within 400 ms emits `Ctrl-A` + `Ctrl-K` (`\x01\x0b`) to the PTY after the normal Escape, clearing the current readline / TUI prompt input. Also exposed as bindable `Action::ClearInputLine`. Set `keyboard.double_escape_clear = false` to turn it off (default `true`); see [Double-Escape and Vim](#double-escape-and-vim). |
 | **Session restoration** | Windows reopen on next launch with their cwd, tab group, tab title, size, and screen position preserved. Restored windows share a fresh launch-local tabbing ID so they reopen as tabs in one window without replaying stale AppKit IDs. Persisted to `~/Library/Application Support/org.alacritty/session.json`. Hold Shift at launch to opt out. Skipped when the CLI specifies `-e`, `--working-directory`, or `--title`. |
 | **Per-tab AI session resume** | After session restoration, claude / copilot / codex / codexpilot / opencode tabs reopen at *their specific* prior conversation (not just the most-recent) and carry permissive CLI flags from `[ai_resume]` in `alacritty.toml`. Resolved via per-PID metadata: `~/.claude/sessions/<pid>.json`, `~/.copilot/logs/process-<ts>-<pid>.log`, codex-family argv `resume <uuid>`, and — when argv carries no session — the codex rollout `~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl` that the process currently holds **open** (fd tables of the matched process, its near descendants, and — since codex 0.162 — the per-user managed app-server daemon, whose pid and `processIdentity` live in `~/.codex/app-server-daemon/daemon.pid` and are validated against the live process start time; the daemon runs under PPID 1 and is unreachable through descendants), all read via `PROC_PIDLISTFDS`; subagent rollouts are filtered out by `payload.source`, and remaining candidates rank by cwd match then mtime, with a per-save-tick claim set so sibling codex tabs don't collide — under the daemon layout every tab shares one fd pool, so pairing among several concurrently-active tabs is a best-effort claim until the replayed `resume <uuid>` pins it. Reading the open fd replaced an earlier `pbi_start_tvsec`-proximity match, which resolved almost nothing: resuming a codex conversation appends to its **original** rollout, so the filename timestamp predates the process by days and failed the start-time window — leaving a multi-tab restore with at most one live codex session. Saved commands are normalized on load against current TOML flags, `copilot` restore defaults to `--mouse=on` unless you already configured a mouse flag, `codexpilot` sessions replay as `codexpilot resume <id>` instead of plain `codex`, and `codex resume --last` is not persisted or replayed for restored tabs because it collapses multiple tabs into one conversation. Claude sessions keep their provider route: a session whose `--settings` carries a known wrapper endpoint is replayed **through that zshrc wrapper** (`cglm`/`cqwn`/`cmo`/`cfu`/`crt`/`cor`/`coc`) so the wrapper re-derives its own auth tokens and model maps — nothing sensitive ever enters `session.json`. `crt` sessions pin the originating `~/.claude-accounts/<label>` store via `--account` (the stock `~/.claude` store pins `default`); non-`crt` stores bind through a `CLAUDE_CONFIG_DIR` prefix, and session markers are searched in both `~/.claude/sessions/<pid>.json` and `~/.claude-accounts/*/sessions/<pid>.json`. Unknown http(s) endpoints fall back to a URL-only `--settings` rebuild (never silently moved onto paid subscription credits), and non-HTTP endpoints are not resumed at all. opencode (launched through the `ooc` shell wrapper) resolves from argv `--session <id>` when present, else from the newest unclaimed top-level `session_v2` row in `~/.local/share/opencode/opencode.db` (read via `sqlite3 -readonly -json`, so a `|` in a directory path cannot corrupt the parse) ranked by open (`time_suspended IS NULL`) then directory match then `time_updated` (opencode 2.0.26 stopped logging `session.id=`, and bare TUI argv carries no id, so the first restore is a best-effort claim — once replayed as `ooc --session <id>` the mapping becomes exact). Only named subcommands (`run`, `serve`, `session`, …) disqualify a process: `opencode <dir>` is still a TUI at a workspace path and resumes normally. `ooc --continue`-style commands are never persisted for the same multi-tab-collapse reason as `codex resume --last`. |
 | **Cmd+A select all** | Selects the entire terminal contents (scrollback + visible area). Standard macOS shortcut, missing from upstream. |
@@ -89,6 +89,26 @@ key = "Back"
 mods = "Command"
 action = "ClearInputLine"
 ```
+
+## Double-Escape and Vim
+
+The double-Escape clear-line fires on any second `Escape` within 400 ms of the
+first, whatever application is in the foreground. Alacritty cannot see the
+mode of a hosted application: `TermMode::VI` is Alacritty's own selection
+mode, not Vim's normal/insert mode. In Vim normal mode a fast Esc-Esc therefore
+sends `Ctrl-A` (increment number under cursor) and `Ctrl-K` (digraph prefix) after the mode keys.
+
+If you hit this, opt out in `alacritty.toml`; the default (`true`) is
+unchanged behavior:
+
+```toml
+[keyboard]
+double_escape_clear = false
+```
+
+With the key off, `ClearInputLine` stays available as a binding (see the
+`Cmd+Backspace` example above). A foreground-process heuristic (disable only
+while `vim`/`nvim` is the PTY foreground) may be layered on top later.
 
 ## Configuration interactions
 
@@ -398,7 +418,8 @@ alacritty/src/display/window.rs           — AppKit FFI (tab title, NSAlert, lo
 alacritty/src/display/mod.rs              — TabActivity, apply_tab_title → both tab + window title
 alacritty/src/event.rs                    — RenameTabState, BudgetTick, AppFocusState, next_focus_state
 alacritty/src/input/mod.rs                — tab_swipe_step, ClearInputLine, budget keystroke filter
-alacritty/src/input/keyboard.rs           — double-Esc detection, rename input routing
+alacritty/src/input/keyboard.rs           — double-Esc detection (gated by keyboard.double_escape_clear), rename input routing
+alacritty/src/config/ui_config.rs          — [keyboard] double_escape_clear opt-out (default true)
 alacritty/src/config/bindings.rs          — RENAME_TAB BindingMode, SelectAll, GrantCourtesy
 alacritty/src/macos/proc.rs               — list_children(), list_descendants(), pid_path, start_tvsec
 alacritty/src/window_context.rs           — session_snapshot, restored_size/position application
