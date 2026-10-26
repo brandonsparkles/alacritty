@@ -37,6 +37,17 @@ with `cargo test -p alacritty_terminal sixel` and
 `cat alacritty_terminal/tests/sixel/testimage_libsixel.sixel` in a newly
 launched build.
 
+Sixel memory limits (large images can vanish from scrollback when they hit
+one): a single image is capped at 4096x4096 px (larger ones are dropped);
+each cell keeps at most 20 graphics (oldest dropped first); the CPU-side
+pending queue holds at most 256 MiB of RGBA pixels between frames (a graphic
+that would exceed it is ignored with a `log::warn!`); and the GPU holds at
+most 1000 textures / 256 MiB of RGBA pixels, evicting the oldest textures
+first. The constants are `MAX_GRAPHIC_DIMENSIONS`, `MAX_GRAPHICS_PER_CELL` and
+`MAX_PENDING_GRAPHICS_BYTES` in `alacritty_terminal/src/graphics/mod.rs`, and
+`MAX_TEXTURES_COUNT` and `MAX_TEXTURES_BYTES` in
+`alacritty/src/renderer/graphics/mod.rs`; none is configurable yet.
+
 Codex `/pets` chooses its image protocol from terminal identity. It sees
 `ALACRITTY_SOCKET` before `TERM`, so the Sixel renderer alone does not make
 pets appear. The `codex()` function in the tracked

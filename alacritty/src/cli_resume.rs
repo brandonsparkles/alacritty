@@ -1342,8 +1342,10 @@ mod tests {
     fn codex_claimed_rollouts_not_returned_twice() {
         // Daemon-layout shared fd pool: the claim set distributes distinct
         // rollouts across sibling tabs instead of replaying one id twice.
-        let dir = std::env::temp_dir().join(format!("codex-rank-{}", std::process::id()));
-        let date_dir = dir.join(".codex/sessions/2026/10/11");
+        // TempDir removes the directory on drop, so a failing assert or an
+        // unwrap panic below does not leak a pid-keyed directory in $TMPDIR.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let date_dir = tmp.path().join(".codex/sessions/2026/10/11");
         std::fs::create_dir_all(&date_dir).unwrap();
         let write_rollout = |uuid: &str| {
             let path = date_dir.join(format!("rollout-2026-10-11T00-00-00-{uuid}.jsonl"));
@@ -1371,7 +1373,6 @@ mod tests {
             Some("bbbbbbbb-0000-0000-0000-000000000002")
         );
         assert_eq!(codex_session_from_open_paths(&paths, "/work"), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1553,8 +1554,10 @@ mod tests {
         // copilot's log has a different inode, and if it happens to be at
         // least as long as the stale offset the incremental scan would start
         // mid-file and miss the session marker.
-        let dir = std::env::temp_dir().join(format!("copilot-scan-reuse-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // TempDir removes the directory on drop, so a failing assert or an
+        // unwrap panic below does not leak a pid-keyed directory in $TMPDIR.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
         // A PID no real copilot can hold, so parallel tests sharing the
         // process-lifetime cache cannot collide with this entry.
         let pid: c_int = 2_000_000_007;
@@ -1571,7 +1574,6 @@ mod tests {
         .unwrap();
         assert!(std::fs::metadata(&log_b).unwrap().len() >= 52);
         assert_eq!(copilot_scan_uuid(pid, &log_b).as_deref(), Some("uuid-bbb"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
