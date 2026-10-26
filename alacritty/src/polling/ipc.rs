@@ -331,14 +331,31 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    /// Socket file removed on drop, so a failed assertion or panic mid-test cannot leave the
+    /// pid-keyed file behind in the temp dir.
+    struct SocketFile(PathBuf);
+
+    impl SocketFile {
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for SocketFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
     /// Bind a nonblocking listener, like `IpcListener::new`, on a unique temporary path.
-    fn bind_listener(name: &str) -> (UnixListener, PathBuf) {
+    fn bind_listener(name: &str) -> (UnixListener, SocketFile) {
         let path =
             env::temp_dir().join(format!("alacritty-ipc-test-{}-{name}.sock", std::process::id()));
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
+        let socket = SocketFile(path);
         listener.set_nonblocking(true).unwrap();
-        (listener, path)
+        (listener, socket)
     }
 
     /// Accept the pending connection, like the poller wake-up in `process_message`.
@@ -356,9 +373,9 @@ mod tests {
 
     #[test]
     fn prepared_stream_waits_for_late_client_write() {
-        let (listener, path) = bind_listener("late");
+        let (listener, socket) = bind_listener("late");
 
-        let client_path = path.clone();
+        let client_path = socket.path();
         let client = thread::spawn(move || {
             let mut socket = UnixStream::connect(client_path).unwrap();
             // Connect before writing, as the poller wakes on connect.
@@ -376,15 +393,14 @@ mod tests {
         assert_eq!(data, "{\"CreateWindow\":null}");
 
         client.join().unwrap();
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn prepared_stream_times_out_for_silent_client() {
-        let (listener, path) = bind_listener("silent");
+        let (listener, socket) = bind_listener("silent");
 
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let client_path = path.clone();
+        let client_path = socket.path();
         let client = thread::spawn(move || {
             let _socket = UnixStream::connect(client_path).unwrap();
             // Hold the connection open without writing until the server gave up.
@@ -400,14 +416,13 @@ mod tests {
 
         release_tx.send(()).unwrap();
         client.join().unwrap();
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn read_message_stops_at_first_newline() {
-        let (listener, path) = bind_listener("newline");
+        let (listener, socket) = bind_listener("newline");
 
-        let client_path = path.clone();
+        let client_path = socket.path();
         let client = thread::spawn(move || {
             let mut socket = UnixStream::connect(client_path).unwrap();
             // Let the server prepare the stream first, since macOS rejects `setsockopt` once the
@@ -426,15 +441,14 @@ mod tests {
         assert_eq!(data, "{\"CreateWindow\":null}\n");
 
         client.join().unwrap();
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn read_message_times_out_for_client_trickling_bytes() {
-        let (listener, path) = bind_listener("trickle");
+        let (listener, socket) = bind_listener("trickle");
 
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let client_path = path.clone();
+        let client_path = socket.path();
         let client = thread::spawn(move || {
             let mut socket = UnixStream::connect(client_path).unwrap();
             // A byte every 200 ms, never a newline: each read succeeds well inside the timeout.
@@ -456,15 +470,14 @@ mod tests {
 
         release_tx.send(()).unwrap();
         client.join().unwrap();
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn read_message_rejects_oversized_message() {
-        let (listener, path) = bind_listener("oversized");
+        let (listener, socket) = bind_listener("oversized");
 
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let client_path = path.clone();
+        let client_path = socket.path();
         let client = thread::spawn(move || {
             let mut socket = UnixStream::connect(client_path).unwrap();
             // More than the cap and no newline; the server gives up and the write may fail.
@@ -482,6 +495,5 @@ mod tests {
 
         release_tx.send(()).unwrap();
         client.join().unwrap();
-        let _ = fs::remove_file(&path);
     }
 }
