@@ -25,6 +25,19 @@ mod shader;
 /// Max. number of textures stored in the GPU.
 const MAX_TEXTURES_COUNT: usize = 1000;
 
+/// Max. total size, in bytes, of the RGBA pixels stored in the GPU across all
+/// graphic textures.
+///
+/// The count cap alone allows 1000 maximum-size (4096x4096, 64 MiB) textures,
+/// so a stream of large Sixel images could pin tens of GiB of GPU memory.
+/// Matches `MAX_PENDING_GRAPHICS_BYTES` in `alacritty_terminal`, the cap on the
+/// CPU-side queue that feeds this store.
+///
+/// SPK-SHORTCUT: the ceiling reuses the pending-queue cap instead of a measured
+/// live-allocation figure; upgrade path is to measure real Sixel workloads and
+/// expose the budget in the config if 256 MiB proves too tight or too loose.
+const MAX_TEXTURES_BYTES: usize = 256 * 1024 * 1024;
+
 pub use draw::RenderList;
 
 bitflags::bitflags! {
@@ -144,6 +157,10 @@ impl GraphicsRenderer {
         }
 
         for graphic in graphics {
+            // Make room before allocating, so the GPU never holds the budget plus
+            // this graphic at once.
+            self.evict_for_budget(texture_bytes(graphic.width, graphic.height));
+
             let mut texture = 0;
 
             unsafe {
@@ -197,6 +214,19 @@ impl GraphicsRenderer {
         }
 
         UpdateResult::NEED_RESET_ACTIVE_TEX
+    }
+
+    /// Discard the oldest textures until `incoming` more bytes fit in the budget.
+    fn evict_for_budget(&mut self, incoming: usize) {
+        let live = self
+            .graphic_textures
+            .iter()
+            .map(|(id, texture)| (*id, texture_bytes(texture.width.into(), texture.height.into())));
+
+        for id in ids_to_evict(live, incoming, MAX_TEXTURES_BYTES) {
+            trace!("Evict texture {id:?} to stay inside the byte budget.");
+            self.graphic_textures.remove(&id);
+        }
     }
 
     /// Update textures in the GPU to clear specific subregions.
@@ -283,6 +313,35 @@ impl GraphicsRenderer {
     }
 }
 
+/// Bytes a `width` x `height` graphic occupies in the GPU (always uploaded as RGBA).
+fn texture_bytes(width: usize, height: usize) -> usize {
+    width.saturating_mul(height).saturating_mul(4)
+}
+
+/// Pick the oldest ids (lowest first; ids grow monotonically) to drop so that
+/// `incoming` more bytes fit in `budget`, given the `(id, bytes)` pairs now live.
+fn ids_to_evict<K: Ord + Copy>(
+    live: impl Iterator<Item = (K, usize)>,
+    incoming: usize,
+    budget: usize,
+) -> Vec<K> {
+    let mut live: Vec<(K, usize)> = live.collect();
+    live.sort_unstable_by_key(|(id, _)| *id);
+
+    let mut total = live.iter().fold(0_usize, |sum, (_, bytes)| sum.saturating_add(*bytes));
+    let mut victims = Vec::new();
+    for (id, bytes) in live {
+        if total.saturating_add(incoming) <= budget {
+            break;
+        }
+
+        total = total.saturating_sub(bytes);
+        victims.push(id);
+    }
+
+    victims
+}
+
 fn check_opengl_extensions(extensions: &[&str]) -> bool {
     // Use a HashSet to track extensions needed to be found. When the set is
     // empty, we know that all extensions are available.
@@ -310,4 +369,42 @@ fn check_opengl_extensions(extensions: &[&str]) -> bool {
 
     log::debug!("Missing OpenGL extensions: {needed:?}");
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_bytes_is_rgba() {
+        assert_eq!(texture_bytes(4096, 4096), 64 * 1024 * 1024);
+        assert_eq!(texture_bytes(0, 100), 0);
+        assert_eq!(texture_bytes(usize::MAX, 4), usize::MAX);
+    }
+
+    #[test]
+    fn nothing_is_evicted_inside_the_budget() {
+        let live = [(1_u64, 40), (2, 40)];
+        assert!(ids_to_evict(live.into_iter(), 20, 100).is_empty());
+    }
+
+    #[test]
+    fn oldest_ids_go_first_until_the_incoming_graphic_fits() {
+        // Unordered on purpose: the map iterates in arbitrary order.
+        let live = [(7_u64, 40), (3, 40), (5, 40)];
+        // 120 live + 50 incoming > 100: dropping 3 leaves 80 + 50, dropping 5 leaves 40 + 50.
+        assert_eq!(ids_to_evict(live.into_iter(), 50, 100), vec![3, 5]);
+    }
+
+    #[test]
+    fn everything_goes_when_the_incoming_graphic_needs_the_whole_budget() {
+        let live = [(1_u64, 60), (2, 30)];
+        assert_eq!(ids_to_evict(live.into_iter(), 100, 100), vec![1, 2]);
+    }
+
+    #[test]
+    fn an_exact_fit_evicts_nothing() {
+        let live = [(1_u64, 60)];
+        assert!(ids_to_evict(live.into_iter(), 40, 100).is_empty());
+    }
 }
