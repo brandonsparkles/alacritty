@@ -2,12 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult, Write};
+use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use log::{error, warn};
@@ -21,8 +21,14 @@ use crate::event::{Event, EventType};
 /// Environment variable name for the IPC socket path.
 const ALACRITTY_SOCKET_ENV: &str = "ALACRITTY_SOCKET";
 
-/// Maximum time to wait for a connected client to send its message.
+/// Maximum time to wait for a connected client to send its whole message.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum size of a single IPC message.
+///
+/// Messages are read on the shared `io event listener` thread, so an unbounded `read_line` would
+/// let a client that never sends a newline grow `data` without limit.
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
 /// IPC socket listener.
 pub struct IpcListener {
@@ -53,7 +59,13 @@ impl IpcListener {
 
     /// Process the next IPC message.
     pub fn process_message(&mut self) -> Result<(), IoError> {
-        let (stream, _) = self.socket.accept()?;
+        // The poller can wake spuriously or after the client already gave up. `WouldBlock` is not a
+        // failure, and propagating it would skip the signal pipe event in the same poll pass.
+        let stream = match self.socket.accept() {
+            Ok((stream, _)) => stream,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
+        };
 
         // The poller wakes on connect, before the client has written its message, so the read
         // below must wait for it instead of failing with `WouldBlock`.
@@ -63,9 +75,8 @@ impl IpcListener {
         }
 
         self.data.clear();
-        let mut reader = BufReader::new(&stream);
 
-        match reader.read_line(&mut self.data) {
+        match read_message(&stream, &mut self.data) {
             Ok(0) => return Ok(()),
             Err(err) => {
                 warn!("Failed to read IPC message: {err}");
@@ -106,15 +117,62 @@ impl IpcListener {
     }
 }
 
+/// Read one IPC message, up to the first newline or the client closing its write end.
+///
+/// `READ_TIMEOUT` (set by `prepare_stream`) only bounds each `read` call, so this also enforces it
+/// as a deadline for the whole message, and `MAX_MESSAGE_SIZE` caps its length. Without both, a
+/// client that sends a byte every few hundred milliseconds without a newline would keep the shared
+/// `io event listener` thread, which also drains the signal pipe. The deadline is checked after
+/// every read, so a stalled message ends at most one `READ_TIMEOUT` after the deadline.
+///
+/// Returns the number of bytes appended to `data`.
+fn read_message(mut stream: &UnixStream, data: &mut String) -> IoResult<usize> {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut message = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if read == 0 {
+            break;
+        }
+
+        // Like `read_line`, keep everything up to and including the first newline.
+        let newline = chunk[..read].iter().position(|&byte| byte == b'\n');
+        let end = newline.map_or(read, |index| index + 1);
+        message.extend_from_slice(&chunk[..end]);
+
+        if message.len() > MAX_MESSAGE_SIZE {
+            return Err(IoError::new(ErrorKind::InvalidData, "IPC message is too large"));
+        }
+        if newline.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(IoError::new(ErrorKind::TimedOut, "IPC message not completed in time"));
+        }
+    }
+
+    let message =
+        String::from_utf8(message).map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
+    data.push_str(&message);
+    Ok(message.len())
+}
+
 /// Put an accepted IPC stream into blocking mode with a bounded read.
 ///
 /// On macOS/BSD an accepted socket inherits `O_NONBLOCK` from the nonblocking listener, so
-/// `read_line` would return `WouldBlock` for a client that has connected but not yet written,
+/// `read_message` would get `WouldBlock` for a client that has connected but not yet written,
 /// silently dropping its message. Linux does not inherit the flag, so this is a no-op there.
 ///
 /// Messages are processed on the shared `io event listener` thread, which also drains the signal
 /// pipe. The read timeout keeps a client that connects and never writes from stalling IPC and
-/// signal handling.
+/// signal handling; `read_message` adds the whole-message deadline and size cap. The timeout is set
+/// once here: macOS rejects `setsockopt` with `EINVAL` once the peer has shut down its write end.
 fn prepare_stream(stream: &UnixStream) -> IoResult<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))
@@ -313,7 +371,7 @@ mod tests {
         prepare_stream(&stream).unwrap();
 
         let mut data = String::new();
-        let read = BufReader::new(&stream).read_line(&mut data).unwrap();
+        let read = read_message(&stream, &mut data).unwrap();
         assert_eq!(read, data.len());
         assert_eq!(data, "{\"CreateWindow\":null}");
 
@@ -337,8 +395,90 @@ mod tests {
         prepare_stream(&stream).unwrap();
 
         let mut data = String::new();
-        let err = BufReader::new(&stream).read_line(&mut data).unwrap_err();
+        let err = read_message(&stream, &mut data).unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{err:?}");
+
+        release_tx.send(()).unwrap();
+        client.join().unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_message_stops_at_first_newline() {
+        let (listener, path) = bind_listener("newline");
+
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let mut socket = UnixStream::connect(client_path).unwrap();
+            // Let the server prepare the stream first, since macOS rejects `setsockopt` once the
+            // peer has shut down.
+            thread::sleep(Duration::from_millis(100));
+            socket.write_all(b"{\"CreateWindow\":null}\nignored").unwrap();
+            socket.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let stream = accept(&listener);
+        prepare_stream(&stream).unwrap();
+
+        let mut data = String::new();
+        let read = read_message(&stream, &mut data).unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(data, "{\"CreateWindow\":null}\n");
+
+        client.join().unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_message_times_out_for_client_trickling_bytes() {
+        let (listener, path) = bind_listener("trickle");
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let mut socket = UnixStream::connect(client_path).unwrap();
+            // A byte every 200 ms, never a newline: each read succeeds well inside the timeout.
+            while release_rx.recv_timeout(Duration::from_millis(200)).is_err() {
+                if socket.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stream = accept(&listener);
+        prepare_stream(&stream).unwrap();
+
+        let started = Instant::now();
+        let mut data = String::new();
+        let err = read_message(&stream, &mut data).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{err:?}");
+        assert!(started.elapsed() < READ_TIMEOUT * 3, "{:?}", started.elapsed());
+
+        release_tx.send(()).unwrap();
+        client.join().unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_message_rejects_oversized_message() {
+        let (listener, path) = bind_listener("oversized");
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let mut socket = UnixStream::connect(client_path).unwrap();
+            // More than the cap and no newline; the server gives up and the write may fail.
+            let _ = socket.write_all(&vec![b'x'; MAX_MESSAGE_SIZE + 4096]);
+            let _ = release_rx.recv();
+        });
+
+        let stream = accept(&listener);
+        prepare_stream(&stream).unwrap();
+
+        let mut data = String::new();
+        let err = read_message(&stream, &mut data).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{err:?}");
+        assert!(data.is_empty());
 
         release_tx.send(()).unwrap();
         client.join().unwrap();
