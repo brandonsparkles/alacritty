@@ -109,6 +109,11 @@ pub struct Processor {
     /// overwrite the complete saved session.
     #[cfg(target_os = "macos")]
     session_restore_pending: usize,
+    /// First window of a multi-window session restore. Later restored
+    /// windows are attached to its tab group explicitly, since AppKit's
+    /// automatic tabbing does nothing while the app is inactive.
+    #[cfg(target_os = "macos")]
+    restore_tab_anchor: Option<WindowId>,
     /// When `save_session` first skipped for the current stretch of
     /// `session_restore_pending > 0`; cleared by the next save that goes
     /// through. Drives the one-shot "saves suppressed" warning
@@ -270,6 +275,8 @@ impl Processor {
             #[cfg(target_os = "macos")]
             session_restore_pending: 0,
             #[cfg(target_os = "macos")]
+            restore_tab_anchor: None,
+            #[cfg(target_os = "macos")]
             session_save_skip_since: std::cell::Cell::new(None),
             #[cfg(target_os = "macos")]
             session_save_skip_warned: std::cell::Cell::new(false),
@@ -367,6 +374,9 @@ impl Processor {
         self.gl_config = Some(window_context.display.gl_context().config());
         #[cfg(target_os = "macos")]
         {
+            if restore_tabbing_id.is_some() {
+                self.restore_tab_anchor = Some(window_context.id());
+            }
             Self::start_tab_activity_polling(&mut self.scheduler, window_context.id());
             self.start_session_save_polling(window_context.id());
             self.start_budget_tick_polling(window_context.id());
@@ -634,6 +644,12 @@ impl Processor {
             }
             if let Some(cmd) = resume_command {
                 Self::schedule_resume_command(&mut self.scheduler, window_context.id(), cmd);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if restored_from_session {
+            if let Some(anchor) = self.restore_tab_anchor.and_then(|id| self.windows.get(&id)) {
+                anchor.display.window.add_tabbed_window(&window_context.display.window);
             }
         }
         self.windows.insert(window_context.id(), window_context);

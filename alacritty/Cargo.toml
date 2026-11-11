@@ -86,6 +86,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "NSDraggingSession",
     "NSEvent",
     "NSFont",
+    "NSGraphics",
     "NSImage",
     "NSPanel",
     "NSPasteboard",
@@ -97,6 +98,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "NSView",
     "NSWindow",
     "NSWindowTab",
+    "NSWindowTabGroup",
 ] }
 
 [target.'cfg(windows)'.dependencies]

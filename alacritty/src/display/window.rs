@@ -23,7 +23,10 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::MainThreadMarker,
-    objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSColorSpace, NSView},
+    objc2::rc::Retained,
+    objc2_app_kit::{
+        NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSColorSpace, NSView, NSWindow,
+    },
     objc2_foundation::NSString,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
@@ -525,6 +528,32 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn tabbing_id(&self) -> String {
         self.window.tabbing_identifier()
+    }
+
+    /// Append `other` to this window's native tab group, unless it is
+    /// already in it.
+    ///
+    /// AppKit only auto-joins windows that share a `tabbingIdentifier` while
+    /// the app is active. When macOS relaunches Alacritty in the background
+    /// (e.g. reopening apps after a reboot), no window is key, so every
+    /// restored tab came back as its own window. Attaching explicitly makes
+    /// session restore independent of activation state.
+    #[cfg(target_os = "macos")]
+    pub fn add_tabbed_window(&self, other: &Window) {
+        let (Some(anchor), Some(tab)) = (self.ns_window(), other.ns_window()) else { return };
+        let Some(group) = anchor.tabGroup() else { return };
+        let already_grouped =
+            tab.tabGroup().is_some_and(|g| Retained::as_ptr(&g) == Retained::as_ptr(&group));
+        if !already_grouped {
+            group.addWindow(&tab);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ns_window(&self) -> Option<Retained<NSWindow>> {
+        let RawWindowHandle::AppKit(handle) = self.raw_window_handle() else { return None };
+        assert!(MainThreadMarker::new().is_some());
+        unsafe { handle.ns_view.cast::<NSView>().as_ref() }.window()
     }
 
     /// Show a modal close-confirmation dialog. Returns `true` if the user
