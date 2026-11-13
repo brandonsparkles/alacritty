@@ -19,11 +19,12 @@
 
 #![cfg(target_os = "macos")]
 
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::{fs, io};
 
-use log::{debug, warn};
+use log::{Level, log, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ai_resume::AiResumeConfig;
@@ -75,6 +76,21 @@ fn default_version() -> u32 {
 
 const CURRENT_VERSION: u32 = 1;
 
+/// True while the current run of consecutive save failures has already been
+/// logged at `warn`. Only the save worker thread writes snapshots, so this
+/// behaves as that thread's streak state; it is a static because
+/// [`Session::save`] has no caller-owned state to hang it on.
+static SAVE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Log level for a save failure: `Warn` for the first failure of a streak,
+/// `Debug` while the streak continues. A persistent failure (disk full,
+/// permissions) retries on every 3s tick, and `warn!` also lands in the
+/// message bar, so repeating it would flood both. [`Session::save_to`] ends
+/// the streak on its next success.
+fn save_failure_level(warned: &AtomicBool) -> Level {
+    if warned.swap(true, Ordering::Relaxed) { Level::Debug } else { Level::Warn }
+}
+
 impl Session {
     /// Path to the persisted session directory.
     ///
@@ -102,12 +118,35 @@ impl Session {
     /// Load the persisted session, if any. Returns `None` if no session file
     /// exists or it cannot be parsed — never an error, since failure to
     /// restore should silently fall back to "fresh window".
+    ///
+    /// A missing file is the normal first-launch case and stays silent. Any
+    /// other fallback (unreadable file, unsupported version, parse failure) is
+    /// logged, because the next save tick overwrites the saved session with
+    /// the fresh single-window snapshot.
     pub fn load() -> Option<Session> {
-        let file = Self::file()?;
-        let raw = fs::read_to_string(&file).ok()?;
+        Self::load_from(&Self::file()?)
+    }
+
+    fn load_from(file: &Path) -> Option<Session> {
+        let raw = match fs::read_to_string(file) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+            Err(err) => {
+                warn!("Failed to read session file at {}: {err}", file.display());
+                return None;
+            },
+        };
         match serde_json::from_str::<Session>(&raw) {
             Ok(session) if session.version == CURRENT_VERSION && !session.windows.is_empty() => {
                 Some(session)
+            },
+            Ok(session) if session.version != CURRENT_VERSION => {
+                warn!(
+                    "Ignoring session file at {} with version {} (expected {CURRENT_VERSION})",
+                    file.display(),
+                    session.version,
+                );
+                None
             },
             Ok(_) => None,
             Err(err) => {
@@ -133,13 +172,22 @@ impl Session {
 
     /// Return true only after a nonempty snapshot reaches its final path.
     fn save_to(&self, dir: &Path) -> bool {
+        self.save_to_with(dir, &SAVE_FAILURE_WARNED)
+    }
+
+    /// [`Self::save_to`] with the failure-streak flag supplied by the caller.
+    fn save_to_with(&self, dir: &Path, failure_warned: &AtomicBool) -> bool {
         if self.windows.is_empty() {
             return false;
         }
         let file = dir.join("session.json");
 
         if let Err(err) = fs::create_dir_all(dir) {
-            debug!("Could not create saved-state dir {}: {err}", dir.display());
+            log!(
+                save_failure_level(failure_warned),
+                "Could not create saved-state dir {}: {err}",
+                dir.display()
+            );
             return false;
         }
 
@@ -149,7 +197,7 @@ impl Session {
         let json = match serde_json::to_string_pretty(&to_persist) {
             Ok(j) => j,
             Err(err) => {
-                debug!("Could not serialize session: {err}");
+                log!(save_failure_level(failure_warned), "Could not serialize session: {err}");
                 return false;
             },
         };
@@ -158,14 +206,20 @@ impl Session {
         // a previously-good session.
         let tmp = file.with_extension("json.tmp");
         if let Err(err) = fs::write(&tmp, json) {
-            debug!("Could not write {}: {err}", tmp.display());
+            log!(save_failure_level(failure_warned), "Could not write {}: {err}", tmp.display());
             return false;
         }
         if let Err(err) = fs::rename(&tmp, &file) {
-            debug!("Could not rename {} -> {}: {err}", tmp.display(), file.display());
+            log!(
+                save_failure_level(failure_warned),
+                "Could not rename {} -> {}: {err}",
+                tmp.display(),
+                file.display()
+            );
             let _ = fs::remove_file(&tmp);
             return false;
         }
+        failure_warned.store(false, Ordering::Relaxed);
         true
     }
 
@@ -336,6 +390,123 @@ mod tests {
                 resume_command: None,
             }],
         }
+    }
+
+    /// Records captured by [`CaptureLogger`]: level and message.
+    static CAPTURED: std::sync::Mutex<Vec<(Level, String)>> = std::sync::Mutex::new(Vec::new());
+
+    struct CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            let mut captured = CAPTURED.lock().unwrap_or_else(|err| err.into_inner());
+            captured.push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Route `log` records into [`CAPTURED`]. Tests share the process-wide logger and run in
+    /// parallel, so each assertion filters on a marker unique to its own temp dir.
+    fn install_capture_logger() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = log::set_logger(&CaptureLogger);
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+    }
+
+    fn captured_containing(marker: &str) -> Vec<(Level, String)> {
+        let captured = CAPTURED.lock().unwrap_or_else(|err| err.into_inner());
+        captured.iter().filter(|(_, message)| message.contains(marker)).cloned().collect()
+    }
+
+    #[test]
+    fn load_missing_file_is_silent() {
+        install_capture_logger();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.json");
+        assert!(Session::load_from(&file).is_none());
+        assert!(captured_containing(&dir.path().to_string_lossy()).is_empty());
+    }
+
+    #[test]
+    fn load_unreadable_file_warns() {
+        install_capture_logger();
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in place of the file fails with a non-NotFound read error, as a
+        // permission or I/O error would.
+        let file = dir.path().join("session.json");
+        fs::create_dir(&file).unwrap();
+        assert!(Session::load_from(&file).is_none());
+        let records = captured_containing(&dir.path().to_string_lossy());
+        assert!(
+            records
+                .iter()
+                .any(|(level, msg)| *level == Level::Warn
+                    && msg.contains("Failed to read session file")),
+            "unreadable session file was not warned about: {records:?}"
+        );
+    }
+
+    #[test]
+    fn load_unsupported_version_warns() {
+        install_capture_logger();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.json");
+        let mut future = fixture_session();
+        future.version = CURRENT_VERSION + 1;
+        fs::write(&file, serde_json::to_string(&future).unwrap()).unwrap();
+        assert!(Session::load_from(&file).is_none());
+        let records = captured_containing(&dir.path().to_string_lossy());
+        let expected = format!("version {}", CURRENT_VERSION + 1);
+        assert!(
+            records.iter().any(|(level, msg)| *level == Level::Warn && msg.contains(&expected)),
+            "version mismatch was not warned about: {records:?}"
+        );
+    }
+
+    #[test]
+    fn load_current_version_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(fixture_session().save_to_with(dir.path(), &AtomicBool::new(false)));
+        assert_eq!(Session::load_from(&dir.path().join("session.json")), Some(fixture_session()));
+    }
+
+    #[test]
+    fn save_failure_warns_once_per_streak_and_resets_on_success() {
+        install_capture_logger();
+        let warned = AtomicBool::new(false);
+        assert_eq!(save_failure_level(&warned), Level::Warn);
+        assert_eq!(save_failure_level(&warned), Level::Debug);
+        assert_eq!(save_failure_level(&warned), Level::Debug);
+
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("saved");
+        fs::write(&blocked, "blocked").unwrap();
+        let session = fixture_session();
+
+        // Streak already warned: the failure is still recorded, but at debug.
+        assert!(!session.save_to_with(&blocked, &warned));
+        let marker = blocked.to_string_lossy().into_owned();
+        let records = captured_containing(&marker);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].0, Level::Debug);
+        assert!(warned.load(Ordering::Relaxed));
+
+        // A success ends the streak, so the next failure warns again.
+        let good = dir.path().join("good");
+        assert!(session.save_to_with(&good, &warned));
+        assert!(!warned.load(Ordering::Relaxed));
+        assert!(!session.save_to_with(&blocked, &warned));
+        let records = captured_containing(&marker);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[1].0, Level::Warn);
+        assert!(records[1].1.contains("Could not create saved-state dir"));
     }
 
     #[test]
