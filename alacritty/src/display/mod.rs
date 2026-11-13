@@ -653,6 +653,7 @@ impl Display {
             tab_activity_frame: 0,
             #[cfg(target_os = "macos")]
             tab_poll_ticks_occluded: 0,
+            #[cfg(target_os = "macos")]
             tab_attention_from_bell: false,
             #[cfg(target_os = "macos")]
             budget_blocked: false,

@@ -668,7 +668,28 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
+    /// True while the macOS budget lockout is in force. Always false elsewhere.
+    ///
+    /// Paths that write to the PTY outside `Execute for Action` (which has its own gate) check
+    /// this so the lockout cannot be bypassed by mouse reports or alternate-screen wheel arrows.
+    #[inline]
+    fn budget_blocked(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.ctx.is_budget_blocked()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     fn mouse_report(&mut self, button: u8, state: ElementState) {
+        // Budget lockout: a mouse report is PTY input to mouse-mode programs.
+        if self.budget_blocked() {
+            return;
+        }
+
         let display_offset = self.ctx.terminal().grid().display_offset();
         let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
 
@@ -1016,7 +1037,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 content.push(column_cmd);
             }
 
-            self.ctx.write_to_pty(content);
+            // Budget lockout: the arrow bytes are PTY input. The accumulated scroll is still
+            // reduced below so a long blocked scroll does not burst out once the block lifts.
+            if !self.budget_blocked() {
+                self.ctx.write_to_pty(content);
+            }
         } else if lines != 0 {
             let lines = if is_scroll_up { lines as i32 } else { -(lines as i32) };
             self.ctx.scroll(Scroll::Delta(lines));
@@ -1474,9 +1499,22 @@ mod tests {
         pub modifiers: Modifiers,
         config: &'a UiConfig,
         inline_search_state: &'a mut InlineSearchState,
+        /// Everything the processor wrote to the PTY, one entry per write.
+        pty_writes: std::cell::RefCell<Vec<Vec<u8>>>,
+        /// Reported through `is_budget_blocked` (macOS lockout).
+        budget_blocked: bool,
     }
 
     impl<T: EventListener> super::ActionContext<T> for ActionContext<'_, T> {
+        fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, data: B) {
+            self.pty_writes.borrow_mut().push(data.into().into_owned());
+        }
+
+        #[cfg(target_os = "macos")]
+        fn is_budget_blocked(&self) -> bool {
+            self.budget_blocked
+        }
+
         fn search_next(
             &mut self,
             _origin: Point,
@@ -1623,6 +1661,8 @@ mod tests {
                     message_buffer: &mut message_buffer,
                     inline_search_state: &mut inline_search_state,
                     config: &cfg,
+                    pty_writes: Default::default(),
+                    budget_blocked: false,
                 };
 
                 let mut processor = Processor::new(context);
@@ -1851,6 +1891,81 @@ mod tests {
     #[test]
     fn local_selection_with_command_in_mouse_mode() {
         assert!(uses_local_selection(true, ModifiersState::SUPER));
+    }
+
+    /// Build a processor around the mocked context, run `act` on it and return every write it
+    /// made to the PTY. `alt_screen` switches the terminal to the alternate screen first.
+    #[cfg(target_os = "macos")]
+    fn pty_writes_under_lockout(
+        blocked: bool,
+        alt_screen: bool,
+        act: impl FnOnce(&mut Processor<MockEventProxy, ActionContext<'_, MockEventProxy>>),
+    ) -> Vec<Vec<u8>> {
+        let mut clipboard = Clipboard::new_nop();
+        let cfg = UiConfig::default();
+        let size = SizeInfo::new(21.0, 51.0, 3.0, 3.0, 0., 0., false);
+        let mut terminal = Term::new(cfg.term_options(), &size, MockEventProxy);
+        if alt_screen {
+            terminal.swap_alt();
+        }
+        let mut mouse = Mouse::default();
+        let mut inline_search_state = InlineSearchState::default();
+        let mut message_buffer = MessageBuffer::default();
+
+        let context = ActionContext {
+            terminal: &mut terminal,
+            mouse: &mut mouse,
+            size_info: &size,
+            clipboard: &mut clipboard,
+            modifiers: Default::default(),
+            message_buffer: &mut message_buffer,
+            inline_search_state: &mut inline_search_state,
+            config: &cfg,
+            pty_writes: Default::default(),
+            budget_blocked: blocked,
+        };
+
+        let mut processor = Processor::new(context);
+        act(&mut processor);
+        processor.ctx.pty_writes.take()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mouse_report_reaches_pty_when_not_blocked() {
+        let writes = pty_writes_under_lockout(false, false, |processor| {
+            processor.mouse_report(0, ElementState::Pressed);
+        });
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].starts_with(b"\x1b[M"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mouse_report_dropped_under_budget_lockout() {
+        let writes = pty_writes_under_lockout(true, false, |processor| {
+            processor.mouse_report(0, ElementState::Pressed);
+            processor.mouse_report(0, ElementState::Released);
+        });
+        assert!(writes.is_empty(), "mouse reports leaked to the PTY: {writes:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn alternate_scroll_reaches_pty_when_not_blocked() {
+        let writes = pty_writes_under_lockout(false, true, |processor| {
+            processor.scroll_terminal(0., 6., 1.);
+        });
+        assert_eq!(writes, vec![b"\x1bOA\x1bOA".to_vec()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn alternate_scroll_dropped_under_budget_lockout() {
+        let writes = pty_writes_under_lockout(true, true, |processor| {
+            processor.scroll_terminal(0., 6., 1.);
+        });
+        assert!(writes.is_empty(), "alternate-scroll arrows leaked to the PTY: {writes:?}");
     }
 
     test_process_binding! {

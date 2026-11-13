@@ -28,7 +28,6 @@ use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
-#[cfg(target_os = "macos")]
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
@@ -313,17 +312,14 @@ impl Processor {
         } else {
             crate::session::Session::load()
         };
-        #[cfg(not(target_os = "macos"))]
-        let restore: Option<crate::session::Session> = None;
 
         #[cfg(target_os = "macos")]
         let restore_tabbing_id = restore
             .as_ref()
             .filter(|session| session.windows.len() > 1)
             .map(|_| fresh_restore_tabbing_id());
-        #[cfg(not(target_os = "macos"))]
-        let restore_tabbing_id: Option<String> = None;
 
+        #[cfg(target_os = "macos")]
         let (first_options, rest, restored_initial) = match restore {
             Some(session) if !session.windows.is_empty() => {
                 let mut iter = session.windows.into_iter();
@@ -339,6 +335,10 @@ impl Processor {
             },
             _ => (window_options, Vec::new(), false),
         };
+        // Session restore is macOS-only (`mod session` is gated in main.rs), so
+        // other platforms pass the CLI window options straight through.
+        #[cfg(not(target_os = "macos"))]
+        let first_options = window_options;
 
         #[cfg(target_os = "macos")]
         {
@@ -390,6 +390,7 @@ impl Processor {
         // We can't call create_window directly here because the GL config
         // requires the initial window to have finished initializing first;
         // routing through the event loop handles that ordering.
+        #[cfg(target_os = "macos")]
         for entry in rest {
             let mut opts = WindowOptions::default();
             apply_session_overrides(
@@ -2344,6 +2345,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     /// Paste a text into the terminal.
     fn paste(&mut self, text: &str, bracketed: bool) {
+        // Budget lockout: IME commits (dead keys, emoji viewer, dictation), dropped files and
+        // every other paste caller reach the PTY here, so gate once at this choke point.
+        #[cfg(target_os = "macos")]
+        if self.is_budget_blocked() {
+            return;
+        }
+
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
