@@ -5,8 +5,12 @@
 //! Rendered via AppKit (NSView + NSTextField + NSButton) rather than the
 //! existing GL renderer because:
 //!
-//!   * The overlay must absorb keystrokes that would otherwise hit the
-//!     terminal — NSView's first-responder semantics handle this for free.
+//!   * The overlay is display only. It never becomes first responder, so
+//!     keystrokes keep reaching the terminal view. Input is gated in the
+//!     input layer instead: `Processor::key_input` (input/keyboard.rs),
+//!     `Execute::execute` (input/mod.rs), `paste` (event.rs),
+//!     `Processor::mouse_report` and the alt-scroll write in
+//!     `scroll_terminal` all check the budget lockout.
 //!   * The optional extension buttons must be real clickable HUD elements,
 //!     not synthesized PTY interactions.
 //!   * NSView lives outside the GL surface, so re-rendering doesn't fight
