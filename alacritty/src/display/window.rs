@@ -237,6 +237,7 @@ impl Window {
     }
 
     /// Top-left of the window in screen coordinates, if the platform supports it.
+    #[cfg(target_os = "macos")]
     #[inline]
     pub fn outer_position(
         &self,
@@ -245,6 +246,7 @@ impl Window {
     }
 
     /// Move the window's top-left to `position` (screen coords, physical px).
+    #[cfg(target_os = "macos")]
     #[inline]
     pub fn set_outer_position(&self, position: PhysicalPosition<i32>) {
         self.window.set_outer_position(position);

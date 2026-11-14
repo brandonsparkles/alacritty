@@ -115,6 +115,8 @@ impl WindowContext {
         let gl_context =
             renderer::platform::create_gl_context(&gl_display, &gl_config, raw_window_handle)?;
 
+        // `mut` is only needed by the macOS restore block below.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut display = Display::new(window, gl_context, &config, false)?;
         #[cfg(target_os = "macos")]
         {
@@ -168,6 +170,8 @@ impl WindowContext {
         let gl_context =
             renderer::platform::create_gl_context(&gl_display, gl_config, Some(raw_window_handle))?;
 
+        // `mut` is only needed by the macOS restore block below.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut display = Display::new(window, gl_context, &config, tabbed)?;
         #[cfg(target_os = "macos")]
         {
