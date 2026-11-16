@@ -34,9 +34,10 @@ mod mouse;
 use crate::cli::Options;
 #[cfg(test)]
 pub use crate::config::bindings::Binding;
+#[cfg(target_os = "macos")]
+pub use crate::config::bindings::TabRenameAction;
 pub use crate::config::bindings::{
-    Action, BindingKey, BindingMode, KeyBinding, MouseAction, MouseEvent, SearchAction,
-    TabRenameAction, ViAction,
+    Action, BindingKey, BindingMode, KeyBinding, MouseAction, MouseEvent, SearchAction, ViAction,
 };
 pub use crate::config::ui_config::UiConfig;
 use crate::logging::LOG_TARGET_CONFIG;

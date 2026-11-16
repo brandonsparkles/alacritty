@@ -37,9 +37,11 @@ use alacritty_terminal::vte::ansi::{ClearMode, Handler};
 
 use crate::clipboard::Clipboard;
 #[cfg(target_os = "macos")]
+use crate::config::TabRenameAction;
+#[cfg(target_os = "macos")]
 use crate::config::window::Decorations;
 use crate::config::{
-    Action, BindingMode, MouseAction, MouseEvent, SearchAction, TabRenameAction, UiConfig, ViAction,
+    Action, BindingMode, MouseAction, MouseEvent, SearchAction, UiConfig, ViAction,
 };
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
@@ -139,16 +141,24 @@ pub trait ActionContext<T: EventListener> {
     fn advance_search_origin(&mut self, _direction: Direction) {}
     fn search_direction(&self) -> Direction;
     fn search_active(&self) -> bool;
+    // Only the macOS native-tab actions call these; other targets keep the no-op defaults.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn start_rename_tab(&mut self) {}
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn cancel_rename_tab(&mut self) {}
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn confirm_rename_tab(&mut self) {}
     fn rename_tab_input(&mut self, _c: char) {}
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn rename_tab_pop_char(&mut self) {}
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn rename_tab_pop_word(&mut self) {}
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn rename_tab_clear(&mut self) {}
     fn rename_tab_active(&self) -> bool {
         false
     }
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn reset_tab_title(&mut self) {}
     /// Show a confirm-close dialog when a foreground subprocess is running.
     /// Returns `true` to proceed with close, `false` to abort.

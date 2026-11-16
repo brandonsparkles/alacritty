@@ -1447,8 +1447,10 @@ pub struct RenameTabState {
     /// Whether a rename prompt is currently active.
     pub active: bool,
     /// Current input buffer being typed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub input: String,
     /// Effective tab title prior to entering rename mode, restored on cancel.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub previous_title: Option<String>,
 }
 
@@ -2773,10 +2775,13 @@ pub struct Mouse {
     pub x: usize,
     pub y: usize,
     /// Accumulated horizontal pixels for the current two-finger pan gesture (macOS tab swipe).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tab_swipe_accum_x: f64,
     /// Accumulated absolute vertical pixels for the current two-finger pan gesture.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tab_swipe_accum_y_abs: f64,
     /// Whether a tab-switch has already fired during the current pan gesture.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tab_swipe_fired: bool,
 
     /// Timestamp of the last Escape key press, used to detect a double-tap and
