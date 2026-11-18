@@ -148,6 +148,14 @@ pub fn resume_command_for(
     None
 }
 
+/// Preserve turn-end tab selection for local interactive agent terminals.
+pub fn has_interactive_agent(root: c_int) -> bool {
+    std::iter::once(root).chain(crate::macos::proc::list_descendants(root, 4)).any(|pid| {
+        crate::macos::proc::pid_path(pid).as_deref().and_then(Path::to_str)
+            .is_some_and(|path| is_claude_binary(path) || codex_program_for_binary(path).is_some())
+    })
+}
+
 // ---------- claude ----------
 
 /// Claude's auto-updater prunes old `versions/<x.y.z>` binaries while

@@ -2878,7 +2878,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     ///   - direct command root or any descendant     -> `Working` (square spinner)
     ///
     /// Bell-triggered `NeedsAttention` (set by `TerminalEvent::Bell`) is sticky
-    /// until focus gain; `tab_attention_from_bell` tracks that path.
+    /// until focus gain. A root OSC 7501 report supersedes the process heuristic.
     ///
     /// We use descendants of the shell, not the TTY's foreground process group.
     /// Some TUIs (codex/claude/copilot) run through wrappers or share their
@@ -2892,10 +2892,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
         /// walk every 4s instead of 2Hz.
         const OCCLUDED_TAB_POLL_STRIDE: u32 = 8;
 
-        // Bell-triggered NeedsAttention is sticky; only focus gain clears it.
-        if self.ctx.display.tab_activity == TabActivity::NeedsAttention
-            && self.ctx.display.tab_attention_from_bell
-        {
+        if !self.ctx.display.tab_program_managed && self.ctx.display.tab_activity.is_unread() {
             return;
         }
 
@@ -2920,7 +2917,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
             .and_then(|path| path.file_name().map(|name| name.to_owned()))
             .and_then(|name| name.to_str().map(str::to_owned))
             .is_some_and(|name| !is_idle_shell_process(&name));
-        let next = if root_is_command || !children.is_empty() {
+        let running = root_is_command || !children.is_empty();
+        let next = if self.ctx.display.tab_program_managed && running {
+            self.ctx.display.tab_activity
+        } else if self.ctx.display.tab_program_managed {
+            // A crashed TUI may never send clear. Release ownership once its shell is alone.
+            self.ctx.terminal.release_program_status();
+            return;
+        } else if running {
             TabActivity::Working
         } else {
             TabActivity::Idle
@@ -2998,10 +3002,48 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.display.window.set_title(reset_to);
                         }
                     },
+                    #[cfg(target_os = "macos")]
+                    TerminalEvent::ProgramStatus(status) => {
+                        use crate::display::TabActivity;
+
+                        let focused = self.ctx.terminal.is_focused;
+                        let next = status
+                            .map_or(TabActivity::Idle, |s| TabActivity::from_program(s, focused));
+                        self.ctx.display.tab_program_managed = status.is_some();
+                        self.ctx.display.tab_activity = next;
+                        self.ctx.display.apply_tab_title();
+                        // A queued completion may already have been superseded by resumed work.
+                        if next == TabActivity::NeedsAttention
+                            && status == self.ctx.terminal.program_status()
+                            && !self.ctx.display.budget_blocked
+                        {
+                            let pid = self.ctx.shell_pid as i32;
+                            if crate::cli_resume::has_interactive_agent(pid) {
+                                self.ctx.display.window.select_background_tab();
+                            }
+                        }
+                    },
+                    #[cfg(target_os = "macos")]
+                    TerminalEvent::ProgramStatusReleased => {
+                        use crate::display::TabActivity;
+
+                        self.ctx.display.tab_program_managed = false;
+                        if !self.ctx.display.tab_activity.is_unread() {
+                            self.ctx.display.tab_activity = TabActivity::Idle;
+                            self.ctx.display.apply_tab_title();
+                        }
+                    },
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;
-                        if !focused && self.ctx.terminal.mode().contains(TermMode::URGENCY_HINTS) {
+                        #[cfg(target_os = "macos")]
+                        let use_bell_attention = !self.ctx.display.tab_program_managed;
+                        #[cfg(not(target_os = "macos"))]
+                        let use_bell_attention = true;
+                        if use_bell_attention
+                            && !focused
+                            && self.ctx.terminal.mode().contains(TermMode::URGENCY_HINTS)
+                        {
                             self.ctx.window().set_urgent(true);
                         }
 
@@ -3009,15 +3051,12 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // raises the blue "needs attention" indicator.
                         // Sticky until focus gain (see `poll_tab_activity`).
                         #[cfg(target_os = "macos")]
-                        if !focused {
-                            if self.ctx.display.tab_activity
-                                != crate::display::TabActivity::NeedsAttention
-                            {
-                                self.ctx.display.tab_activity =
-                                    crate::display::TabActivity::NeedsAttention;
-                                self.ctx.display.apply_tab_title();
-                            }
-                            self.ctx.display.tab_attention_from_bell = true;
+                        if use_bell_attention
+                            && !focused
+                            && self.ctx.display.tab_activity != crate::display::TabActivity::NeedsAttention
+                        {
+                            self.ctx.display.tab_activity = crate::display::TabActivity::NeedsAttention;
+                            self.ctx.display.apply_tab_title();
                         }
 
                         // Ring visual bell.
@@ -3143,18 +3182,13 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         if is_focused {
                             self.ctx.window().set_urgent(false);
                             // Clear "needs attention" on tab focus (macOS).
-                            // Also drop the bell-sticky flag and idle timer
-                            // so the next tick re-derives state cleanly.
                             #[cfg(target_os = "macos")]
                             {
-                                if self.ctx.display.tab_activity
-                                    == crate::display::TabActivity::NeedsAttention
-                                {
+                                if self.ctx.display.tab_activity.is_unread() {
                                     self.ctx.display.tab_activity =
                                         crate::display::TabActivity::Idle;
                                     self.ctx.display.apply_tab_title();
                                 }
-                                self.ctx.display.tab_attention_from_bell = false;
                             }
                         }
                         // Focus changes are a good moment to refresh the

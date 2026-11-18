@@ -551,6 +551,21 @@ impl Window {
         }
     }
 
+    /// Select the finished conversation within its own tab group while another
+    /// app is frontmost. Never switch the tab underneath active keyboard input.
+    #[cfg(target_os = "macos")]
+    pub fn select_background_tab(&self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if objc2_app_kit::NSApplication::sharedApplication(mtm).isActive() {
+            return;
+        }
+        if let Some(window) = self.ns_window() {
+            if let Some(group) = window.tabGroup() {
+                group.setSelectedWindow(Some(&window));
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn ns_window(&self) -> Option<Retained<NSWindow>> {
         let RawWindowHandle::AppKit(handle) = self.raw_window_handle() else { return None };

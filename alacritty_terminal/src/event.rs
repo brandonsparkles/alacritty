@@ -48,6 +48,14 @@ pub enum Event {
     /// New terminal content available.
     Wakeup,
 
+    /// Root program changed its reported activity (OSC 7501).
+    #[cfg(target_os = "macos")]
+    ProgramStatus(Option<crate::term::program_status::ProgramStatus>),
+
+    /// The reporting program returned to its shell without clearing its status.
+    #[cfg(target_os = "macos")]
+    ProgramStatusReleased,
+
     /// Terminal bell ring.
     Bell,
 
@@ -71,6 +79,10 @@ impl Debug for Event {
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::Wakeup => write!(f, "Wakeup"),
+            #[cfg(target_os = "macos")]
+            Event::ProgramStatus(state) => write!(f, "ProgramStatus({state:?})"),
+            #[cfg(target_os = "macos")]
+            Event::ProgramStatusReleased => write!(f, "ProgramStatusReleased"),
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),

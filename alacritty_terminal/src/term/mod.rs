@@ -31,6 +31,8 @@ use crate::graphics::{Graphics, UpdateQueues};
 
 pub mod cell;
 pub mod color;
+#[cfg(target_os = "macos")]
+pub mod program_status;
 pub mod search;
 
 /// Minimum number of columns.
@@ -317,6 +319,9 @@ pub struct Term<T> {
     /// Proxy for sending events to the event loop.
     event_proxy: T,
 
+    #[cfg(target_os = "macos")]
+    program_status: Option<program_status::ProgramStatus>,
+
     /// Current title of the window.
     title: Option<String>,
 
@@ -448,6 +453,8 @@ impl<T> Term<T> {
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
             colors: color::Colors::default(),
+            #[cfg(target_os = "macos")]
+            program_status: None,
             title_stack: Default::default(),
             is_focused: Default::default(),
             selection: Default::default(),
@@ -1085,7 +1092,45 @@ impl<T> Dimensions for Term<T> {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl<T: EventListener> Term<T> {
+    pub fn program_status(&self) -> Option<program_status::ProgramStatus> {
+        self.program_status
+    }
+
+    pub fn release_program_status(&mut self) {
+        if self.program_status.take().is_some() {
+            self.event_proxy.send_event(Event::ProgramStatusReleased);
+        }
+    }
+
+    fn set_program_status(&mut self, status: Option<program_status::ProgramStatus>) {
+        if self.program_status != status {
+            self.program_status = status;
+            self.event_proxy.send_event(Event::ProgramStatus(status));
+        }
+    }
+}
+
 impl<T: EventListener> Handler for Term<T> {
+    #[cfg(target_os = "macos")]
+    fn osc_unhandled(&mut self, params: &[&[u8]], terminator: &str) {
+        use program_status::Report;
+
+        match params {
+            [b"7501", b"?"] => {
+                self.event_proxy.send_event(Event::PtyWrite(format!("\x1b]7501;?{terminator}")));
+            },
+            [b"7501", body] => match Report::parse(body) {
+                Some(Report::Status(status)) => self.set_program_status(Some(status)),
+                Some(Report::Clear) => self.set_program_status(None),
+                None => (),
+            },
+            [b"133", b"A", ..] => self.release_program_status(),
+            _ => (),
+        }
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
@@ -1862,6 +1907,8 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.set_program_status(None);
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -2625,6 +2672,78 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn program_status_replays_parent_and_child_wire_events() {
+        use program_status::ProgramStatus::*;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct Capture(RefCell<Vec<Event>>);
+        impl EventListener for Capture {
+            fn send_event(&self, event: Event) {
+                self.0.borrow_mut().push(event);
+            }
+        }
+
+        let mut term = Term::new(Config::default(), &TermSize::new(80, 24), Capture::default());
+        let mut parser: ansi::Processor = Default::default();
+        let wire = concat!(
+            "\x1b]7501;?\x07",
+            "\x1b]7501;?\x1b\\",
+            "\x1b]7501;state=idle:app=claude-code\x07",
+            "\x1b]7501;state=working:app=claude-code\x07",
+            "\x1b]7501;state=working:app=claude-code:id=abc\x07",
+            "\x1b]7501;state=done:id=abc\x07",
+            "\x1b]7501;state=clear:id=abc\x07",
+            "\x1b]7501;state=working:app=claude-code\x07",
+            "\x1b]7501;state=blocked:app=claude-code:kind=permission\x07",
+            "\x1b]7501;state=working:app=claude-code\x07",
+            "\x1b]7501;state=done:app=claude-code\x07",
+            "\x1b]7501;state=clear\x07",
+            "\x1b]7501;state=working:app=codex\x1b\\",
+            "\x1b]7501;state=blocked:app=codex:kind=question\x1b\\",
+            "\x1b]7501;state=working:app=codex\x1b\\",
+            "\x1b]7501;state=done:app=codex\x1b\\",
+            "\x1b]7501;state=error:app=codex\x1b\\",
+            "\x1bc",
+        );
+        for byte in wire.as_bytes().chunks(1) {
+            parser.advance(&mut term, byte);
+        }
+        let events = term.event_proxy.0.borrow();
+        let replies: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::PtyWrite(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, ["\x1b]7501;?\x07", "\x1b]7501;?\x1b\\"]);
+        let states: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProgramStatus(state) => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, [
+            Some(Idle),
+            Some(Working),
+            Some(Blocked),
+            Some(Working),
+            Some(Done),
+            None,
+            Some(Working),
+            Some(Blocked),
+            Some(Working),
+            Some(Done),
+            Some(Error),
+            None
+        ]);
+        assert!(!events.iter().any(|e| matches!(e, Event::Bell)));
+    }
 
     #[test]
     fn scroll_display_page_up() {

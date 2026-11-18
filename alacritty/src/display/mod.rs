@@ -375,12 +375,34 @@ pub enum TabActivity {
     Idle,
     /// A foreground subprocess (non-shell) is running.
     Working,
-    /// Bell rang or output occurred while unfocused — pending user attention.
+    /// The program is waiting for user input.
+    Blocked,
+    /// A reported failure has not yet been seen.
+    Failed,
+    /// Unread completion or a bell from a program without native status.
     NeedsAttention,
 }
 
 #[cfg(target_os = "macos")]
 impl TabActivity {
+    pub fn from_program(
+        status: alacritty_terminal::term::program_status::ProgramStatus,
+        focused: bool,
+    ) -> Self {
+        use alacritty_terminal::term::program_status::ProgramStatus;
+        match status {
+            ProgramStatus::Working => Self::Working,
+            ProgramStatus::Blocked => Self::Blocked,
+            ProgramStatus::Done if !focused => Self::NeedsAttention,
+            ProgramStatus::Error if !focused => Self::Failed,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn is_unread(self) -> bool {
+        matches!(self, Self::NeedsAttention | Self::Failed)
+    }
+
     /// Icon prefix (with trailing space) inserted before the tab label.
     pub fn prefix(self, frame: usize) -> Option<&'static str> {
         match self {
@@ -390,8 +412,27 @@ impl TabActivity {
             },
             // U+1F535 LARGE BLUE CIRCLE.
             TabActivity::NeedsAttention => Some("🔵 "),
+            TabActivity::Blocked => Some("? "),
+            TabActivity::Failed => Some("! "),
             TabActivity::Idle => None,
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn program_status_tab_indicators() {
+    use alacritty_terminal::term::program_status::ProgramStatus;
+    for (status, focused, expected) in [
+        (ProgramStatus::Working, false, Some("◰ ")),
+        (ProgramStatus::Done, false, Some("🔵 ")),
+        (ProgramStatus::Done, true, None),
+        (ProgramStatus::Blocked, true, Some("? ")),
+        (ProgramStatus::Blocked, false, Some("? ")),
+        (ProgramStatus::Error, false, Some("! ")),
+        (ProgramStatus::Idle, false, None),
+    ] {
+        assert_eq!(TabActivity::from_program(status, focused).prefix(0), expected);
     }
 }
 
@@ -466,13 +507,9 @@ pub struct Display {
     #[cfg(target_os = "macos")]
     pub tab_poll_ticks_occluded: u32,
 
-    /// `true` when the current `NeedsAttention` was triggered by a terminal
-    /// BEL. Sticky-on-unfocus: polling must NOT clear a bell-triggered
-    /// attention even if the child resumes work; only focus gain clears it.
-    /// Idle-triggered `NeedsAttention` (this flag false) is allowed to clear
-    /// itself when the child becomes runnable again.
+    /// A root OSC 7501 report owns this tab until clear, reset, or program exit.
     #[cfg(target_os = "macos")]
-    pub tab_attention_from_bell: bool,
+    pub tab_program_managed: bool,
 
     /// `true` while the daily-usage budget block is in effect. Set by the
     /// budget tick on Processor; read by the input handler (to filter
@@ -654,7 +691,7 @@ impl Display {
             #[cfg(target_os = "macos")]
             tab_poll_ticks_occluded: 0,
             #[cfg(target_os = "macos")]
-            tab_attention_from_bell: false,
+            tab_program_managed: false,
             #[cfg(target_os = "macos")]
             budget_blocked: false,
             #[cfg(target_os = "macos")]

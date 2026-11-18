@@ -230,6 +230,8 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
     // Setup shell environment.
     let window_id = window_id.to_string();
     builder.env("ALACRITTY_WINDOW_ID", &window_id);
+    #[cfg(target_os = "macos")]
+    builder.env("ALACRITTY_PROGRAM_STATUS", "1");
     builder.env("USER", user.user);
     builder.env("HOME", user.home);
     // Set Window ID for clients relying on X11 hacks.
